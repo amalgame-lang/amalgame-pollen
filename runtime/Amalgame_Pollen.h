@@ -34,6 +34,12 @@ code_bool   Amalgame_Pollen_Pollen_WorkflowLoad(code_string path, code_string no
 void        Amalgame_Pollen_Pollen_WorkflowSetSharedDir(code_string path);
 void        Amalgame_Pollen_Pollen_WorkflowSetSelf(code_string role, code_string host, int64_t port);
 
+/* Phase 5.3 — per-execution state file under sharedDir/state/<rootMid>.json.
+ * StateGet returns the raw JSON literal for the key (or "" if absent).
+ * StateSet replace-or-append the key, atomic tmp+rename. */
+code_string Amalgame_Pollen_Pollen_StateGet(code_string rootMid, code_string path);
+code_bool   Amalgame_Pollen_Pollen_StateSet(code_string rootMid, code_string path, code_string jsonLiteral);
+
 /* TCP transport */
 void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
 code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,

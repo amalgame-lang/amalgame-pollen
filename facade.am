@@ -29,7 +29,12 @@ namespace Amalgame.Pollen
 @c {
     #include <stdio.h>
     #include <stdint.h>
+    #include <stdlib.h>
     #include <string.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #include <sys/stat.h>
+    #include <sys/types.h>
     #include <gc.h>
 
     /* Singleton-per-process engine state. v0.1 carries flags only ;
@@ -37,11 +42,29 @@ namespace Amalgame.Pollen
     static int _pollen_pkg_loaded = 0;
     static int _pollen_pkg_version = 0;
     static char _pollen_pkg_role[64] = "";
-    static char _pollen_pkg_shared_dir[512] = "";
+    /* shared_dir uses the runtime-canonical name (no _pkg_ prefix) so
+     * the M2.x state_persist code below ports verbatim from
+     * pollen-node-tcp.am with zero diff. file-scope static — no link
+     * collision with the legacy binary. */
+    static char _pollen_shared_dir[512] = "";
 
     static const char _pollen_pkg_unimpl_warning[] =
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
         "M2-M3 migration from pollen.am in progress.\n";
+
+    /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
+     * has to be defined before any system header which is hard to
+     * guarantee from inside an amc @c block. Naive O(h × n) is fine
+     * for our short needles scanning <8 KiB state files. */
+    static const char* _pollen_find(const char* hay, size_t hlen,
+                                     const char* needle, size_t nlen) {
+        if (nlen == 0 || hlen < nlen) return NULL;
+        const char* end = hay + hlen - nlen;
+        for (const char* p = hay; p <= end; p++) {
+            if (memcmp(p, needle, nlen) == 0) return p;
+        }
+        return NULL;
+    }
 
     /* === Workflow lifecycle =================================== */
     static code_bool
@@ -54,11 +77,13 @@ namespace Amalgame.Pollen
 
     static void
     Amalgame_Pollen_Pollen_WorkflowSetSharedDir_c(code_string path) {
-        if (path) {
-            strncpy(_pollen_pkg_shared_dir, path,
-                     sizeof(_pollen_pkg_shared_dir) - 1);
-            _pollen_pkg_shared_dir[sizeof(_pollen_pkg_shared_dir) - 1] = 0;
-        }
+        if (!path) return;
+        strncpy(_pollen_shared_dir, path,
+                 sizeof(_pollen_shared_dir) - 1);
+        _pollen_shared_dir[sizeof(_pollen_shared_dir) - 1] = 0;
+        /* best-effort create — EEXIST ok ; sub-dirs (state/, executions/)
+         * are created lazily by their respective writers. */
+        mkdir(_pollen_shared_dir, 0755);
     }
 
     static void
@@ -69,6 +94,219 @@ namespace Amalgame.Pollen
             _pollen_pkg_role[sizeof(_pollen_pkg_role) - 1] = 0;
         }
         (void) host; (void) port;
+    }
+
+    /* === Phase 5.3 — per-execution state file =================
+     *
+     * Migrated verbatim from pollen-node-tcp.am v0.2.x (workflow-tree
+     * Phase 5.3 commit 7854bef). Each `rootMessageId` gets a JSON
+     * object stored under `<sharedDir>/state/<rootMid>.json`. Writes
+     * go through tmp + rename for crash safety ; reads slurp the
+     * whole file (capped at POLLEN_STATE_FILE_MAX). `state.X`
+     * lookups in conditions read it back.
+     */
+    #define POLLEN_STATE_FILE_MAX 8192
+
+    static int _pollen_state_filepath(const char* root_mid,
+                                       char* out, size_t cap) {
+        if (!_pollen_shared_dir[0] || !root_mid || !root_mid[0]) return 0;
+        int n = snprintf(out, cap, "%s/state/%s.json",
+                          _pollen_shared_dir, root_mid);
+        return (n > 0 && n < (int) cap);
+    }
+
+    static void _pollen_state_dir_ensure(void) {
+        if (!_pollen_shared_dir[0]) return;
+        char d[600];
+        snprintf(d, sizeof(d), "%s/state", _pollen_shared_dir);
+        mkdir(d, 0755);
+    }
+
+    static int _pollen_state_read(const char* root_mid,
+                                    char* buf, size_t cap) {
+        char path[1024];
+        if (!_pollen_state_filepath(root_mid, path, sizeof(path))) return -1;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) return -1;
+        ssize_t n = read(fd, buf, cap - 1);
+        close(fd);
+        if (n <= 0) return -1;
+        buf[n] = 0;
+        return (int) n;
+    }
+
+    static int _pollen_state_write(const char* root_mid,
+                                     const char* buf, size_t len) {
+        char path[1024], tmp[1100];
+        if (!_pollen_state_filepath(root_mid, path, sizeof(path))) return 0;
+        _pollen_state_dir_ensure();
+        snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid());
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return 0;
+        ssize_t w = write(fd, buf, len);
+        close(fd);
+        if (w != (ssize_t) len) { unlink(tmp); return 0; }
+        if (rename(tmp, path) != 0) { unlink(tmp); return 0; }
+        return 1;
+    }
+
+    /* Locate the value extent for `"key":` inside a state buffer.
+     * Returns 1 on success and writes the value start + length to
+     * *out_v / *out_vlen. Strings, objects/arrays, and bare literals
+     * (number/true/false/null) are all handled. */
+    static int _pollen_state_find_value(const char* buf, int blen,
+                                         const char* key,
+                                         const char** out_v,
+                                         size_t* out_vlen) {
+        char needle[80];
+        int nlen = snprintf(needle, sizeof(needle), "\"%s\":", key);
+        if (nlen <= 0 || nlen >= (int) sizeof(needle)) return 0;
+        const char* found = _pollen_find(buf, (size_t) blen,
+                                          needle, (size_t) nlen);
+        if (!found) return 0;
+        const char* v = found + nlen;
+        const char* v_end = v;
+        if (*v == '"') {
+            v_end = v + 1;
+            while (v_end < buf + blen && *v_end != '"') {
+                if (*v_end == '\\' && v_end + 1 < buf + blen) v_end++;
+                v_end++;
+            }
+            if (v_end < buf + blen) v_end++;
+        } else if (*v == '{' || *v == '[') {
+            char open = *v; char close = (open == '{') ? '}' : ']';
+            int depth = 0;
+            v_end = v;
+            while (v_end < buf + blen) {
+                if (*v_end == open) depth++;
+                else if (*v_end == close) {
+                    depth--;
+                    if (depth == 0) { v_end++; break; }
+                }
+                v_end++;
+            }
+        } else {
+            while (v_end < buf + blen
+                   && *v_end != ',' && *v_end != '}'
+                   && *v_end != ' ' && *v_end != '\n'
+                   && *v_end != '\r' && *v_end != '\t') v_end++;
+        }
+        *out_v = v;
+        *out_vlen = (size_t)(v_end - v);
+        return 1;
+    }
+
+    /* Mutate a single top-level key in the per-execution state file.
+     * value_lit is a JSON literal (number, quoted string, true, false,
+     * null). For now only top-level keys are supported — `state.X.Y`
+     * is treated as a single key name with a literal dot in it,
+     * which works but doesn't compose with cond eval's dotted
+     * resolution. Phase 5.3.1 will handle nested set. */
+    static int _pollen_state_set(const char* root_mid,
+                                   const char* path,
+                                   const char* json_literal) {
+        const char* key = path;
+        if (strncmp(key, "state.", 6) == 0) key += 6;
+        if (!key[0]) return 0;
+
+        char old_buf[POLLEN_STATE_FILE_MAX];
+        int old_n = _pollen_state_read(root_mid, old_buf, sizeof(old_buf));
+
+        char new_buf[POLLEN_STATE_FILE_MAX];
+        int n = 0;
+
+        if (old_n <= 0) {
+            n = snprintf(new_buf, sizeof(new_buf),
+                          "{\"%s\":%s}\n", key, json_literal);
+        } else {
+            const char* v = NULL;
+            size_t vlen = 0;
+            if (_pollen_state_find_value(old_buf, old_n, key, &v, &vlen)) {
+                const char* v_end = v + vlen;
+                int prefix_n = (int)(v - old_buf);
+                int suffix_n = old_n - (int)(v_end - old_buf);
+                n = snprintf(new_buf, sizeof(new_buf), "%.*s%s%.*s",
+                              prefix_n, old_buf, json_literal,
+                              suffix_n, v_end);
+            } else {
+                int close_at = -1;
+                for (int i = old_n - 1; i >= 0; i--) {
+                    if (old_buf[i] == '}') { close_at = i; break; }
+                }
+                if (close_at < 0) return 0;
+                int has_fields = 0;
+                for (int i = 0; i < close_at; i++) {
+                    char c = old_buf[i];
+                    if (c == ':') { has_fields = 1; break; }
+                }
+                const char* sep = has_fields ? "," : "";
+                n = snprintf(new_buf, sizeof(new_buf),
+                              "%.*s%s\"%s\":%s%.*s",
+                              close_at, old_buf, sep, key, json_literal,
+                              old_n - close_at, old_buf + close_at);
+            }
+        }
+
+        if (n <= 0 || n >= (int) sizeof(new_buf)) return 0;
+        return _pollen_state_write(root_mid, new_buf, (size_t) n);
+    }
+
+    /* Extract rootMessageId from a MESSAGE envelope. Returns 1 on
+     * success. Used by the workflow dispatcher in M2.3 — exposed
+     * here as part of the state_persist module since it's the
+     * inverse of "which state file do I touch". */
+    static int _pollen_extract_root_mid(const char* env, size_t env_len,
+                                          char* out, size_t cap) {
+        const char* k = _pollen_find(env, env_len,
+                                       "\"rootMessageId\":\"", 17);
+        if (!k) return 0;
+        const char* v = k + 17;
+        const char* q = memchr(v, '"', env_len - (size_t)(v - env));
+        if (!q) return 0;
+        size_t rlen = (size_t)(q - v);
+        if (rlen == 0 || rlen >= cap) return 0;
+        memcpy(out, v, rlen); out[rlen] = 0;
+        return 1;
+    }
+
+    /* Public facade for state read by key path. Returns a GC-owned
+     * string containing the raw JSON literal (number / quoted-string
+     * / object / array / true / false / null). Returns "" if the
+     * sharedDir isn't set, the state file doesn't exist, or the key
+     * isn't present. */
+    static code_string
+    Amalgame_Pollen_Pollen_StateGet_c(code_string rootMid, code_string path) {
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!rootMid || !path) return (code_string) empty;
+        const char* key = (const char*) path;
+        if (strncmp(key, "state.", 6) == 0) key += 6;
+        if (!key[0]) return (code_string) empty;
+
+        char buf[POLLEN_STATE_FILE_MAX];
+        int n = _pollen_state_read((const char*) rootMid, buf, sizeof(buf));
+        if (n <= 0) return (code_string) empty;
+
+        const char* v = NULL;
+        size_t vlen = 0;
+        if (!_pollen_state_find_value(buf, n, key, &v, &vlen)) {
+            return (code_string) empty;
+        }
+        char* out = (char*) GC_MALLOC_ATOMIC(vlen + 1);
+        if (!out) return (code_string) empty;
+        memcpy(out, v, vlen);
+        out[vlen] = 0;
+        return (code_string) out;
+    }
+
+    static code_bool
+    Amalgame_Pollen_Pollen_StateSet_c(code_string rootMid, code_string path,
+                                       code_string jsonLiteral) {
+        if (!rootMid || !path || !jsonLiteral) return (code_bool) 0;
+        int ok = _pollen_state_set((const char*) rootMid,
+                                     (const char*) path,
+                                     (const char*) jsonLiteral);
+        return (code_bool) (ok ? 1 : 0);
     }
 
     /* === TCP transport ======================================== */
@@ -151,6 +389,28 @@ public class Pollen {
                                                       topicUuid, (int64_t) topicVersion,
                                                       dataJson); }
         return mid
+    }
+
+    // Phase 5.3 — read a top-level key from the per-execution state
+    // file at sharedDir/state/<rootMid>.json. Returns the raw JSON
+    // literal (e.g. "1", "\"foo\"", "true") or "" if the key isn't
+    // present / the file doesn't exist. `path` accepts a leading
+    // "state." prefix for symmetry with cond eval ("state.counter").
+    public static string StateGet(rootMid: string, path: string) {
+        var s: string = ""
+        @c { s = Amalgame_Pollen_Pollen_StateGet_c(rootMid, path); }
+        return s
+    }
+
+    // Phase 5.3 — replace-or-append a top-level key in the per-execution
+    // state file (atomic tmp+rename). `jsonLiteral` is inserted verbatim
+    // so callers are responsible for quoting strings.
+    public static bool StateSet(rootMid: string, path: string,
+                                  jsonLiteral: string) {
+        var ok: int = 0
+        @c { ok = Amalgame_Pollen_Pollen_StateSet_c(rootMid, path,
+                                                      jsonLiteral); }
+        return ok != 0
     }
 
     public static int WorkflowVersion() {
