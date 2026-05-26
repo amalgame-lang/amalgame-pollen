@@ -34,6 +34,16 @@ code_bool   Amalgame_Pollen_Pollen_WorkflowLoad(code_string path, code_string no
 void        Amalgame_Pollen_Pollen_WorkflowSetSharedDir(code_string path);
 void        Amalgame_Pollen_Pollen_WorkflowSetSelf(code_string role, code_string host, int64_t port);
 
+/* M2.3c.1 — workflow runtime setters (consumes / nexts / emit topic).
+ * Bracket the AddConsume/AddNext/SetEmitTopic calls with the
+ * ReloadBegin / ReloadCommit pair — they hold a mutex against the
+ * listener dispatch. */
+void        Amalgame_Pollen_Pollen_WorkflowReloadBegin(void);
+void        Amalgame_Pollen_Pollen_WorkflowReloadCommit(void);
+void        Amalgame_Pollen_Pollen_WorkflowAddConsume(code_string topic);
+void        Amalgame_Pollen_Pollen_WorkflowAddNext(code_string host, int64_t port);
+void        Amalgame_Pollen_Pollen_WorkflowSetEmitTopic(code_string topic);
+
 /* Phase 5.3 — per-execution state file under sharedDir/state/<rootMid>.json.
  * StateGet returns the raw JSON literal for the key (or "" if absent).
  * StateSet replace-or-append the key, atomic tmp+rename. */
