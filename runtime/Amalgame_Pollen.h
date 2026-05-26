@@ -51,6 +51,17 @@ void        Amalgame_Pollen_Pollen_CondBranchOpen(code_string condJson);
 void        Amalgame_Pollen_Pollen_CondBranchAddTarget(code_string host, int64_t port);
 void        Amalgame_Pollen_Pollen_SetOpAdd(code_string path, code_string valueExpr);
 
+/* M2.3c.2b — for / while loops (Phase 5.4). */
+void        Amalgame_Pollen_Pollen_ForSetup(code_string itemVar);
+void        Amalgame_Pollen_Pollen_ForAddTarget(code_string host, int64_t port);
+void        Amalgame_Pollen_Pollen_ForAddItem(code_string itemLit);
+void        Amalgame_Pollen_Pollen_WhileSetup(code_string condJson,
+                                                code_string iterKey,
+                                                int64_t maxIter,
+                                                code_string selfHost,
+                                                int64_t selfPort);
+void        Amalgame_Pollen_Pollen_WhileAddExit(code_string host, int64_t port);
+
 /* Phase 5.3 — per-execution state file under sharedDir/state/<rootMid>.json.
  * StateGet returns the raw JSON literal for the key (or "" if absent).
  * StateSet replace-or-append the key, atomic tmp+rename. */
