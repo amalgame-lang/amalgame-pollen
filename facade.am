@@ -44,7 +44,7 @@ namespace Amalgame.Pollen
     static char _pollen_pkg_role[64] = "";
     /* shared_dir uses the runtime-canonical name (no _pkg_ prefix) so
      * the M2.x state_persist code below ports verbatim from
-     * pollen-node-tcp.am with zero diff. file-scope static — no link
+     * the pollen runtime with zero diff. file-scope static — no link
      * collision with the legacy binary. */
     static char _pollen_shared_dir[512] = "";
 
@@ -98,7 +98,7 @@ namespace Amalgame.Pollen
 
     /* === Phase 5.3 — per-execution state file =================
      *
-     * Migrated verbatim from pollen-node-tcp.am v0.2.x (workflow-tree
+     * Migrated verbatim from the pollen runtime v0.2.x (workflow-tree
      * Phase 5.3 commit 7854bef). Each `rootMessageId` gets a JSON
      * object stored under `<sharedDir>/state/<rootMid>.json`. Writes
      * go through tmp + rename for crash safety ; reads slurp the
@@ -309,6 +309,624 @@ namespace Amalgame.Pollen
         return (code_bool) (ok ? 1 : 0);
     }
 
+    /* === M2.2 — expr / cond evaluator (workflow-tree Phase 5.2-6.0a)
+     *
+     * Migrated verbatim from the pollen runtime. Two evaluators :
+     *
+     *   _pollen_eval_expr      — set.value walker for arithmetic
+     *                            ({const, var, op:+|-|*|/}). Numeric
+     *                            results bubble as double, strings
+     *                            pass through ; arithmetic on strings
+     *                            returns 0.
+     *
+     *   _pollen_cond_eval_expr — recursive cond walker for `if` :
+     *                            leaf (==, !=, <, >, <=, >=),
+     *                            composite (and/or/not),
+     *                            membership (in / not_in).
+     *
+     * Both walk raw JSON via `_pollen_json_field` + `_pollen_find` ;
+     * `var` paths resolve through `_pollen_resolve_path` against
+     * either the envelope (data.X) or the per-execution state file
+     * (state.X). 1 KiB expr budget is enough for realistic
+     * conditions ; deeper nests can be lifted in v0.2.
+     */
+    #define POLLEN_COND_VAR_MAX  64
+    #define POLLEN_COND_STR_MAX  128
+
+    /* op codes used by _pollen_cond_eval_leaf — must stay stable, the
+     * dispatcher M2.3 will populate branches with these. */
+    #define POLLEN_COND_NONE 0
+    #define POLLEN_COND_EQ   1
+    #define POLLEN_COND_NE   2
+    #define POLLEN_COND_LT   3
+    #define POLLEN_COND_GT   4
+    #define POLLEN_COND_LE   5
+    #define POLLEN_COND_GE   6
+
+    /* Walk a dotted path through a JSON range. Brace + string aware. */
+    static int _pollen_resolve_path(const char* env, size_t env_len,
+                                     const char* path,
+                                     const char** out_val, size_t* out_len) {
+        const char* range_lo = env;
+        const char* range_hi = env + env_len;
+        const char* p = path;
+        for (;;) {
+            const char* dot = strchr(p, '.');
+            char seg[POLLEN_COND_VAR_MAX];
+            size_t seglen = dot ? (size_t)(dot - p) : strlen(p);
+            if (seglen == 0 || seglen + 4 >= sizeof(seg)) return 0;
+            seg[0] = '"';
+            memcpy(seg + 1, p, seglen);
+            seg[1 + seglen] = '"';
+            seg[2 + seglen] = ':';
+            int needle_len = (int)(seglen + 3);
+
+            const char* k = _pollen_find(range_lo,
+                                          (size_t)(range_hi - range_lo),
+                                          seg, (size_t) needle_len);
+            if (!k) return 0;
+            const char* v = k + needle_len;
+            while (v < range_hi && (*v == ' ' || *v == '\t')) v++;
+            if (v >= range_hi) return 0;
+
+            int is_last = (dot == NULL);
+            if (!is_last) {
+                if (*v != '{') return 0;
+                int depth = 1;
+                const char* w = v + 1;
+                int in_str = 0;
+                while (w < range_hi && depth > 0) {
+                    char c = *w;
+                    if (in_str) {
+                        if (c == '\\' && w + 1 < range_hi) { w += 2; continue; }
+                        if (c == '"') in_str = 0;
+                    } else {
+                        if (c == '"') in_str = 1;
+                        else if (c == '{') depth++;
+                        else if (c == '}') depth--;
+                    }
+                    w++;
+                }
+                if (depth != 0) return 0;
+                range_lo = v + 1;
+                range_hi = w - 1;
+                p = dot + 1;
+                continue;
+            }
+
+            if (*v == '"') {
+                const char* q = v + 1;
+                while (q < range_hi) {
+                    if (*q == '\\' && q + 1 < range_hi) { q += 2; continue; }
+                    if (*q == '"') break;
+                    q++;
+                }
+                if (q >= range_hi) return 0;
+                *out_val = v;
+                *out_len = (size_t)(q - v) + 1;
+                return 1;
+            }
+            const char* q = v;
+            while (q < range_hi
+                   && *q != ',' && *q != '}' && *q != ']'
+                   && *q != ' ' && *q != '\t' && *q != '\n' && *q != '\r') {
+                q++;
+            }
+            *out_val = v;
+            *out_len = (size_t)(q - v);
+            return 1;
+        }
+    }
+
+    /* Locate "key":<value> inside a JSON object, returning the raw
+     * value extent. Brace + bracket + string aware. */
+    static int _pollen_json_field(const char* buf, size_t len,
+                                    const char* key, int klen,
+                                    const char** out_v, size_t* out_vlen) {
+        char needle[80];
+        int nlen = snprintf(needle, sizeof(needle), "\"%.*s\":", klen, key);
+        if (nlen <= 0 || nlen >= (int) sizeof(needle)) return 0;
+        const char* k = _pollen_find(buf, len, needle, (size_t) nlen);
+        if (!k) return 0;
+        const char* v = k + nlen;
+        while (v < buf + len && (*v == ' ' || *v == '\t')) v++;
+        if (v >= buf + len) return 0;
+        const char* e = v;
+        if (*v == '"') {
+            e = v + 1;
+            while (e < buf + len) {
+                if (*e == '\\' && e + 1 < buf + len) { e += 2; continue; }
+                if (*e == '"') { e++; break; }
+                e++;
+            }
+        } else if (*v == '{' || *v == '[') {
+            char open = *v; char close = (open == '{') ? '}' : ']';
+            int depth = 0;
+            int in_str = 0;
+            e = v;
+            while (e < buf + len) {
+                char c = *e;
+                if (in_str) {
+                    if (c == '\\' && e + 1 < buf + len) { e += 2; continue; }
+                    if (c == '"') in_str = 0;
+                } else {
+                    if (c == '"') in_str = 1;
+                    else if (c == open) depth++;
+                    else if (c == close) {
+                        depth--;
+                        if (depth == 0) { e++; break; }
+                    }
+                }
+                e++;
+            }
+        } else {
+            while (e < buf + len && *e != ',' && *e != '}' && *e != ']'
+                   && *e != ' ' && *e != '\n' && *e != '\r' && *e != '\t') e++;
+        }
+        *out_v = v;
+        *out_vlen = (size_t)(e - v);
+        return 1;
+    }
+
+    /* First key of a JSON object — disambiguates the dispatch. */
+    static int _pollen_expr_outer_key(const char* expr, size_t expr_len,
+                                        char* out_key, size_t cap) {
+        const char* e = expr;
+        const char* end = expr + expr_len;
+        while (e < end && (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r')) e++;
+        if (e >= end || *e != '{') return 0;
+        e++;
+        while (e < end && (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r')) e++;
+        if (e >= end || *e != '"') return 0;
+        e++;
+        const char* k0 = e;
+        while (e < end && *e != '"') {
+            if (*e == '\\' && e + 1 < end) { e += 2; continue; }
+            e++;
+        }
+        if (e >= end) return 0;
+        size_t klen = (size_t)(e - k0);
+        if (klen == 0 || klen >= cap) return 0;
+        memcpy(out_key, k0, klen);
+        out_key[klen] = 0;
+        return 1;
+    }
+
+    typedef struct {
+        int    is_num;
+        double num;
+        char   str[128];
+    } _pollen_expr_val_t;
+
+    static int _pollen_eval_expr(const char* env, size_t env_len,
+                                   const char* expr, size_t expr_len,
+                                   _pollen_expr_val_t* out) {
+        out->is_num = 0;
+        out->num = 0;
+        out->str[0] = 0;
+        const char* v; size_t vlen;
+
+        char outer_key[16];
+        if (!_pollen_expr_outer_key(expr, expr_len, outer_key, sizeof(outer_key))) {
+            return 0;
+        }
+
+        if (strcmp(outer_key, "const") == 0
+            && _pollen_json_field(expr, expr_len, "const", 5, &v, &vlen)) {
+            if (vlen == 0) return 0;
+            if (*v == '"') {
+                size_t slen = vlen >= 2 ? vlen - 2 : 0;
+                if (slen >= sizeof(out->str)) slen = sizeof(out->str) - 1;
+                memcpy(out->str, v + 1, slen);
+                out->str[slen] = 0;
+                out->is_num = 0;
+            } else {
+                char tmp[64];
+                size_t cn = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+                memcpy(tmp, v, cn); tmp[cn] = 0;
+                out->num = atof(tmp);
+                out->is_num = 1;
+            }
+            return 1;
+        }
+
+        if (strcmp(outer_key, "var") == 0
+            && _pollen_json_field(expr, expr_len, "var", 3, &v, &vlen)) {
+            if (vlen < 2 || *v != '"') return 0;
+            char path[POLLEN_COND_VAR_MAX];
+            size_t plen = vlen - 2;
+            if (plen >= sizeof(path)) plen = sizeof(path) - 1;
+            memcpy(path, v + 1, plen); path[plen] = 0;
+
+            const char* lookup_buf = env;
+            size_t lookup_len = env_len;
+            const char* lookup_path = path;
+            char state_buf[POLLEN_STATE_FILE_MAX];
+            if (strncmp(path, "state.", 6) == 0) {
+                char root[64];
+                if (!env || !_pollen_extract_root_mid(env, env_len,
+                                                        root, sizeof(root))) {
+                    out->is_num = 1; out->num = 0;
+                    return 1;
+                }
+                int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+                if (sn <= 0) {
+                    out->is_num = 1; out->num = 0;
+                    return 1;
+                }
+                lookup_buf = state_buf;
+                lookup_len = (size_t) sn;
+                lookup_path = path + 6;
+            }
+            const char* vp; size_t vl;
+            if (!_pollen_resolve_path(lookup_buf, lookup_len,
+                                        lookup_path, &vp, &vl)) {
+                out->is_num = 1; out->num = 0;
+                return 1;
+            }
+            if (*vp == '"') {
+                size_t slen = vl >= 2 ? vl - 2 : 0;
+                if (slen >= sizeof(out->str)) slen = sizeof(out->str) - 1;
+                memcpy(out->str, vp + 1, slen); out->str[slen] = 0;
+                out->is_num = 0;
+            } else {
+                char tmp[64];
+                size_t cn = vl < sizeof(tmp) - 1 ? vl : sizeof(tmp) - 1;
+                memcpy(tmp, vp, cn); tmp[cn] = 0;
+                out->num = atof(tmp);
+                out->is_num = 1;
+            }
+            return 1;
+        }
+
+        if (strcmp(outer_key, "op") == 0
+            && _pollen_json_field(expr, expr_len, "op", 2, &v, &vlen)) {
+            if (vlen < 2 || *v != '"') return 0;
+            char op[16];
+            size_t olen = vlen - 2;
+            if (olen >= sizeof(op)) return 0;
+            memcpy(op, v + 1, olen); op[olen] = 0;
+
+            const char* lv; size_t llen;
+            const char* rv; size_t rlen;
+            if (!_pollen_json_field(expr, expr_len, "left", 4,
+                                      &lv, &llen)) return 0;
+            if (!_pollen_json_field(expr, expr_len, "right", 5,
+                                      &rv, &rlen)) return 0;
+            _pollen_expr_val_t lvv, rvv;
+            if (!_pollen_eval_expr(env, env_len, lv, llen, &lvv)) return 0;
+            if (!_pollen_eval_expr(env, env_len, rv, rlen, &rvv)) return 0;
+            if (!lvv.is_num || !rvv.is_num) return 0;
+            out->is_num = 1;
+            if      (strcmp(op, "+") == 0) out->num = lvv.num + rvv.num;
+            else if (strcmp(op, "-") == 0) out->num = lvv.num - rvv.num;
+            else if (strcmp(op, "*") == 0) out->num = lvv.num * rvv.num;
+            else if (strcmp(op, "/") == 0) out->num = (rvv.num == 0) ? 0 : lvv.num / rvv.num;
+            else return 0;
+            return 1;
+        }
+
+        return 0;
+    }
+
+    static int _pollen_expr_val_to_literal(_pollen_expr_val_t* v,
+                                             char* out, size_t cap) {
+        if (v->is_num) {
+            double rounded = (double)(long long) v->num;
+            if (rounded == v->num
+                && v->num >= -9.2e18 && v->num <= 9.2e18) {
+                return snprintf(out, cap, "%lld", (long long) v->num);
+            }
+            return snprintf(out, cap, "%g", v->num);
+        }
+        return snprintf(out, cap, "\"%s\"", v->str);
+    }
+
+    /* Leaf comparison — resolves a var path, parses value extent,
+     * applies op. Shared between the leaf-op cond walker and the
+     * composite walker. */
+    static int _pollen_cond_eval_leaf(const char* env, size_t env_len,
+                                        const char* var_path,
+                                        int op_code,
+                                        int rhs_is_num,
+                                        double rhs_num,
+                                        const char* rhs_str) {
+        if (op_code == POLLEN_COND_NONE) return 1;
+        const char* lookup_buf = env;
+        size_t lookup_len = env_len;
+        const char* lookup_path = var_path;
+        char state_buf[POLLEN_STATE_FILE_MAX];
+        if (strncmp(var_path, "state.", 6) == 0) {
+            char root[64];
+            if (!_pollen_extract_root_mid(env, env_len,
+                                            root, sizeof(root))) return 0;
+            int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+            if (sn <= 0) return 0;
+            lookup_buf = state_buf;
+            lookup_len = (size_t) sn;
+            lookup_path = var_path + 6;
+        }
+        const char* val_ptr = NULL;
+        size_t val_len = 0;
+        if (!_pollen_resolve_path(lookup_buf, lookup_len, lookup_path,
+                                    &val_ptr, &val_len)) return 0;
+        const char* v = val_ptr;
+        const char* v_end = val_ptr + val_len;
+        if (v >= v_end) return 0;
+        double v_num = 0; int v_is_num = 0;
+        char v_str[128] = "";
+        if (*v == '"') {
+            const char* q = v_end - 1;
+            if (q <= v) return 0;
+            size_t slen = (size_t)(q - v - 1);
+            if (slen >= sizeof(v_str)) slen = sizeof(v_str) - 1;
+            memcpy(v_str, v + 1, slen);
+            v_str[slen] = 0;
+        } else if ((*v >= '0' && *v <= '9') || *v == '-' || *v == '+' || *v == '.') {
+            char tmp[64];
+            size_t cn = val_len < sizeof(tmp) - 1 ? val_len : sizeof(tmp) - 1;
+            memcpy(tmp, v, cn); tmp[cn] = 0;
+            v_num = atof(tmp);
+            v_is_num = 1;
+        } else if (val_len == 4 && memcmp(v, "true", 4) == 0) {
+            strcpy(v_str, "true");
+        } else if (val_len == 5 && memcmp(v, "false", 5) == 0) {
+            strcpy(v_str, "false");
+        } else if (val_len == 4 && memcmp(v, "null", 4) == 0) {
+            strcpy(v_str, "null");
+        } else {
+            return 0;
+        }
+        if (rhs_is_num && v_is_num) {
+            double d = v_num - rhs_num;
+            switch (op_code) {
+                case POLLEN_COND_EQ: return d == 0;
+                case POLLEN_COND_NE: return d != 0;
+                case POLLEN_COND_LT: return d <  0;
+                case POLLEN_COND_GT: return d >  0;
+                case POLLEN_COND_LE: return d <= 0;
+                case POLLEN_COND_GE: return d >= 0;
+            }
+        } else if (!rhs_is_num) {
+            int c = strcmp(v_str, rhs_str);
+            switch (op_code) {
+                case POLLEN_COND_EQ: return c == 0;
+                case POLLEN_COND_NE: return c != 0;
+                case POLLEN_COND_LT: return c <  0;
+                case POLLEN_COND_GT: return c >  0;
+                case POLLEN_COND_LE: return c <= 0;
+                case POLLEN_COND_GE: return c >= 0;
+            }
+        }
+        return 0;
+    }
+
+    /* Recursive cond eval over raw JSON. Empty expr → true (else
+     * branch). Composite forms : op:and|or|not, op:in|not_in. */
+    static int _pollen_cond_eval_expr(const char* env, size_t env_len,
+                                        const char* expr, size_t expr_len) {
+        if (expr_len == 0) return 1;
+        char outer_key[16];
+        if (!_pollen_expr_outer_key(expr, expr_len,
+                                      outer_key, sizeof(outer_key))) return 0;
+        if (strcmp(outer_key, "op") != 0) return 0;
+
+        const char* opv; size_t op_len;
+        if (!_pollen_json_field(expr, expr_len, "op", 2, &opv, &op_len)) return 0;
+        if (op_len < 2 || *opv != '"') return 0;
+        char op[16];
+        size_t olen = op_len - 2;
+        if (olen >= sizeof(op)) return 0;
+        memcpy(op, opv + 1, olen); op[olen] = 0;
+
+        if (strcmp(op, "and") == 0 || strcmp(op, "or") == 0) {
+            const char* args; size_t args_len;
+            if (!_pollen_json_field(expr, expr_len, "args", 4,
+                                      &args, &args_len)) return 0;
+            if (args_len < 2 || *args != '[') return 0;
+            int is_and = (op[0] == 'a');
+            const char* p = args + 1;
+            const char* end = args + args_len - 1;
+            while (p < end) {
+                while (p < end && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')) p++;
+                if (p >= end) break;
+                if (*p != '{') break;
+                const char* sp = p;
+                int depth = 1; int in_str = 0;
+                p++;
+                while (p < end && depth > 0) {
+                    if (in_str) {
+                        if (*p == '\\' && p + 1 < end) { p += 2; continue; }
+                        if (*p == '"') in_str = 0;
+                    } else {
+                        if (*p == '"') in_str = 1;
+                        else if (*p == '{') depth++;
+                        else if (*p == '}') depth--;
+                    }
+                    p++;
+                }
+                int sub_pass = _pollen_cond_eval_expr(env, env_len,
+                                                       sp, (size_t)(p - sp));
+                if (is_and && !sub_pass) return 0;
+                if (!is_and && sub_pass) return 1;
+            }
+            return is_and ? 1 : 0;
+        }
+
+        if (strcmp(op, "not") == 0) {
+            const char* arg; size_t arg_len;
+            if (!_pollen_json_field(expr, expr_len, "arg", 3,
+                                      &arg, &arg_len)) return 0;
+            return !_pollen_cond_eval_expr(env, env_len, arg, arg_len);
+        }
+
+        if (strcmp(op, "in") == 0 || strcmp(op, "not_in") == 0) {
+            int negate = (op[0] == 'n');
+            const char* varTok; size_t varTokLen;
+            if (!_pollen_json_field(expr, expr_len, "var", 3,
+                                      &varTok, &varTokLen)) return 0;
+            if (varTokLen < 2 || *varTok != '"') return 0;
+            char vpath[POLLEN_COND_VAR_MAX];
+            size_t vplen = varTokLen - 2;
+            if (vplen >= sizeof(vpath)) vplen = sizeof(vpath) - 1;
+            memcpy(vpath, varTok + 1, vplen); vpath[vplen] = 0;
+
+            const char* lookup_buf = env;
+            size_t lookup_len = env_len;
+            const char* lookup_path = vpath;
+            char state_buf[POLLEN_STATE_FILE_MAX];
+            if (strncmp(vpath, "state.", 6) == 0) {
+                char root[64];
+                if (!_pollen_extract_root_mid(env, env_len,
+                                                root, sizeof(root))) return 0;
+                int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+                if (sn <= 0) return 0;
+                lookup_buf = state_buf;
+                lookup_len = (size_t) sn;
+                lookup_path = vpath + 6;
+            }
+            const char* val_ptr; size_t val_len;
+            if (!_pollen_resolve_path(lookup_buf, lookup_len,
+                                        lookup_path, &val_ptr, &val_len)) {
+                return negate ? 1 : 0;
+            }
+
+            char v_str[128]; v_str[0] = 0;
+            if (val_len > 0 && *val_ptr == '"') {
+                size_t slen = val_len >= 2 ? val_len - 2 : 0;
+                if (slen >= sizeof(v_str)) slen = sizeof(v_str) - 1;
+                memcpy(v_str, val_ptr + 1, slen);
+                v_str[slen] = 0;
+            } else {
+                size_t cn = val_len < sizeof(v_str) - 1 ? val_len : sizeof(v_str) - 1;
+                memcpy(v_str, val_ptr, cn); v_str[cn] = 0;
+            }
+
+            const char* values; size_t values_len;
+            if (!_pollen_json_field(expr, expr_len, "values", 6,
+                                      &values, &values_len)) return 0;
+            if (values_len < 2 || *values != '[') return 0;
+            const char* p = values + 1;
+            const char* end = values + values_len - 1;
+            int found = 0;
+            while (p < end) {
+                while (p < end && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')) p++;
+                if (p >= end) break;
+                const char* tok = p;
+                char tok_buf[128]; tok_buf[0] = 0;
+                if (*p == '"') {
+                    p++;
+                    const char* q = p;
+                    while (q < end && *q != '"') {
+                        if (*q == '\\' && q + 1 < end) { q += 2; continue; }
+                        q++;
+                    }
+                    size_t slen = (size_t)(q - p);
+                    if (slen >= sizeof(tok_buf)) slen = sizeof(tok_buf) - 1;
+                    memcpy(tok_buf, p, slen); tok_buf[slen] = 0;
+                    p = (q < end) ? q + 1 : q;
+                } else {
+                    while (p < end && *p != ',' && *p != ']'
+                           && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') p++;
+                    size_t slen = (size_t)(p - tok);
+                    if (slen >= sizeof(tok_buf)) slen = sizeof(tok_buf) - 1;
+                    memcpy(tok_buf, tok, slen); tok_buf[slen] = 0;
+                }
+                if (strcmp(tok_buf, v_str) == 0) { found = 1; break; }
+            }
+            return negate ? (found ? 0 : 1) : (found ? 1 : 0);
+        }
+
+        /* Leaf comparison. */
+        int op_code = POLLEN_COND_NONE;
+        if      (strcmp(op, "==") == 0) op_code = POLLEN_COND_EQ;
+        else if (strcmp(op, "!=") == 0) op_code = POLLEN_COND_NE;
+        else if (strcmp(op, "<")  == 0) op_code = POLLEN_COND_LT;
+        else if (strcmp(op, ">")  == 0) op_code = POLLEN_COND_GT;
+        else if (strcmp(op, "<=") == 0) op_code = POLLEN_COND_LE;
+        else if (strcmp(op, ">=") == 0) op_code = POLLEN_COND_GE;
+        else return 0;
+
+        const char* var; size_t var_len;
+        if (!_pollen_json_field(expr, expr_len, "var", 3,
+                                  &var, &var_len)) return 0;
+        if (var_len < 2 || *var != '"') return 0;
+        char path[POLLEN_COND_VAR_MAX];
+        size_t plen = var_len - 2;
+        if (plen >= sizeof(path)) plen = sizeof(path) - 1;
+        memcpy(path, var + 1, plen); path[plen] = 0;
+
+        const char* val; size_t v_len;
+        if (!_pollen_json_field(expr, expr_len, "value", 5,
+                                  &val, &v_len)) return 0;
+        int rhs_is_num = 0;
+        double rhs_num = 0;
+        char rhs_str[POLLEN_COND_STR_MAX] = "";
+        if (v_len > 0 && *val == '"') {
+            size_t slen = v_len >= 2 ? v_len - 2 : 0;
+            if (slen >= sizeof(rhs_str)) slen = sizeof(rhs_str) - 1;
+            memcpy(rhs_str, val + 1, slen); rhs_str[slen] = 0;
+        } else if (v_len > 0 && ((*val >= '0' && *val <= '9')
+                   || *val == '-' || *val == '+' || *val == '.')) {
+            char tmp[64];
+            size_t cn = v_len < sizeof(tmp) - 1 ? v_len : sizeof(tmp) - 1;
+            memcpy(tmp, val, cn); tmp[cn] = 0;
+            rhs_num = atof(tmp);
+            rhs_is_num = 1;
+        } else if (v_len == 4 && memcmp(val, "true", 4) == 0) {
+            strcpy(rhs_str, "true");
+        } else if (v_len == 5 && memcmp(val, "false", 5) == 0) {
+            strcpy(rhs_str, "false");
+        } else if (v_len == 4 && memcmp(val, "null", 4) == 0) {
+            strcpy(rhs_str, "null");
+        } else {
+            return 0;
+        }
+
+        return _pollen_cond_eval_leaf(env, env_len, path, op_code,
+                                        rhs_is_num, rhs_num, rhs_str);
+    }
+
+    /* Public facade — evaluate an expression against an envelope.
+     * Returns the literal form (number-as-string, or "\"foo\"" with
+     * the quotes embedded). Empty "" on eval failure. */
+    static code_string
+    Amalgame_Pollen_Pollen_EvalExpr_c(code_string envelopeJson,
+                                        code_string exprJson) {
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!envelopeJson || !exprJson) return (code_string) empty;
+        const char* env = (const char*) envelopeJson;
+        const char* expr = (const char*) exprJson;
+        size_t env_len = strlen(env);
+        size_t expr_len = strlen(expr);
+        _pollen_expr_val_t val;
+        if (!_pollen_eval_expr(env, env_len, expr, expr_len, &val)) {
+            return (code_string) empty;
+        }
+        char lit[256];
+        int n = _pollen_expr_val_to_literal(&val, lit, sizeof(lit));
+        if (n <= 0 || n >= (int) sizeof(lit)) return (code_string) empty;
+        char* out = (char*) GC_MALLOC_ATOMIC((size_t) n + 1);
+        if (!out) return (code_string) empty;
+        memcpy(out, lit, (size_t) n); out[n] = 0;
+        return (code_string) out;
+    }
+
+    /* Public facade — evaluate a cond expression against an envelope.
+     * Empty cond → true (else-branch semantics). */
+    static code_bool
+    Amalgame_Pollen_Pollen_EvalCond_c(code_string envelopeJson,
+                                        code_string condJson) {
+        if (!envelopeJson) return (code_bool) 0;
+        const char* env = (const char*) envelopeJson;
+        const char* cond = condJson ? (const char*) condJson : "";
+        size_t env_len = strlen(env);
+        size_t cond_len = strlen(cond);
+        int ok = _pollen_cond_eval_expr(env, env_len, cond, cond_len);
+        return (code_bool) (ok ? 1 : 0);
+    }
+
     /* === TCP transport ======================================== */
     static void
     Amalgame_Pollen_Pollen_StartListener_c(int64_t port) {
@@ -410,6 +1028,27 @@ public class Pollen {
         var ok: int = 0
         @c { ok = Amalgame_Pollen_Pollen_StateSet_c(rootMid, path,
                                                       jsonLiteral); }
+        return ok != 0
+    }
+
+    // M2.2 — evaluate a set.value expression against an envelope.
+    // Returns the literal form ("42", "\"foo\"", "3.14") or "" on
+    // failure. Expressions follow {"const":<lit>} | {"var":"<path>"} |
+    // {"op":"+|-|*|/", "left":<E>, "right":<E>}. `state.X` paths
+    // resolve through the per-execution state file.
+    public static string EvalExpr(envelopeJson: string, exprJson: string) {
+        var s: string = ""
+        @c { s = Amalgame_Pollen_Pollen_EvalExpr_c(envelopeJson, exprJson); }
+        return s
+    }
+
+    // M2.2 — evaluate a cond expression against an envelope.
+    // Empty cond → true (else-branch semantics). Supports leaf ops
+    // (==, !=, <, >, <=, >=), composite (and / or / not), and
+    // membership (in / not_in).
+    public static bool EvalCond(envelopeJson: string, condJson: string) {
+        var ok: int = 0
+        @c { ok = Amalgame_Pollen_Pollen_EvalCond_c(envelopeJson, condJson); }
         return ok != 0
     }
 
