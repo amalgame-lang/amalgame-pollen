@@ -52,6 +52,9 @@ void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
 code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
                                             code_string topicUuid, int64_t topicVersion,
                                             code_string dataJson);
+code_string Amalgame_Pollen_Pollen_PublishSync(code_string host, int64_t port,
+                                                code_string topicUuid, int64_t topicVersion,
+                                                code_string dataJson, int64_t timeoutMs);
 
 /* Introspection */
 int64_t     Amalgame_Pollen_Pollen_WorkflowVersion(void);
