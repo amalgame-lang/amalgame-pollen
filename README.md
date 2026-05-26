@@ -43,6 +43,19 @@ public class Page {
 - One Pollen engine per process — engine state is in static C globals (matches `pollen` v0.2 behavior). v0.2 will optionally wrap in an opaque handle.
 - Single-source class while amc's multi-source package story stabilises ; sibling .am modules to be split out later.
 
+## Publishing checklist (first release)
+
+Following [the official package-indexing workflow](https://github.com/amalgame-lang/packages-index) :
+
+1. `gh repo create amalgame-lang/amalgame-pollen --public --source . --remote origin`
+2. `git push -u origin main`
+3. `git tag v0.1.0 && git push --tags` — CI must pass
+4. Open a PR on `amalgame-lang/packages-index` adding a `[[package]]` entry (`name="pollen"`, `category="messaging"`, etc.)
+5. After merge, run `./tools/register-package.sh pollen v0.1.0` from the Amalgame compiler repo — script opens a second PR with the `[[version]]` row, merge it
+6. Verify : `amc package add pollen` resolves
+
+CI workflow in `.github/workflows/ci.yml` builds the package archive ; once M2 lands, smoke tests will activate.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
