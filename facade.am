@@ -57,6 +57,11 @@ namespace Amalgame.Pollen
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
         "M2-M3 migration from pollen.am in progress.\n";
 
+    /* Forward declarations — order in this TU is one-shot @c so a
+     * helper used before its definition (M2.3a's _pollen_now_ms_c
+     * referenced from M2.3b's listener worker) needs hoisting. */
+    static int64_t _pollen_now_ms_c(void);
+
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
      * has to be defined before any system header which is hard to
      * guarantee from inside an amc @c block. Naive O(h × n) is fine
@@ -933,10 +938,100 @@ namespace Amalgame.Pollen
     }
 
     /* === TCP transport ======================================== */
+
+    /* M2.3b — accept loop + per-connection ACK echo worker.
+     * Plain TCP + newline-framed JSON envelopes. No workflow
+     * dispatch yet (M2.3c) and no debug bridge (M2.4) — just
+     * recv → extract messageId → send back an ACK envelope.
+     * One pthread per accepted connection ; the accept thread
+     * itself blocks in StartListener until the process exits. */
+
+    #include <pthread.h>
+
+    static void* _pollen_listener_worker(void* arg) {
+        int fd = (int)(intptr_t) arg;
+        char rbuf[16384];
+        size_t rlen = 0;
+        char ack[256];
+        const char* MID_KEY = "\"messageId\":\"";
+        const size_t MID_KEY_LEN = 13;
+
+        for (;;) {
+            if (rlen >= sizeof(rbuf)) break;  /* oversize line — drop */
+            ssize_t n = recv(fd, rbuf + rlen, sizeof(rbuf) - rlen, 0);
+            if (n <= 0) break;
+            rlen += (size_t) n;
+            for (;;) {
+                char* nl = memchr(rbuf, '\n', rlen);
+                if (!nl) break;
+                size_t line_len = (size_t)(nl - rbuf);
+                const char* mp = _pollen_find(rbuf, line_len,
+                                                MID_KEY, MID_KEY_LEN);
+                if (mp) {
+                    mp += MID_KEY_LEN;
+                    const char* mq = memchr(mp, '"',
+                                            line_len - (size_t)(mp - rbuf));
+                    if (mq) {
+                        size_t midlen = (size_t)(mq - mp);
+                        int64_t now = _pollen_now_ms_c();
+                        int alen = snprintf(ack, sizeof(ack),
+                            "{\"type\":\"ACK\",\"messageId\":\"%.*s\","
+                             "\"timestamp\":%lld}\n",
+                            (int) midlen, mp, (long long) now);
+                        if (alen > 0 && alen < (int) sizeof(ack)) {
+                            ssize_t sent = 0;
+                            while (sent < alen) {
+                                ssize_t w = send(fd, ack + sent,
+                                                 (size_t)(alen - sent),
+                                                 MSG_NOSIGNAL);
+                                if (w <= 0) goto worker_done;
+                                sent += w;
+                            }
+                        }
+                    }
+                }
+                size_t consumed = line_len + 1;
+                memmove(rbuf, rbuf + consumed, rlen - consumed);
+                rlen -= consumed;
+            }
+        }
+    worker_done:
+        close(fd);
+        return NULL;
+    }
+
+    static int _pollen_listen_simple(int port) {
+        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) return -1;
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons((uint16_t) port);
+        if (bind(srv, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(srv); return -1;
+        }
+        if (listen(srv, 64) < 0) { close(srv); return -1; }
+        for (;;) {
+            int conn = accept(srv, NULL, NULL);
+            if (conn < 0) continue;
+            pthread_t th;
+            if (pthread_create(&th, NULL,
+                                _pollen_listener_worker,
+                                (void*)(intptr_t) conn) != 0) {
+                close(conn); continue;
+            }
+            pthread_detach(th);
+        }
+        /* unreachable until we add a shutdown path */
+        close(srv);
+        return 0;
+    }
+
     static void
     Amalgame_Pollen_Pollen_StartListener_c(int64_t port) {
-        fprintf(stderr, _pollen_pkg_unimpl_warning, "StartListener");
-        (void) port;
+        (void) _pollen_listen_simple((int) port);
     }
 
     /* M2.3a — UUID v4 generator (RFC 4122 variant + version bits).
@@ -1037,6 +1132,111 @@ namespace Amalgame.Pollen
         return (code_string) out;
     }
 
+    /* M2.3b — synchronous publish : same as _pollen_publish_one but
+     * keeps the socket open after the send and waits up to
+     * timeout_ms for the matching ACK. Returns 1 if ACK arrived
+     * for the expected mid, 0 on connect/send/recv/timeout failure
+     * or mid mismatch. `out_mid` always receives the minted UUID
+     * (even on ACK failure) so the caller can log it. */
+    #include <poll.h>
+    static int _pollen_publish_sync(const char* host, int port,
+                                      const char* topic_uuid,
+                                      int64_t topic_version,
+                                      const char* data_json,
+                                      int timeout_ms,
+                                      char* out_mid) {
+        if (!host || !topic_uuid || !data_json || !out_mid) return 0;
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(fd); return 0;
+        }
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(fd); return 0;
+        }
+        _pollen_gen_uuid(out_mid);
+        char envelope[8192];
+        int64_t now = _pollen_now_ms_c();
+        int env_len = snprintf(envelope, sizeof(envelope),
+            "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+             "\"type\":\"MESSAGE\","
+             "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
+             "\"data\":%s,\"timestamp\":%lld}\n",
+            out_mid, out_mid, topic_uuid,
+            (long long) topic_version, data_json, (long long) now);
+        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
+            close(fd); return 0;
+        }
+        ssize_t sent = 0;
+        while (sent < env_len) {
+            ssize_t n = send(fd, envelope + sent,
+                              (size_t)(env_len - sent), MSG_NOSIGNAL);
+            if (n < 0) { close(fd); return 0; }
+            sent += n;
+        }
+
+        /* Wait for one newline-terminated line and verify it ACKs
+         * our mid. poll() bounds the wait by timeout_ms. */
+        char rbuf[2048];
+        size_t rlen = 0;
+        int got_ack = 0;
+        int remaining = timeout_ms > 0 ? timeout_ms : 5000;
+        while (rlen < sizeof(rbuf) - 1) {
+            struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN;
+            int64_t start = _pollen_now_ms_c();
+            int pr = poll(&pfd, 1, remaining);
+            if (pr <= 0) break;  /* timeout or error */
+            ssize_t n = recv(fd, rbuf + rlen, sizeof(rbuf) - 1 - rlen, 0);
+            if (n <= 0) break;
+            rlen += (size_t) n;
+            rbuf[rlen] = 0;
+            char* nl = memchr(rbuf, '\n', rlen);
+            if (nl) {
+                size_t line_len = (size_t)(nl - rbuf);
+                const char* mp = _pollen_find(rbuf, line_len,
+                                                "\"messageId\":\"", 13);
+                if (mp) {
+                    mp += 13;
+                    const char* mq = memchr(mp, '"',
+                                              line_len - (size_t)(mp - rbuf));
+                    if (mq && (size_t)(mq - mp) == 36
+                        && memcmp(mp, out_mid, 36) == 0) {
+                        got_ack = 1;
+                    }
+                }
+                break;
+            }
+            int64_t elapsed = _pollen_now_ms_c() - start;
+            remaining -= (int) elapsed;
+            if (remaining <= 0) break;
+        }
+        close(fd);
+        return got_ack;
+    }
+
+    static code_string
+    Amalgame_Pollen_Pollen_PublishSync_c(code_string host, int64_t port,
+                                          code_string topicUuid, int64_t topicVersion,
+                                          code_string dataJson, int64_t timeoutMs) {
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!host || !topicUuid || !dataJson) return (code_string) empty;
+        char mid[37];
+        int ok = _pollen_publish_sync((const char*) host, (int) port,
+                                        (const char*) topicUuid,
+                                        topicVersion,
+                                        (const char*) dataJson,
+                                        (int) timeoutMs, mid);
+        if (!ok) return (code_string) empty;
+        char* out = (char*) GC_MALLOC_ATOMIC(37);
+        if (!out) return (code_string) empty;
+        memcpy(out, mid, 37);
+        return (code_string) out;
+    }
+
     /* === Introspection ======================================== */
     static int64_t
     Amalgame_Pollen_Pollen_WorkflowVersion_c(void) {
@@ -1077,11 +1277,31 @@ public class Pollen {
                                                        (int64_t) port); }
     }
 
-    // Block in the current thread, accepting + dispatching messages
-    // per the loaded workflow.
-    // STATUS : stub (M3).
+    // Block in the current thread, accepting MESSAGE envelopes on
+    // the given port and ACKing each one. One pthread per accepted
+    // connection. Does NOT yet dispatch per the workflow tree —
+    // forwarding lands with M2.3c (LoadWorkflow + tree walker).
+    // STATUS : real since v0.1.5 (M2.3b). For now this is an
+    // ACK-echo listener — useful for benchmarking + as the
+    // downstream-peer half of a publish smoke test.
     public static void StartListener(port: int) {
         @c { Amalgame_Pollen_Pollen_StartListener_c((int64_t) port); }
+    }
+
+    // Synchronous publish — same envelope shape as Publish but
+    // blocks until the matching ACK comes back (or timeoutMs
+    // elapses). Returns the mid on success, "" if the connect /
+    // send fails or the ACK doesn't arrive in time / doesn't
+    // match. timeoutMs == 0 → defaults to 5000 ms.
+    // STATUS : real since v0.1.5 (M2.3b).
+    public static string PublishSync(host: string, port: int,
+                                       topicUuid: string, topicVersion: int,
+                                       dataJson: string, timeoutMs: int) {
+        var mid: string = ""
+        @c { mid = Amalgame_Pollen_Pollen_PublishSync_c(host, (int64_t) port,
+                                                          topicUuid, (int64_t) topicVersion,
+                                                          dataJson, (int64_t) timeoutMs); }
+        return mid
     }
 
     // Fire-and-forget : send a MESSAGE envelope. Returns the
