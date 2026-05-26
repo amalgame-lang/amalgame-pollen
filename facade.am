@@ -1,92 +1,164 @@
 // facade.am — public AM API for the amalgame-pollen package.
 //
-// This file currently exposes only the surface declarations.
-// The full engine implementation (workflow.json parsing, cond
-// evaluator, set ops + state file, while/for routing, debug
-// bridge, TCP transport with hot-reload mutex) still lives in
-// /home/neitsab/Développement/pollen/tools/pollen-node-tcp.am
-// and will be migrated piece by piece (M2-M3 milestones).
+// v0.1.0-dev :  SKELETON with linkable STUBS. The actual engine
+// migration from pollen/tools/pollen.am happens in M2-M3.
 //
-// For v0.1 the public methods will internally call into static
-// @c functions identical to the ones in pollen-node-tcp.am ;
-// once the migration is complete this file owns them and the
-// CLI shrinks to a ~80-line wrapper.
+// Today the methods in this file return dummy values + log a
+// warning ; the C symbols exist so consumers can `import
+// Amalgame.Pollen` and compile without link errors.
 //
-// API mapping table (CLI vs package vs Mosaic embed) :
+// API mapping (target shape, partly stubbed today) :
 //
 //   CLI flag                   Package call
 //   --workflow <path>          Pollen.WorkflowLoad(path, role, port)
-//   --node-name <role>         (passed as second arg)
+//   --node-name <role>         (second arg)
 //   --shared-dir <path>        Pollen.WorkflowSetSharedDir(path)
 //   --publish host:port:t:v:d  Pollen.Publish(host, port, t, v, d)
 //   (start listening)          Pollen.StartListener(port)
 //
-//   Mosaic app pattern :
+//   Mosaic embed :
 //     public static HttpResponse POST(ctx: WebContext) {
 //       let mid: string = Pollen.Publish("127.0.0.1", 8000,
 //                                         "order.in", 1, ctx.Body)
-//       return HttpResponse.New().Json("{\"messageId\":\"" + mid + "\"}")
+//       return HttpResponse.New().Json(
+//         "{\"messageId\":\"" + mid + "\"}")
 //     }
-//
-// The Pollen class is declared in amalgame.toml ; amc auto-attaches
-// the package when any source imports Amalgame.Pollen.
 
 namespace Amalgame.Pollen
 
+@c {
+    #include <stdio.h>
+    #include <stdint.h>
+    #include <string.h>
+    #include <gc.h>
+
+    /* Singleton-per-process engine state. v0.1 carries flags only ;
+     * M2-M3 will copy in the full runtime from pollen.am. */
+    static int _pollen_pkg_loaded = 0;
+    static int _pollen_pkg_version = 0;
+    static char _pollen_pkg_role[64] = "";
+    static char _pollen_pkg_shared_dir[512] = "";
+
+    static const char _pollen_pkg_unimpl_warning[] =
+        "amalgame-pollen v0.1.0-dev : %s is a stub. "
+        "M2-M3 migration from pollen.am in progress.\n";
+
+    /* === Workflow lifecycle =================================== */
+    static code_bool
+    Amalgame_Pollen_Pollen_WorkflowLoad_c(code_string path, code_string nodeName,
+                                            int64_t actualPort) {
+        fprintf(stderr, _pollen_pkg_unimpl_warning, "WorkflowLoad");
+        (void) path; (void) nodeName; (void) actualPort;
+        return (code_bool) 0;
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowSetSharedDir_c(code_string path) {
+        if (path) {
+            strncpy(_pollen_pkg_shared_dir, path,
+                     sizeof(_pollen_pkg_shared_dir) - 1);
+            _pollen_pkg_shared_dir[sizeof(_pollen_pkg_shared_dir) - 1] = 0;
+        }
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowSetSelf_c(code_string role, code_string host,
+                                               int64_t port) {
+        if (role) {
+            strncpy(_pollen_pkg_role, role, sizeof(_pollen_pkg_role) - 1);
+            _pollen_pkg_role[sizeof(_pollen_pkg_role) - 1] = 0;
+        }
+        (void) host; (void) port;
+    }
+
+    /* === TCP transport ======================================== */
+    static void
+    Amalgame_Pollen_Pollen_StartListener_c(int64_t port) {
+        fprintf(stderr, _pollen_pkg_unimpl_warning, "StartListener");
+        (void) port;
+    }
+
+    static code_string
+    Amalgame_Pollen_Pollen_Publish_c(code_string host, int64_t port,
+                                       code_string topicUuid, int64_t topicVersion,
+                                       code_string dataJson) {
+        fprintf(stderr, _pollen_pkg_unimpl_warning, "Publish");
+        (void) host; (void) port; (void) topicUuid;
+        (void) topicVersion; (void) dataJson;
+        /* Return an empty string allocated through bdwgc so the
+         * caller can hold onto it without a use-after-free. */
+        char* out = (char*) GC_MALLOC_ATOMIC(1);
+        if (out) out[0] = 0;
+        return (code_string) out;
+    }
+
+    /* === Introspection ======================================== */
+    static int64_t
+    Amalgame_Pollen_Pollen_WorkflowVersion_c(void) {
+        return (int64_t) _pollen_pkg_version;
+    }
+
+    static code_string
+    Amalgame_Pollen_Pollen_WorkflowActiveRole_c(void) {
+        size_t len = strlen(_pollen_pkg_role);
+        char* out = (char*) GC_MALLOC_ATOMIC(len + 1);
+        if (out) { memcpy(out, _pollen_pkg_role, len); out[len] = 0; }
+        return (code_string) out;
+    }
+}
+
 public class Pollen {
     // Load a workflow.json file. `nodeName` overrides port-based
-    // role lookup (matches CLI --node-name). `actualPort` is the
-    // listener port, used to find the role when nodeName is empty.
-    // Returns true on successful parse + load.
-    public static bool WorkflowLoad(workflowPath: string, nodeName: string, actualPort: int) {
+    // role lookup. Returns true on success.
+    // STATUS : stub (M2). Returns false + stderr warning.
+    public static bool WorkflowLoad(workflowPath: string, nodeName: string,
+                                     actualPort: int) {
         var ok: int = 0
-        @c { ok = Amalgame_Pollen_Pollen_WorkflowLoad_c(workflowPath, nodeName, (i64) actualPort); }
+        @c { ok = Amalgame_Pollen_Pollen_WorkflowLoad_c(workflowPath, nodeName,
+                                                          (int64_t) actualPort); }
         return ok != 0
     }
 
-    // Configure where sharedDir/state/ and sharedDir/executions/
-    // records live. Must be set BEFORE WorkflowLoad if you want
-    // state persistence to work (otherwise set ops silently no-op).
+    // Configure sharedDir/state/ + sharedDir/executions/ location.
+    // STATUS : stores the path ; full effect lands with M2 state
+    // persist migration.
     public static void WorkflowSetSharedDir(path: string) {
         @c { Amalgame_Pollen_Pollen_WorkflowSetSharedDir_c(path); }
     }
 
-    // Phase 3.5 — self identity. Used by the executions/ recorder
-    // when emitting per-hop step records. Typically called once
-    // at startup.
+    // Phase 3.5 — self identity for executions/ recorder.
     public static void WorkflowSetSelf(role: string, host: string, port: int) {
-        @c { Amalgame_Pollen_Pollen_WorkflowSetSelf_c(role, host, (i64) port); }
+        @c { Amalgame_Pollen_Pollen_WorkflowSetSelf_c(role, host,
+                                                       (int64_t) port); }
     }
 
-    // Start the TCP listener on `port` in the current thread.
-    // Blocks until the process exits ; spawns one worker thread
-    // per accepted connection.
+    // Block in the current thread, accepting + dispatching messages
+    // per the loaded workflow.
+    // STATUS : stub (M3).
     public static void StartListener(port: int) {
-        @c { Amalgame_Pollen_Pollen_StartListener_c((i64) port); }
+        @c { Amalgame_Pollen_Pollen_StartListener_c((int64_t) port); }
     }
 
-    // Fire-and-forget : send a MESSAGE envelope to host:port on the
-    // given topic. Returns the newly-minted messageId (also serves
-    // as the rootMessageId for the execution chain).
+    // Fire-and-forget : send a MESSAGE envelope. Returns the
+    // newly-minted messageId (which becomes the rootMessageId
+    // for the execution chain).
+    // STATUS : stub (M2). Returns empty string + stderr warning.
     public static string Publish(host: string, port: int,
                                   topicUuid: string, topicVersion: int,
                                   dataJson: string) {
         var mid: string = ""
-        @c { mid = Amalgame_Pollen_Pollen_Publish_c(host, (i64) port,
-                                                      topicUuid, (i64) topicVersion,
+        @c { mid = Amalgame_Pollen_Pollen_Publish_c(host, (int64_t) port,
+                                                      topicUuid, (int64_t) topicVersion,
                                                       dataJson); }
         return mid
     }
 
-    // Counter incremented each time WorkflowLoad commits a new
-    // tree (hot-reload watcher relies on this).
     public static int WorkflowVersion() {
         var v: int = 0
         @c { v = Amalgame_Pollen_Pollen_WorkflowVersion_c(); }
         return v
     }
 
-    // Empty if no role matched (free-form mode).
     public static string WorkflowActiveRole() {
         var r: string = ""
         @c { r = Amalgame_Pollen_Pollen_WorkflowActiveRole_c(); }
