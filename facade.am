@@ -115,6 +115,41 @@ namespace Amalgame.Pollen
     static int             _pollen_n_set_ops = 0;
     static pollen_set_op_t _pollen_set_ops[POLLEN_SET_OPS_MAX];
 
+    /* M2.3c.2b — for / while route storage (Phase 5.4). Mirrors
+     * the workflow-tree runtime : a for loop is a finite item list
+     * that gets fanned out to a target set ; a while loop is a
+     * self-loop bounded by maxIter + a JSON cond evaluated each
+     * iteration. Both maintain iter / item state via the same
+     * state.X persist machinery as the set ops. */
+    #define POLLEN_FOR_MAX_ITEMS 32
+    #define POLLEN_FOR_ITEM_MAX  256
+
+    typedef struct {
+        char items[POLLEN_FOR_MAX_ITEMS][POLLEN_FOR_ITEM_MAX];
+        int  n_items;
+        char item_var[POLLEN_COND_VAR_MAX];
+        char target_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+        int  target_port[POLLEN_MAX_NEXTS];
+        int  n_targets;
+    } pollen_for_route_t;
+
+    static int                _pollen_for_active = 0;
+    static pollen_for_route_t _pollen_for_route;
+
+    typedef struct {
+        char cond_expr[POLLEN_COND_EXPR_MAX];
+        char iter_state_key[POLLEN_COND_VAR_MAX];
+        int  max_iter;
+        char loop_host[POLLEN_HOST_MAX];
+        int  loop_port;
+        char exit_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+        int  exit_port[POLLEN_MAX_NEXTS];
+        int  n_exits;
+    } pollen_while_route_t;
+
+    static int                  _pollen_while_active = 0;
+    static pollen_while_route_t _pollen_while_route;
+
     static const char _pollen_pkg_unimpl_warning[] =
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
         "M2-M3 migration from pollen.am in progress.\n";
@@ -125,6 +160,8 @@ namespace Amalgame.Pollen
     static void    _pollen_gen_uuid(char* buf);
     static void    _pollen_cond_clear(void);
     static void    _pollen_set_ops_clear(void);
+    static void    _pollen_for_clear(void);
+    static void    _pollen_while_clear(void);
     static void    _pollen_wf_forward_one(const char* host, int port,
                                             const char* envelope, size_t env_len);
     static size_t  _pollen_wf_rebuild_envelope(
@@ -132,6 +169,8 @@ namespace Amalgame.Pollen
                        char* out, size_t out_cap,
                        const char* new_topic,
                        char* out_new_mid);
+    static void    _pollen_for_forward(const char* env, size_t env_len);
+    static void    _pollen_while_forward(const char* env, size_t env_len);
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
      * has to be defined before any system header which is hard to
@@ -1013,6 +1052,83 @@ namespace Amalgame.Pollen
         return (code_bool) (ok ? 1 : 0);
     }
 
+    /* === M2.3c.2b — for / while setters + dispatch ============ */
+
+    static void _pollen_for_clear(void) {
+        _pollen_for_active = 0;
+        _pollen_for_route.n_items = 0;
+        _pollen_for_route.n_targets = 0;
+        _pollen_for_route.item_var[0] = 0;
+    }
+
+    static void _pollen_for_setup(const char* var) {
+        _pollen_for_active = 1;
+        _pollen_for_route.n_items = 0;
+        _pollen_for_route.n_targets = 0;
+        strncpy(_pollen_for_route.item_var,
+                 var && var[0] ? var : "item",
+                 POLLEN_COND_VAR_MAX - 1);
+        _pollen_for_route.item_var[POLLEN_COND_VAR_MAX - 1] = 0;
+    }
+
+    static void _pollen_for_add_target(const char* host, int port) {
+        if (_pollen_for_route.n_targets >= POLLEN_MAX_NEXTS) return;
+        strncpy(_pollen_for_route.target_host[_pollen_for_route.n_targets],
+                 host ? host : "", POLLEN_HOST_MAX - 1);
+        _pollen_for_route.target_host[_pollen_for_route.n_targets][POLLEN_HOST_MAX - 1] = 0;
+        _pollen_for_route.target_port[_pollen_for_route.n_targets] = port;
+        _pollen_for_route.n_targets++;
+    }
+
+    static void _pollen_for_add_item(const char* item_lit) {
+        if (_pollen_for_route.n_items >= POLLEN_FOR_MAX_ITEMS) return;
+        strncpy(_pollen_for_route.items[_pollen_for_route.n_items],
+                 item_lit ? item_lit : "null",
+                 POLLEN_FOR_ITEM_MAX - 1);
+        _pollen_for_route.items[_pollen_for_route.n_items][POLLEN_FOR_ITEM_MAX - 1] = 0;
+        _pollen_for_route.n_items++;
+    }
+
+    static void _pollen_while_clear(void) {
+        _pollen_while_active = 0;
+        _pollen_while_route.cond_expr[0] = 0;
+        _pollen_while_route.iter_state_key[0] = 0;
+        _pollen_while_route.max_iter = 0;
+        _pollen_while_route.loop_host[0] = 0;
+        _pollen_while_route.loop_port = 0;
+        _pollen_while_route.n_exits = 0;
+    }
+
+    static void _pollen_while_setup(const char* cond_json,
+                                      const char* iter_key,
+                                      int max_iter,
+                                      const char* self_host,
+                                      int self_port) {
+        _pollen_while_active = 1;
+        strncpy(_pollen_while_route.cond_expr, cond_json ? cond_json : "",
+                 POLLEN_COND_EXPR_MAX - 1);
+        _pollen_while_route.cond_expr[POLLEN_COND_EXPR_MAX - 1] = 0;
+        strncpy(_pollen_while_route.iter_state_key,
+                 iter_key && iter_key[0] ? iter_key : "_wf_iter",
+                 POLLEN_COND_VAR_MAX - 1);
+        _pollen_while_route.iter_state_key[POLLEN_COND_VAR_MAX - 1] = 0;
+        _pollen_while_route.max_iter = max_iter > 0 ? max_iter : 100;
+        strncpy(_pollen_while_route.loop_host, self_host ? self_host : "",
+                 POLLEN_HOST_MAX - 1);
+        _pollen_while_route.loop_host[POLLEN_HOST_MAX - 1] = 0;
+        _pollen_while_route.loop_port = self_port;
+        _pollen_while_route.n_exits = 0;
+    }
+
+    static void _pollen_while_add_exit(const char* host, int port) {
+        if (_pollen_while_route.n_exits >= POLLEN_MAX_NEXTS) return;
+        strncpy(_pollen_while_route.exit_host[_pollen_while_route.n_exits],
+                 host ? host : "", POLLEN_HOST_MAX - 1);
+        _pollen_while_route.exit_host[_pollen_while_route.n_exits][POLLEN_HOST_MAX - 1] = 0;
+        _pollen_while_route.exit_port[_pollen_while_route.n_exits] = port;
+        _pollen_while_route.n_exits++;
+    }
+
     /* === M2.3c.2 — dispatch helper bodies (deferred from up top
      * because they call into the M2.2 cond_eval / expr_eval +
      * M2.1 state_persist routines defined just above). === */
@@ -1037,6 +1153,111 @@ namespace Amalgame.Pollen
             int ln = _pollen_expr_val_to_literal(&val, lit, sizeof(lit));
             if (ln <= 0 || ln >= (int) sizeof(lit)) continue;
             _pollen_state_set(root, o->path, lit);
+        }
+    }
+
+    /* Phase 5.4 — for loop. Each iteration writes state.<item_var>
+     * = items[i], then rebuilds the envelope (new mid + parent
+     * chain + topic rewrite) and forwards to every target.
+     * Total messages = n_items × n_targets. */
+    static void _pollen_for_forward(const char* env, size_t env_len) {
+        char root[64];
+        int have_root = _pollen_extract_root_mid(env, env_len,
+                                                   root, sizeof(root));
+        const char* var = _pollen_for_route.item_var;
+        char state_path[POLLEN_COND_VAR_MAX + 8];
+        if (strncmp(var, "state.", 6) == 0) {
+            snprintf(state_path, sizeof(state_path), "%s", var);
+        } else {
+            snprintf(state_path, sizeof(state_path), "state.%s", var);
+        }
+        for (int i = 0; i < _pollen_for_route.n_items; i++) {
+            const char* item = _pollen_for_route.items[i];
+            if (have_root) {
+                _pollen_state_set(root, state_path, item);
+            }
+            char rebuilt[8192];
+            const char* new_topic = _pollen_wf_emit_topic[0]
+                                      ? _pollen_wf_emit_topic : NULL;
+            size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                      rebuilt, sizeof(rebuilt),
+                                                      new_topic, NULL);
+            const char* fwd = rn > 0 ? rebuilt : env;
+            size_t fwd_len = rn > 0 ? rn : env_len;
+            for (int t = 0; t < _pollen_for_route.n_targets; t++) {
+                _pollen_wf_forward_one(_pollen_for_route.target_host[t],
+                                         _pollen_for_route.target_port[t],
+                                         fwd, fwd_len);
+            }
+        }
+    }
+
+    /* Phase 5.4 — while loop with maxIter + cond. Reads iter from
+     * state, evaluates cond, decides loop vs exit. On loop bumps
+     * iter + forwards to self. On exit forwards to every exit
+     * target. Auto-iter checked BEFORE cond so a runaway loop
+     * always terminates. */
+    static void _pollen_while_forward(const char* env, size_t env_len) {
+        char root[64];
+        int have_root = _pollen_extract_root_mid(env, env_len,
+                                                   root, sizeof(root));
+        int iter = 0;
+        if (have_root) {
+            char state_buf[POLLEN_STATE_FILE_MAX];
+            int sn = _pollen_state_read(root, state_buf, sizeof(state_buf));
+            if (sn > 0) {
+                const char* vp; size_t vl;
+                if (_pollen_resolve_path(state_buf, (size_t) sn,
+                                           _pollen_while_route.iter_state_key,
+                                           &vp, &vl)) {
+                    char tmp[32];
+                    size_t cn = vl < sizeof(tmp) - 1 ? vl : sizeof(tmp) - 1;
+                    memcpy(tmp, vp, cn); tmp[cn] = 0;
+                    iter = atoi(tmp);
+                }
+            }
+        }
+
+        int hit_max = (iter >= _pollen_while_route.max_iter);
+        int cond_pass = _pollen_cond_eval_expr(env, env_len,
+                                                 _pollen_while_route.cond_expr,
+                                                 strlen(_pollen_while_route.cond_expr));
+
+        if (!hit_max && cond_pass) {
+            if (have_root) {
+                char lit[32];
+                snprintf(lit, sizeof(lit), "%d", iter + 1);
+                _pollen_state_set(root,
+                                    _pollen_while_route.iter_state_key,
+                                    lit);
+            }
+            char rebuilt[8192];
+            const char* new_topic = _pollen_wf_emit_topic[0]
+                                      ? _pollen_wf_emit_topic : NULL;
+            size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                      rebuilt, sizeof(rebuilt),
+                                                      new_topic, NULL);
+            const char* fwd = rn > 0 ? rebuilt : env;
+            size_t fwd_len = rn > 0 ? rn : env_len;
+            _pollen_wf_forward_one(_pollen_while_route.loop_host,
+                                     _pollen_while_route.loop_port,
+                                     fwd, fwd_len);
+            return;
+        }
+
+        if (_pollen_while_route.n_exits == 0) return;
+        char rebuilt[8192];
+        const char* new_topic = _pollen_wf_emit_topic[0]
+                                  ? _pollen_wf_emit_topic : NULL;
+        size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                  rebuilt, sizeof(rebuilt),
+                                                  new_topic, NULL);
+        const char* fwd = rn > 0 ? rebuilt : env;
+        size_t fwd_len = rn > 0 ? rn : env_len;
+        for (int i = 0; i < _pollen_while_route.n_exits; i++) {
+            _pollen_wf_forward_one(_pollen_while_route.exit_host[i],
+                                     _pollen_while_route.exit_port[i],
+                                     fwd, fwd_len);
         }
     }
 
@@ -1077,10 +1298,13 @@ namespace Amalgame.Pollen
         _pollen_wf_n_consumes = 0;
         _pollen_wf_n_nexts = 0;
         _pollen_wf_emit_topic[0] = 0;
-        /* M2.3c.2 — also reset cond branches + set ops so a reload
-         * that drops the `if` / `set` reverts to plain fan-out. */
+        /* M2.3c.2 — also reset cond branches + set ops + for/while
+         * routes so a reload that drops the `if` / `set` / `for` /
+         * `while` reverts to plain fan-out. */
         _pollen_cond_clear();
         _pollen_set_ops_clear();
+        _pollen_for_clear();
+        _pollen_while_clear();
         /* _pollen_wf_active stays sticky — once a workflow has been
          * loaded, free-form fallback won't kick back in even if the
          * new config is empty. Restart the process to disable. */
@@ -1404,7 +1628,18 @@ namespace Amalgame.Pollen
                         if (_pollen_n_set_ops > 0) {
                             _pollen_set_ops_apply(rbuf, line_len);
                         }
-                        if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
+                        /* M2.3c.2b dispatch priority :
+                         *   while (self-loop bounded) > for (item fan-out)
+                         *   > cond (if / elseif branches)
+                         *   > plain fan_out (forward_all)
+                         * These flags are mutually exclusive per node in
+                         * the workflow-tree schema, but priority is safer
+                         * than asserting exclusion. */
+                        if (_pollen_while_active) {
+                            _pollen_while_forward(rbuf, line_len);
+                        } else if (_pollen_for_active) {
+                            _pollen_for_forward(rbuf, line_len);
+                        } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
                             _pollen_cond_forward(rbuf, line_len);
                         } else {
                             _pollen_wf_forward_all(rbuf, line_len);
@@ -1684,6 +1919,41 @@ namespace Amalgame.Pollen
         _pollen_set_ops_add((const char*) path, (const char*) valueExpr);
     }
 
+    /* === M2.3c.2b — AM-side for + while setters =============== */
+
+    static void
+    Amalgame_Pollen_Pollen_ForSetup_c(code_string itemVar) {
+        _pollen_for_setup((const char*) itemVar);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_ForAddTarget_c(code_string host, int64_t port) {
+        _pollen_for_add_target((const char*) host, (int) port);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_ForAddItem_c(code_string itemLit) {
+        _pollen_for_add_item((const char*) itemLit);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WhileSetup_c(code_string condJson,
+                                          code_string iterKey,
+                                          int64_t maxIter,
+                                          code_string selfHost,
+                                          int64_t selfPort) {
+        _pollen_while_setup((const char*) condJson,
+                              (const char*) iterKey,
+                              (int) maxIter,
+                              (const char*) selfHost,
+                              (int) selfPort);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WhileAddExit_c(code_string host, int64_t port) {
+        _pollen_while_add_exit((const char*) host, (int) port);
+    }
+
     static code_string
     Amalgame_Pollen_Pollen_PublishSync_c(code_string host, int64_t port,
                                           code_string topicUuid, int64_t topicVersion,
@@ -1888,6 +2158,42 @@ public class Pollen {
     // the cond / forward pass.
     public static void SetOpAdd(path: string, valueExprJson: string) {
         @c { Amalgame_Pollen_Pollen_SetOpAdd_c(path, valueExprJson); }
+    }
+
+    // M2.3c.2b — for loop. ForSetup arms the route ; subsequent
+    // ForAddTarget calls populate the downstream peer set ;
+    // ForAddItem calls populate the iteration items list.
+    // Dispatch fans out n_items × n_targets messages, writing
+    // state.<itemVar> = items[i] before each iter's forward.
+    public static void ForSetup(itemVar: string) {
+        @c { Amalgame_Pollen_Pollen_ForSetup_c(itemVar); }
+    }
+
+    public static void ForAddTarget(host: string, port: int) {
+        @c { Amalgame_Pollen_Pollen_ForAddTarget_c(host, (int64_t) port); }
+    }
+
+    public static void ForAddItem(itemLit: string) {
+        @c { Amalgame_Pollen_Pollen_ForAddItem_c(itemLit); }
+    }
+
+    // M2.3c.2b — while loop. Self-loop bounded by maxIter, with
+    // a user-supplied condJson (same grammar as Pollen.EvalCond)
+    // evaluated each iteration. The iterKey is the state.X path
+    // amc auto-bumps each loop iteration (defaults to "_wf_iter"
+    // if empty). selfHost/selfPort is where the loop forwards
+    // back to (typically the same listener that's dispatching).
+    // Exit targets are wired via WhileAddExit.
+    public static void WhileSetup(condJson: string, iterKey: string,
+                                    maxIter: int,
+                                    selfHost: string, selfPort: int) {
+        @c { Amalgame_Pollen_Pollen_WhileSetup_c(condJson, iterKey,
+                                                   (int64_t) maxIter,
+                                                   selfHost, (int64_t) selfPort); }
+    }
+
+    public static void WhileAddExit(host: string, port: int) {
+        @c { Amalgame_Pollen_Pollen_WhileAddExit_c(host, (int64_t) port); }
     }
 
     public static int WorkflowVersion() {
