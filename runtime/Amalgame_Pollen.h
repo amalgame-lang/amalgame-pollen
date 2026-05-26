@@ -44,6 +44,13 @@ void        Amalgame_Pollen_Pollen_WorkflowAddConsume(code_string topic);
 void        Amalgame_Pollen_Pollen_WorkflowAddNext(code_string host, int64_t port);
 void        Amalgame_Pollen_Pollen_WorkflowSetEmitTopic(code_string topic);
 
+/* M2.3c.2 — cond branches (Phase 5.2 `if`) + set state.X ops (Phase
+ * 5.3 `set`). Both fit between ReloadBegin/ReloadCommit alongside
+ * the flat-topology setters. */
+void        Amalgame_Pollen_Pollen_CondBranchOpen(code_string condJson);
+void        Amalgame_Pollen_Pollen_CondBranchAddTarget(code_string host, int64_t port);
+void        Amalgame_Pollen_Pollen_SetOpAdd(code_string path, code_string valueExpr);
+
 /* Phase 5.3 — per-execution state file under sharedDir/state/<rootMid>.json.
  * StateGet returns the raw JSON literal for the key (or "" if absent).
  * StateSet replace-or-append the key, atomic tmp+rename. */

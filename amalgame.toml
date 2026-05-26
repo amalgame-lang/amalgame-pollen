@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.1.6"
+version           = "0.1.7"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v2 trees over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -92,6 +92,11 @@ WorkflowReloadCommit   = { returns = "void" }
 WorkflowAddConsume     = { returns = "void" }
 WorkflowAddNext        = { returns = "void" }
 WorkflowSetEmitTopic   = { returns = "void" }
+
+# M2.3c.2 — cond branches (Phase 5.2 `if`) + set state ops (Phase 5.3 `set`)
+CondBranchOpen         = { returns = "void" }
+CondBranchAddTarget    = { returns = "void" }
+SetOpAdd               = { returns = "void" }
 
 # Phase 5.3 — per-execution state file (sharedDir/state/<rootMid>.json)
 StateGet            = { returns = "code_string" }
