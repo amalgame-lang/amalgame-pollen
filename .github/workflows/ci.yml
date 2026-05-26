@@ -42,7 +42,5 @@ jobs:
           ar rcs build/linux-x86_64/libamalgame-pkg-Pollen.a /tmp/Pollen-facade.o
           ls -la build/linux-x86_64/
 
-      # Phase v0.1.x : tests focus on linkability (no behavior yet,
-      # the runtime engine arrives in M2). Once M2 lands :
-      #   - name: Run smoke tests
-      #     run: ./tests/run_tests.sh "$AMC"
+      - name: Run smoke tests
+        run: ./tests/run_tests.sh "$AMC"
