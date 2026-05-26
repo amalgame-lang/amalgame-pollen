@@ -1,0 +1,93 @@
+// examples/two_node_chain.am
+//
+// A self-contained 2-node Pollen chain that runs entirely inside
+// the package (no legacy `pollen` binary needed).
+//
+//   Producer  ── MESSAGE topic="order.in" ──>  Validator (node A)
+//                                              consumes "order.in"
+//                                              if data.amount > 1000:
+//                                                  emit "order.vip"
+//                                                  → Worker (node B, port 8001)
+//                                              else:
+//                                                  emit "order.std"
+//                                                  → Worker (node B, port 8001)
+//
+//   Worker (node B) — consumes both ; here we just log.
+//
+// Build :
+//   amc package add pollen
+//   amc examples/two_node_chain.am -o /tmp/two_node_chain
+//
+// Run (in 3 terminals or one shell with backgrounds) :
+//   /tmp/two_node_chain worker  &
+//   /tmp/two_node_chain validator &
+//   /tmp/two_node_chain produce '{"amount":1500,"item":"laptop"}'
+//   /tmp/two_node_chain produce '{"amount":50,"item":"sticker"}'
+//
+// Inspect state files :
+//   ls /tmp/pollen-pkg-demo/state/
+
+import Amalgame.Pollen
+import Amalgame.Console
+
+public class Program {
+    public static void Main(string[] args) {
+        if (args.Length() == 0) {
+            Console.WriteLine("usage : two_node_chain worker | validator | produce <json>")
+            return
+        }
+
+        let role: string = args.At(0)
+        Pollen.WorkflowSetSharedDir("/tmp/pollen-pkg-demo")
+
+        if (role == "validator") {
+            // Node A — consume order.in, branch on amount, forward to B
+            Pollen.WorkflowReloadBegin()
+            Pollen.WorkflowAddConsume("order.in")
+            // VIP branch : amount > 1000 → topic order.vip
+            Pollen.CondBranchOpen("{\"op\":\">\",\"var\":\"data.amount\",\"value\":1000}")
+            Pollen.CondBranchAddTarget("127.0.0.1", 8001)
+            // Else branch : topic order.std
+            Pollen.CondBranchOpen("")
+            Pollen.CondBranchAddTarget("127.0.0.1", 8001)
+            // Tag the message via state.processed = true (set op uses the
+            // {const} expr form ; SetOp paths drop the leading "state." prefix).
+            Pollen.SetOpAdd("state.processed", "{\"const\":true}")
+            // Topic rewrite happens via CondBranch's rebuild — we'd need
+            // per-branch emit topics for proper VIP / STD differentiation.
+            // v0.1.x has one global emit_topic ; for now we emit "order.routed".
+            Pollen.WorkflowSetEmitTopic("order.routed")
+            Pollen.WorkflowReloadCommit()
+
+            Console.WriteLine("validator : listening on :8000")
+            Pollen.StartListener(8000)
+            return
+        }
+
+        if (role == "worker") {
+            // Node B — accept whatever the validator sends, just ACK.
+            // No workflow config = free-form ACK fallback.
+            Console.WriteLine("worker : listening on :8001 (free-form ACK)")
+            Pollen.StartListener(8001)
+            return
+        }
+
+        if (role == "produce") {
+            if (args.Length() < 2) {
+                Console.WriteLine("produce needs a JSON data arg")
+                return
+            }
+            let payload: string = args.At(1)
+            let mid: string = Pollen.PublishSync(
+                "127.0.0.1", 8000, "order.in", 1, payload, 3000)
+            if (mid == "") {
+                Console.WriteLine("publish failed (timeout or no listener)")
+                return
+            }
+            Console.WriteLine("published mid=" + mid)
+            return
+        }
+
+        Console.WriteLine("unknown role : " + role)
+    }
+}
