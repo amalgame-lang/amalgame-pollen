@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.1.5"
+version           = "0.1.6"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v2 trees over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -85,6 +85,13 @@ libs       = ["pthread"]
 WorkflowLoad        = { returns = "code_bool" }
 WorkflowSetSharedDir = { returns = "void" }
 WorkflowSetSelf     = { returns = "void" }
+
+# M2.3c.1 — workflow runtime setters (consumes / nexts / emit topic)
+WorkflowReloadBegin    = { returns = "void" }
+WorkflowReloadCommit   = { returns = "void" }
+WorkflowAddConsume     = { returns = "void" }
+WorkflowAddNext        = { returns = "void" }
+WorkflowSetEmitTopic   = { returns = "void" }
 
 # Phase 5.3 — per-execution state file (sharedDir/state/<rootMid>.json)
 StateGet            = { returns = "code_string" }

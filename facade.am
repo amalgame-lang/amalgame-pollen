@@ -45,7 +45,6 @@ namespace Amalgame.Pollen
     /* Singleton-per-process engine state. v0.1 carries flags only ;
      * M2-M3 will copy in the full runtime from pollen.am. */
     static int _pollen_pkg_loaded = 0;
-    static int _pollen_pkg_version = 0;
     static char _pollen_pkg_role[64] = "";
     /* shared_dir uses the runtime-canonical name (no _pkg_ prefix) so
      * the M2.x state_persist code below ports verbatim from
@@ -53,14 +52,38 @@ namespace Amalgame.Pollen
      * collision with the legacy binary. */
     static char _pollen_shared_dir[512] = "";
 
+    /* === M2.3c.1 — workflow runtime state ====================
+     *
+     * Storage populated by AM-side LoadWorkflow (or any consumer
+     * that calls the WorkflowAddConsume / AddNext / SetEmitTopic
+     * setters between WorkflowReloadBegin and WorkflowReloadCommit).
+     * Hot path readers (listener_worker dispatch) take the same
+     * mutex for the snapshot + forward window. */
+    #include <pthread.h>
+
+    #define POLLEN_MAX_CONSUMES 32
+    #define POLLEN_MAX_NEXTS    32
+    #define POLLEN_TOPIC_MAX    128
+    #define POLLEN_HOST_MAX     64
+
+    static int  _pollen_wf_active = 0;
+    static int  _pollen_wf_n_consumes = 0;
+    static int  _pollen_wf_n_nexts = 0;
+    static char _pollen_wf_consumes[POLLEN_MAX_CONSUMES][POLLEN_TOPIC_MAX];
+    static char _pollen_wf_next_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+    static int  _pollen_wf_next_port[POLLEN_MAX_NEXTS];
+    static char _pollen_wf_emit_topic[POLLEN_TOPIC_MAX] = "";
+    static pthread_mutex_t _pollen_wf_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static int  _pollen_wf_version = 0;
+
     static const char _pollen_pkg_unimpl_warning[] =
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
         "M2-M3 migration from pollen.am in progress.\n";
 
     /* Forward declarations — order in this TU is one-shot @c so a
-     * helper used before its definition (M2.3a's _pollen_now_ms_c
-     * referenced from M2.3b's listener worker) needs hoisting. */
+     * helper used before its definition needs hoisting. */
     static int64_t _pollen_now_ms_c(void);
+    static void    _pollen_gen_uuid(char* buf);
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
      * has to be defined before any system header which is hard to
@@ -937,6 +960,178 @@ namespace Amalgame.Pollen
         return (code_bool) (ok ? 1 : 0);
     }
 
+    /* === M2.3c.1 — workflow setters + dispatch helpers ======= */
+
+    static void _pollen_wf_reload_begin(void) {
+        pthread_mutex_lock(&_pollen_wf_mutex);
+        _pollen_wf_n_consumes = 0;
+        _pollen_wf_n_nexts = 0;
+        _pollen_wf_emit_topic[0] = 0;
+        /* _pollen_wf_active stays sticky — once a workflow has been
+         * loaded, free-form fallback won't kick back in even if the
+         * new config is empty. Restart the process to disable. */
+    }
+
+    static void _pollen_wf_reload_commit(void) {
+        _pollen_wf_version++;
+        pthread_mutex_unlock(&_pollen_wf_mutex);
+    }
+
+    static void _pollen_wf_add_consume(const char* topic) {
+        if (!topic) return;
+        if (_pollen_wf_n_consumes >= POLLEN_MAX_CONSUMES) return;
+        strncpy(_pollen_wf_consumes[_pollen_wf_n_consumes], topic,
+                 POLLEN_TOPIC_MAX - 1);
+        _pollen_wf_consumes[_pollen_wf_n_consumes][POLLEN_TOPIC_MAX - 1] = 0;
+        _pollen_wf_n_consumes++;
+        _pollen_wf_active = 1;
+    }
+
+    static void _pollen_wf_add_next(const char* host, int port) {
+        if (!host) return;
+        if (_pollen_wf_n_nexts >= POLLEN_MAX_NEXTS) return;
+        strncpy(_pollen_wf_next_host[_pollen_wf_n_nexts], host,
+                 POLLEN_HOST_MAX - 1);
+        _pollen_wf_next_host[_pollen_wf_n_nexts][POLLEN_HOST_MAX - 1] = 0;
+        _pollen_wf_next_port[_pollen_wf_n_nexts] = port;
+        _pollen_wf_n_nexts++;
+        _pollen_wf_active = 1;
+    }
+
+    static void _pollen_wf_set_emit_topic(const char* topic) {
+        if (!topic) return;
+        strncpy(_pollen_wf_emit_topic, topic, POLLEN_TOPIC_MAX - 1);
+        _pollen_wf_emit_topic[POLLEN_TOPIC_MAX - 1] = 0;
+    }
+
+    /* O(N×M) consume check ; N ≤ 32 + topic ≤ 128 chars stays
+     * sub-µs and keeps the hot loop branchless of mallocs. */
+    static int _pollen_wf_topic_consumed(const char* topic, size_t topic_len) {
+        for (int i = 0; i < _pollen_wf_n_consumes; i++) {
+            size_t l = strlen(_pollen_wf_consumes[i]);
+            if (l == topic_len && memcmp(_pollen_wf_consumes[i],
+                                          topic, l) == 0) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    /* Fire-and-forget forward to a single downstream peer. */
+    static void _pollen_wf_forward_one(const char* host, int port,
+                                        const char* envelope, size_t env_len) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(fd); return;
+        }
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(fd); return;
+        }
+        send(fd, envelope, env_len, MSG_NOSIGNAL);
+        if (env_len == 0 || envelope[env_len - 1] != '\n') {
+            send(fd, "\n", 1, MSG_NOSIGNAL);
+        }
+        /* Fire-and-forget close — no SHUT_WR drain ; the receiver
+         * sees EOF on close(). Avoids deadlock with self-loops
+         * where the receiver holds the wf mutex. */
+        close(fd);
+    }
+
+    /* Rebuild an envelope for forward : fresh messageId, optional
+     * topic.uuid rewrite, parentMessageId appended carrying the
+     * old mid. Returns the rebuilt length (with trailing '\n'),
+     * 0 on parse failure (caller falls back to verbatim forward). */
+    static size_t _pollen_wf_rebuild_envelope(
+            const char* in, size_t in_len,
+            char* out, size_t out_cap,
+            const char* new_topic,
+            char* out_new_mid /* may be NULL ; 37-byte buf */) {
+        const char* m_key = _pollen_find(in, in_len,
+                                          "\"messageId\":\"", 13);
+        if (!m_key) return 0;
+        const char* old_mid = m_key + 13;
+        const char* old_mid_end = memchr(old_mid, '"',
+                                          in_len - (size_t)(old_mid - in));
+        if (!old_mid_end || (size_t)(old_mid_end - old_mid) != 36) return 0;
+
+        const char* t_uuid_start = NULL;
+        const char* t_uuid_end = NULL;
+        if (new_topic) {
+            const char* t_key = _pollen_find(in, in_len,
+                                              "\"topic\":{\"uuid\":\"", 17);
+            if (t_key) {
+                t_uuid_start = t_key + 17;
+                t_uuid_end = memchr(t_uuid_start, '"',
+                                     in_len - (size_t)(t_uuid_start - in));
+                if (!t_uuid_end) t_uuid_start = NULL;
+            }
+        }
+
+        size_t e = in_len;
+        while (e > 0 && (in[e-1] == '\n' || in[e-1] == '\r'
+                          || in[e-1] == ' ' || in[e-1] == '\t')) e--;
+        if (e == 0 || in[e-1] != '}') return 0;
+        size_t close_pos = e - 1;
+
+        char new_mid[37];
+        _pollen_gen_uuid(new_mid);
+        if (out_new_mid) memcpy(out_new_mid, new_mid, 37);
+
+        size_t o = 0;
+        #define _POLLEN_PE(src, n) do {                       \
+            if (o + (n) > out_cap) return 0;                  \
+            memcpy(out + o, (src), (n)); o += (n);            \
+        } while (0)
+
+        size_t mid_value_pos = (size_t)(old_mid - in);
+        size_t mid_end_pos   = (size_t)(old_mid_end - in);
+
+        _POLLEN_PE(in, mid_value_pos);
+        _POLLEN_PE(new_mid, 36);
+
+        if (t_uuid_start && t_uuid_end && new_topic) {
+            size_t t_v_pos = (size_t)(t_uuid_start - in);
+            size_t t_e_pos = (size_t)(t_uuid_end - in);
+            _POLLEN_PE(in + mid_end_pos, t_v_pos - mid_end_pos);
+            size_t tlen = strlen(new_topic);
+            _POLLEN_PE(new_topic, tlen);
+            _POLLEN_PE(in + t_e_pos, close_pos - t_e_pos);
+        } else {
+            _POLLEN_PE(in + mid_end_pos, close_pos - mid_end_pos);
+        }
+
+        const char* PARENT_OPEN = ",\"parentMessageId\":\"";
+        _POLLEN_PE(PARENT_OPEN, 20);
+        _POLLEN_PE(old_mid, 36);
+        _POLLEN_PE("\"}", 2);
+        _POLLEN_PE("\n", 1);
+        #undef _POLLEN_PE
+        return o;
+    }
+
+    /* Forward to every downstream peer registered via add_next.
+     * Caller holds _pollen_wf_mutex (snapshot of nexts is safe). */
+    static void _pollen_wf_forward_all(const char* envelope, size_t env_len) {
+        char rebuilt[8192];
+        const char* fwd = envelope;
+        size_t fwd_len = env_len;
+        const char* new_topic = _pollen_wf_emit_topic[0] ?
+                                  _pollen_wf_emit_topic : NULL;
+        size_t rn = _pollen_wf_rebuild_envelope(envelope, env_len,
+                                                  rebuilt, sizeof(rebuilt),
+                                                  new_topic, NULL);
+        if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
+        for (int i = 0; i < _pollen_wf_n_nexts; i++) {
+            _pollen_wf_forward_one(_pollen_wf_next_host[i],
+                                     _pollen_wf_next_port[i],
+                                     fwd, fwd_len);
+        }
+    }
+
     /* === TCP transport ======================================== */
 
     /* M2.3b — accept loop + per-connection ACK echo worker.
@@ -944,17 +1139,19 @@ namespace Amalgame.Pollen
      * dispatch yet (M2.3c) and no debug bridge (M2.4) — just
      * recv → extract messageId → send back an ACK envelope.
      * One pthread per accepted connection ; the accept thread
-     * itself blocks in StartListener until the process exits. */
-
-    #include <pthread.h>
+     * itself blocks in StartListener until the process exits.
+     * pthread.h is already included earlier alongside workflow
+     * state definitions. */
 
     static void* _pollen_listener_worker(void* arg) {
         int fd = (int)(intptr_t) arg;
         char rbuf[16384];
         size_t rlen = 0;
         char ack[256];
-        const char* MID_KEY = "\"messageId\":\"";
+        const char* MID_KEY   = "\"messageId\":\"";
         const size_t MID_KEY_LEN = 13;
+        const char* TOPIC_KEY = "\"topic\":{\"uuid\":\"";
+        const size_t TOPIC_KEY_LEN = 17;
 
         for (;;) {
             if (rlen >= sizeof(rbuf)) break;  /* oversize line — drop */
@@ -965,31 +1162,71 @@ namespace Amalgame.Pollen
                 char* nl = memchr(rbuf, '\n', rlen);
                 if (!nl) break;
                 size_t line_len = (size_t)(nl - rbuf);
-                const char* mp = _pollen_find(rbuf, line_len,
-                                                MID_KEY, MID_KEY_LEN);
-                if (mp) {
-                    mp += MID_KEY_LEN;
-                    const char* mq = memchr(mp, '"',
-                                            line_len - (size_t)(mp - rbuf));
-                    if (mq) {
-                        size_t midlen = (size_t)(mq - mp);
-                        int64_t now = _pollen_now_ms_c();
-                        int alen = snprintf(ack, sizeof(ack),
-                            "{\"type\":\"ACK\",\"messageId\":\"%.*s\","
-                             "\"timestamp\":%lld}\n",
-                            (int) midlen, mp, (long long) now);
-                        if (alen > 0 && alen < (int) sizeof(ack)) {
-                            ssize_t sent = 0;
-                            while (sent < alen) {
-                                ssize_t w = send(fd, ack + sent,
-                                                 (size_t)(alen - sent),
-                                                 MSG_NOSIGNAL);
-                                if (w <= 0) goto worker_done;
-                                sent += w;
+
+                /* Decide ACK + forward policy under the wf mutex :
+                 *   wf active + topic ∈ consumes : ACK + forward
+                 *   wf active + topic ∉ consumes : drop, no ACK
+                 *   wf inactive                  : ACK (free-form fallback) */
+                int do_ack = 1;
+                int do_forward = 0;
+                pthread_mutex_lock(&_pollen_wf_mutex);
+                if (_pollen_wf_active && _pollen_wf_n_consumes > 0) {
+                    const char* tp = _pollen_find(rbuf, line_len,
+                                                    TOPIC_KEY, TOPIC_KEY_LEN);
+                    int matched = 0;
+                    if (tp) {
+                        tp += TOPIC_KEY_LEN;
+                        const char* tq = memchr(tp, '"',
+                                                  line_len - (size_t)(tp - rbuf));
+                        if (tq && _pollen_wf_topic_consumed(
+                                tp, (size_t)(tq - tp))) {
+                            matched = 1;
+                        }
+                    }
+                    if (matched) {
+                        do_forward = 1;
+                    } else {
+                        do_ack = 0;
+                    }
+                }
+
+                if (do_ack) {
+                    const char* mp = _pollen_find(rbuf, line_len,
+                                                    MID_KEY, MID_KEY_LEN);
+                    if (mp) {
+                        mp += MID_KEY_LEN;
+                        const char* mq = memchr(mp, '"',
+                                                  line_len - (size_t)(mp - rbuf));
+                        if (mq) {
+                            size_t midlen = (size_t)(mq - mp);
+                            int64_t now = _pollen_now_ms_c();
+                            int alen = snprintf(ack, sizeof(ack),
+                                "{\"type\":\"ACK\",\"messageId\":\"%.*s\","
+                                 "\"timestamp\":%lld}\n",
+                                (int) midlen, mp, (long long) now);
+                            if (alen > 0 && alen < (int) sizeof(ack)) {
+                                ssize_t sent = 0;
+                                int sock_dead = 0;
+                                while (sent < alen) {
+                                    ssize_t w = send(fd, ack + sent,
+                                                     (size_t)(alen - sent),
+                                                     MSG_NOSIGNAL);
+                                    if (w <= 0) { sock_dead = 1; break; }
+                                    sent += w;
+                                }
+                                if (sock_dead) {
+                                    pthread_mutex_unlock(&_pollen_wf_mutex);
+                                    goto worker_done;
+                                }
                             }
                         }
                     }
+                    if (do_forward) {
+                        _pollen_wf_forward_all(rbuf, line_len);
+                    }
                 }
+                pthread_mutex_unlock(&_pollen_wf_mutex);
+
                 size_t consumed = line_len + 1;
                 memmove(rbuf, rbuf + consumed, rlen - consumed);
                 rlen -= consumed;
@@ -1217,6 +1454,33 @@ namespace Amalgame.Pollen
         return got_ack;
     }
 
+    /* === M2.3c.1 — AM-side workflow setters =================== */
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowReloadBegin_c(void) {
+        _pollen_wf_reload_begin();
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowReloadCommit_c(void) {
+        _pollen_wf_reload_commit();
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowAddConsume_c(code_string topic) {
+        _pollen_wf_add_consume((const char*) topic);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowAddNext_c(code_string host, int64_t port) {
+        _pollen_wf_add_next((const char*) host, (int) port);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_WorkflowSetEmitTopic_c(code_string topic) {
+        _pollen_wf_set_emit_topic((const char*) topic);
+    }
+
     static code_string
     Amalgame_Pollen_Pollen_PublishSync_c(code_string host, int64_t port,
                                           code_string topicUuid, int64_t topicVersion,
@@ -1240,7 +1504,7 @@ namespace Amalgame.Pollen
     /* === Introspection ======================================== */
     static int64_t
     Amalgame_Pollen_Pollen_WorkflowVersion_c(void) {
-        return (int64_t) _pollen_pkg_version;
+        return (int64_t) _pollen_wf_version;
     }
 
     static code_string
@@ -1361,6 +1625,42 @@ public class Pollen {
         var ok: int = 0
         @c { ok = Amalgame_Pollen_Pollen_EvalCond_c(envelopeJson, condJson); }
         return ok != 0
+    }
+
+    // M2.3c.1 — workflow configuration setters. The package keeps
+    // the parser out of scope (each consumer's workflow.json schema
+    // can differ) but exposes the underlying setters so any consumer
+    // can walk their own JSON and call these to wire the runtime.
+    //
+    // Usage shape :
+    //   Pollen.WorkflowReloadBegin()
+    //   for each topic in this node's consumes:
+    //     Pollen.WorkflowAddConsume(topic)
+    //   for each downstream peer:
+    //     Pollen.WorkflowAddNext(host, port)
+    //   Pollen.WorkflowSetEmitTopic(emitTopic)   // optional rewrite
+    //   Pollen.WorkflowReloadCommit()
+    //
+    // The Reload pair brackets a mutex window — readers (listener
+    // dispatch) take the same mutex for their snapshot.
+    public static void WorkflowReloadBegin() {
+        @c { Amalgame_Pollen_Pollen_WorkflowReloadBegin_c(); }
+    }
+
+    public static void WorkflowReloadCommit() {
+        @c { Amalgame_Pollen_Pollen_WorkflowReloadCommit_c(); }
+    }
+
+    public static void WorkflowAddConsume(topic: string) {
+        @c { Amalgame_Pollen_Pollen_WorkflowAddConsume_c(topic); }
+    }
+
+    public static void WorkflowAddNext(host: string, port: int) {
+        @c { Amalgame_Pollen_Pollen_WorkflowAddNext_c(host, (int64_t) port); }
+    }
+
+    public static void WorkflowSetEmitTopic(topic: string) {
+        @c { Amalgame_Pollen_Pollen_WorkflowSetEmitTopic_c(topic); }
     }
 
     public static int WorkflowVersion() {
