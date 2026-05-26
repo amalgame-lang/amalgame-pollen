@@ -35,6 +35,11 @@ namespace Amalgame.Pollen
     #include <fcntl.h>
     #include <sys/stat.h>
     #include <sys/types.h>
+    #include <sys/socket.h>
+    #include <sys/random.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <time.h>
     #include <gc.h>
 
     /* Singleton-per-process engine state. v0.1 carries flags only ;
@@ -934,17 +939,101 @@ namespace Amalgame.Pollen
         (void) port;
     }
 
+    /* M2.3a — UUID v4 generator (RFC 4122 variant + version bits).
+     * `buf` must hold at least 37 bytes (36 + NUL). */
+    static void _pollen_gen_uuid(char* buf) {
+        unsigned char b[16];
+        getrandom(b, 16, 0);
+        b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);
+        b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);
+        const char* hex = "0123456789abcdef";
+        int p = 0;
+        for (int k = 0; k < 16; k++) {
+            if (k == 4 || k == 6 || k == 8 || k == 10) buf[p++] = '-';
+            buf[p++] = hex[(b[k] >> 4) & 0xF];
+            buf[p++] = hex[b[k] & 0xF];
+        }
+        buf[p] = '\0';
+    }
+
+    static int64_t _pollen_now_ms_c(void) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return (int64_t) ts.tv_sec * 1000 + (int64_t) ts.tv_nsec / 1000000;
+    }
+
+    /* M2.3a — single-message fire-and-forget publish. Connects,
+     * sends one well-formed MESSAGE envelope (newline-terminated),
+     * closes ; does NOT wait for an ACK. The kernel-level TCP
+     * acknowledgement gives us delivery confirmation up to the
+     * peer's socket buffer ; Pollen.PublishSync (planned v0.2)
+     * will block on the application-level ACK.
+     *
+     * `data_json` is inserted verbatim into the envelope so callers
+     * are responsible for emitting valid JSON. `out_mid` (37-byte
+     * buffer) receives the freshly minted messageId on success.
+     *
+     * Returns 1 on success, 0 on socket / connect / send failure. */
+    static int _pollen_publish_one(const char* host, int port,
+                                     const char* topic_uuid,
+                                     int64_t topic_version,
+                                     const char* data_json,
+                                     char* out_mid) {
+        if (!host || !topic_uuid || !data_json || !out_mid) return 0;
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(fd); return 0;
+        }
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(fd); return 0;
+        }
+        _pollen_gen_uuid(out_mid);
+
+        char envelope[8192];
+        int64_t now = _pollen_now_ms_c();
+        int env_len = snprintf(envelope, sizeof(envelope),
+            "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+             "\"type\":\"MESSAGE\","
+             "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
+             "\"data\":%s,\"timestamp\":%lld}\n",
+            out_mid, out_mid, topic_uuid,
+            (long long) topic_version, data_json, (long long) now);
+        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
+            close(fd); return 0;
+        }
+        ssize_t sent = 0;
+        while (sent < env_len) {
+            ssize_t n = send(fd, envelope + sent,
+                             (size_t)(env_len - sent), MSG_NOSIGNAL);
+            if (n < 0) { close(fd); return 0; }
+            sent += n;
+        }
+        close(fd);
+        return 1;
+    }
+
     static code_string
     Amalgame_Pollen_Pollen_Publish_c(code_string host, int64_t port,
                                        code_string topicUuid, int64_t topicVersion,
                                        code_string dataJson) {
-        fprintf(stderr, _pollen_pkg_unimpl_warning, "Publish");
-        (void) host; (void) port; (void) topicUuid;
-        (void) topicVersion; (void) dataJson;
-        /* Return an empty string allocated through bdwgc so the
-         * caller can hold onto it without a use-after-free. */
-        char* out = (char*) GC_MALLOC_ATOMIC(1);
-        if (out) out[0] = 0;
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!host || !topicUuid || !dataJson) return (code_string) empty;
+        char mid[37];
+        if (!_pollen_publish_one((const char*) host, (int) port,
+                                   (const char*) topicUuid,
+                                   topicVersion,
+                                   (const char*) dataJson,
+                                   mid)) {
+            return (code_string) empty;
+        }
+        char* out = (char*) GC_MALLOC_ATOMIC(37);
+        if (!out) return (code_string) empty;
+        memcpy(out, mid, 37);
         return (code_string) out;
     }
 
@@ -997,8 +1086,10 @@ public class Pollen {
 
     // Fire-and-forget : send a MESSAGE envelope. Returns the
     // newly-minted messageId (which becomes the rootMessageId
-    // for the execution chain).
-    // STATUS : stub (M2). Returns empty string + stderr warning.
+    // for the execution chain) — empty string on socket/connect
+    // failure. `dataJson` is inserted verbatim ; pre-format it.
+    // STATUS : real since v0.1.4 (M2.3a). PublishSync (waits for
+    // app-level ACK) lands with the listener in M2.3b.
     public static string Publish(host: string, port: int,
                                   topicUuid: string, topicVersion: int,
                                   dataJson: string) {
