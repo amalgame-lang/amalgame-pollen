@@ -12,10 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Bump as amc releases new versions ; v0.8.55 ships
-        # `Amalgame.Net` builtin with UdpSocket.ReceiveFrom which
-        # the future engine migration will use.
-        amc-tag: [v0.8.55]
+        # v0.8.52 is the latest released amc at the time of the
+        # package's first publish. Bump when newer features land
+        # on the package side ; the package's required-amalgame in
+        # amalgame.toml is the source of truth for consumers.
+        amc-tag: [v0.8.52]
     steps:
       - uses: actions/checkout@v4
 
