@@ -1,0 +1,95 @@
+// facade.am — public AM API for the amalgame-pollen package.
+//
+// This file currently exposes only the surface declarations.
+// The full engine implementation (workflow.json parsing, cond
+// evaluator, set ops + state file, while/for routing, debug
+// bridge, TCP transport with hot-reload mutex) still lives in
+// /home/neitsab/Développement/pollen/tools/pollen-node-tcp.am
+// and will be migrated piece by piece (M2-M3 milestones).
+//
+// For v0.1 the public methods will internally call into static
+// @c functions identical to the ones in pollen-node-tcp.am ;
+// once the migration is complete this file owns them and the
+// CLI shrinks to a ~80-line wrapper.
+//
+// API mapping table (CLI vs package vs Mosaic embed) :
+//
+//   CLI flag                   Package call
+//   --workflow <path>          Pollen.WorkflowLoad(path, role, port)
+//   --node-name <role>         (passed as second arg)
+//   --shared-dir <path>        Pollen.WorkflowSetSharedDir(path)
+//   --publish host:port:t:v:d  Pollen.Publish(host, port, t, v, d)
+//   (start listening)          Pollen.StartListener(port)
+//
+//   Mosaic app pattern :
+//     public static HttpResponse POST(ctx: WebContext) {
+//       let mid: string = Pollen.Publish("127.0.0.1", 8000,
+//                                         "order.in", 1, ctx.Body)
+//       return HttpResponse.New().Json("{\"messageId\":\"" + mid + "\"}")
+//     }
+//
+// The Pollen class is declared in amalgame.toml ; amc auto-attaches
+// the package when any source imports Amalgame.Pollen.
+
+namespace Amalgame.Pollen
+
+public class Pollen {
+    // Load a workflow.json file. `nodeName` overrides port-based
+    // role lookup (matches CLI --node-name). `actualPort` is the
+    // listener port, used to find the role when nodeName is empty.
+    // Returns true on successful parse + load.
+    public static bool WorkflowLoad(workflowPath: string, nodeName: string, actualPort: int) {
+        var ok: int = 0
+        @c { ok = Amalgame_Pollen_Pollen_WorkflowLoad_c(workflowPath, nodeName, (i64) actualPort); }
+        return ok != 0
+    }
+
+    // Configure where sharedDir/state/ and sharedDir/executions/
+    // records live. Must be set BEFORE WorkflowLoad if you want
+    // state persistence to work (otherwise set ops silently no-op).
+    public static void WorkflowSetSharedDir(path: string) {
+        @c { Amalgame_Pollen_Pollen_WorkflowSetSharedDir_c(path); }
+    }
+
+    // Phase 3.5 — self identity. Used by the executions/ recorder
+    // when emitting per-hop step records. Typically called once
+    // at startup.
+    public static void WorkflowSetSelf(role: string, host: string, port: int) {
+        @c { Amalgame_Pollen_Pollen_WorkflowSetSelf_c(role, host, (i64) port); }
+    }
+
+    // Start the TCP listener on `port` in the current thread.
+    // Blocks until the process exits ; spawns one worker thread
+    // per accepted connection.
+    public static void StartListener(port: int) {
+        @c { Amalgame_Pollen_Pollen_StartListener_c((i64) port); }
+    }
+
+    // Fire-and-forget : send a MESSAGE envelope to host:port on the
+    // given topic. Returns the newly-minted messageId (also serves
+    // as the rootMessageId for the execution chain).
+    public static string Publish(host: string, port: int,
+                                  topicUuid: string, topicVersion: int,
+                                  dataJson: string) {
+        var mid: string = ""
+        @c { mid = Amalgame_Pollen_Pollen_Publish_c(host, (i64) port,
+                                                      topicUuid, (i64) topicVersion,
+                                                      dataJson); }
+        return mid
+    }
+
+    // Counter incremented each time WorkflowLoad commits a new
+    // tree (hot-reload watcher relies on this).
+    public static int WorkflowVersion() {
+        var v: int = 0
+        @c { v = Amalgame_Pollen_Pollen_WorkflowVersion_c(); }
+        return v
+    }
+
+    // Empty if no role matched (free-form mode).
+    public static string WorkflowActiveRole() {
+        var r: string = ""
+        @c { r = Amalgame_Pollen_Pollen_WorkflowActiveRole_c(); }
+        return r
+    }
+}

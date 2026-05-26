@@ -1,0 +1,51 @@
+/* Amalgame_Pollen.h — runtime header for the amalgame-pollen
+ * package. Forward declarations only ; the actual @c {} blocks
+ * with the workflow engine implementation live in facade.am
+ * (singleton-per-process design, same as pollen-node-tcp.am
+ * v0.2).
+ *
+ * Consumers : the pollen CLI binary, Mosaic web apps that embed
+ * Pollen, or any Amalgame program that needs the workflow-tree
+ * runtime. They import the package via :
+ *
+ *   import Amalgame.Pollen
+ *
+ * which makes the symbols below visible after amc has emitted
+ * the #include + linked against the package archive.
+ */
+
+#ifndef AMALGAME_POLLEN_H
+#define AMALGAME_POLLEN_H
+
+#include "Amalgame.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The engine is presently a singleton-per-process : v0.1 keeps
+ * the same static-global storage used in pollen-node-tcp.am for
+ * compat. v0.2 will introduce an opaque AmalgamePollenEngine
+ * handle for multi-engine hosting (e.g. a single Mosaic app
+ * running two independent workflows on different port ranges). */
+
+/* Workflow loading + lifecycle */
+code_bool   Amalgame_Pollen_Pollen_WorkflowLoad(code_string path, code_string nodeName, int64_t actualPort);
+void        Amalgame_Pollen_Pollen_WorkflowSetSharedDir(code_string path);
+void        Amalgame_Pollen_Pollen_WorkflowSetSelf(code_string role, code_string host, int64_t port);
+
+/* TCP transport */
+void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
+code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
+                                            code_string topicUuid, int64_t topicVersion,
+                                            code_string dataJson);
+
+/* Introspection */
+int64_t     Amalgame_Pollen_Pollen_WorkflowVersion(void);
+code_string Amalgame_Pollen_Pollen_WorkflowActiveRole(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AMALGAME_POLLEN_H */

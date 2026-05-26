@@ -1,0 +1,94 @@
+# Package manifest — amalgame-pollen
+#
+# Workflow runtime engine for Pollen — the P2P TCP message bus.
+# Originally lived inside the `pollen-node-tcp` binary as one
+# 4000-line file ; extracted to a package so :
+#
+#   1. The pollen CLI binary becomes a thin wrapper (~80 lines)
+#   2. Any Mosaic web app can embed Pollen — HTTP endpoints can
+#      Pollen.Publish() to start workflows ; Pollen.OnComplete()
+#      lets the same app capture terminations and reply to HTTP
+#      callers.
+#   3. Other Amalgame programs reuse the workflow-tree engine
+#      (if/for/while/set/cond) without copying code.
+#
+# Surface (v0.1):
+#
+#   Workflow.Load(path) → Workflow
+#     Parse a workflow.json (v2 schema). Loads node table + tree.
+#
+#   Workflow.StartListener(wf, port, role)
+#     Start a TCP listener bound to a role in the workflow ;
+#     subsequent messages get dispatched per the tree.
+#
+#   Workflow.Publish(host, port, topic, version, dataJson) → mid
+#     Fire-and-forget : send a MESSAGE to a node. Returns the
+#     newly-minted root messageId.
+#
+#   Workflow.PublishSync(host, port, topic, version, dataJson) → ackMid
+#     Same as Publish but waits for the ACK before returning.
+#
+#   Workflow.SetSharedDir(path)
+#     Configure where executions/ + state/ records are written.
+#
+#   (Phase 0.2+) Workflow.Run(wf, entryRole, data) → state
+#     Blocking call that publishes + waits for the execution
+#     to terminate, returns the final state file content.
+#
+#   (Phase 0.2+) Workflow.OnComplete(fn)
+#     Subscribe to execution-terminated events.
+#
+# Underlying engine — same code as pollen-node-tcp.am Phase 2.x
+# through 6.0a :
+#   - workflow.json v2 schema (sequence / call / fan_out / if /
+#     for / while / set / end)
+#   - Leaf + composite (and/or/not) + in/not_in conditions
+#   - Dotted path resolution (data.X / state.X with nested
+#     objects)
+#   - Expr evaluator (const / var / +/-/*/÷) for set.value
+#   - Persistent state.X under sharedDir/state/<root-mid>.json
+#     with atomic tmp+rename writes
+#   - Per-message debug pause / step / continue (Phase 4.5
+#     stepper) — protocol identical to pollen-manager's :3001
+#     bridge so existing tooling still works
+#
+# Limitations (v0.1):
+#   - One Pollen engine per process. The runtime state lives in
+#     static C globals (matches pollen-node-tcp.am v0.2 design).
+#     v0.2 of the package will optionally encapsulate into an
+#     engine handle.
+#   - Single-source class for now ; sibling .am modules to be
+#     split out in v0.2 once amc's multi-source pkg story is
+#     fully stable (project_amc_pkgclass_blocker followup).
+
+name              = "amalgame-pollen"
+version           = "0.1.0-dev"
+license           = "Apache-2.0"
+description       = "Workflow engine for Pollen — runs workflow.json v2 trees over a P2P TCP message bus."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.55"
+schema-version    = 1
+
+[stdlib]
+class     = "Pollen"
+header    = "runtime/Amalgame_Pollen.h"
+namespace = "Amalgame.Pollen"
+facade    = "facade.am"
+
+# pthread for the per-connection worker threads ; libgc is already
+# in the runtime's default linkage.
+libs       = ["pthread"]
+
+[stdlib.functions]
+# Workflow loader
+WorkflowLoad        = { returns = "code_bool" }
+WorkflowSetSharedDir = { returns = "void" }
+WorkflowSetSelf     = { returns = "void" }
+
+# TCP transport
+StartListener       = { returns = "void" }
+Publish             = { returns = "code_string" }
+
+# Engine introspection (used by tests + manager)
+WorkflowVersion     = { returns = "i64" }
+WorkflowActiveRole  = { returns = "code_string" }
