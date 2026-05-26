@@ -76,6 +76,45 @@ namespace Amalgame.Pollen
     static pthread_mutex_t _pollen_wf_mutex = PTHREAD_MUTEX_INITIALIZER;
     static int  _pollen_wf_version = 0;
 
+    /* M2.3c.2 — conditional routing storage. Same shape as the
+     * workflow-tree Phase 5.2 / 5.4.1 design : a top-level list
+     * of branches, each holding a raw cond_expr JSON + its target
+     * list. cond_forward picks the first branch whose cond_eval
+     * passes (matched evaluator from M2.2 — see _pollen_cond_eval_expr). */
+    #define POLLEN_COND_MAX_BRANCHES 8
+    #define POLLEN_COND_EXPR_MAX     1024
+
+    typedef struct {
+        char cond_expr[POLLEN_COND_EXPR_MAX];
+        char targets_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
+        int  targets_port[POLLEN_MAX_NEXTS];
+        int  n_targets;
+    } pollen_cond_branch_t;
+
+    static int                  _pollen_cond_active = 0;
+    static int                  _pollen_cond_n_branches = 0;
+    static int                  _pollen_cond_current = -1;
+    static pollen_cond_branch_t _pollen_cond_branches[POLLEN_COND_MAX_BRANCHES];
+
+    /* M2.3c.2 — set-op storage (Phase 5.3 `set state.X` ops).
+     * AM-side loader registers pairs (path, value_expr) ; the
+     * apply pass at message time walks the list, eval_expr each
+     * value against the envelope, persists via _pollen_state_set. */
+    #define POLLEN_SET_OPS_MAX 8
+
+    /* POLLEN_COND_VAR_MAX is also referenced by the cond-eval block
+     * later in this TU ; both must agree on the size. The eval-side
+     * definition is guarded with #ifndef so it's a no-op. */
+    #define POLLEN_COND_VAR_MAX  64
+
+    typedef struct {
+        char path[POLLEN_COND_VAR_MAX];
+        char value_expr[1024];
+    } pollen_set_op_t;
+
+    static int             _pollen_n_set_ops = 0;
+    static pollen_set_op_t _pollen_set_ops[POLLEN_SET_OPS_MAX];
+
     static const char _pollen_pkg_unimpl_warning[] =
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
         "M2-M3 migration from pollen.am in progress.\n";
@@ -84,6 +123,15 @@ namespace Amalgame.Pollen
      * helper used before its definition needs hoisting. */
     static int64_t _pollen_now_ms_c(void);
     static void    _pollen_gen_uuid(char* buf);
+    static void    _pollen_cond_clear(void);
+    static void    _pollen_set_ops_clear(void);
+    static void    _pollen_wf_forward_one(const char* host, int port,
+                                            const char* envelope, size_t env_len);
+    static size_t  _pollen_wf_rebuild_envelope(
+                       const char* in, size_t in_len,
+                       char* out, size_t out_cap,
+                       const char* new_topic,
+                       char* out_new_mid);
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
      * has to be defined before any system header which is hard to
@@ -363,7 +411,12 @@ namespace Amalgame.Pollen
      * (state.X). 1 KiB expr budget is enough for realistic
      * conditions ; deeper nests can be lifted in v0.2.
      */
+    /* POLLEN_COND_VAR_MAX already defined in the M2.3c.2 workflow
+     * storage block at the top of this TU. Re-declare for symmetry
+     * with the source — guarded so we don't redefine. */
+    #ifndef POLLEN_COND_VAR_MAX
     #define POLLEN_COND_VAR_MAX  64
+    #endif
     #define POLLEN_COND_STR_MAX  128
 
     /* op codes used by _pollen_cond_eval_leaf — must stay stable, the
@@ -960,6 +1013,63 @@ namespace Amalgame.Pollen
         return (code_bool) (ok ? 1 : 0);
     }
 
+    /* === M2.3c.2 — dispatch helper bodies (deferred from up top
+     * because they call into the M2.2 cond_eval / expr_eval +
+     * M2.1 state_persist routines defined just above). === */
+
+    /* Apply pending set ops against the state file for the envelope's
+     * rootMessageId. Each op evaluates its value_expr against the
+     * envelope via _pollen_eval_expr, then persists via
+     * _pollen_state_set. Best-effort : skip silently if the envelope
+     * lacks rootMessageId or the write fails. */
+    static void _pollen_set_ops_apply(const char* env, size_t env_len) {
+        if (_pollen_n_set_ops == 0) return;
+        char root[64];
+        if (!_pollen_extract_root_mid(env, env_len, root, sizeof(root))) return;
+        for (int i = 0; i < _pollen_n_set_ops; i++) {
+            pollen_set_op_t* o = &_pollen_set_ops[i];
+            _pollen_expr_val_t val;
+            size_t elen = strlen(o->value_expr);
+            if (!_pollen_eval_expr(env, env_len, o->value_expr, elen, &val)) {
+                continue;
+            }
+            char lit[256];
+            int ln = _pollen_expr_val_to_literal(&val, lit, sizeof(lit));
+            if (ln <= 0 || ln >= (int) sizeof(lit)) continue;
+            _pollen_state_set(root, o->path, lit);
+        }
+    }
+
+    /* Evaluate each branch's cond top-down. First match wins :
+     * rebuild the envelope (new mid + parent chain + optional topic
+     * rewrite) and forward to that branch's target list. No match :
+     * drop silently (caller already ACKed). */
+    static void _pollen_cond_forward(const char* env, size_t env_len) {
+        for (int i = 0; i < _pollen_cond_n_branches; i++) {
+            pollen_cond_branch_t* b = &_pollen_cond_branches[i];
+            int pass = _pollen_cond_eval_expr(env, env_len,
+                                                b->cond_expr,
+                                                strlen(b->cond_expr));
+            if (!pass) continue;
+            char rebuilt[8192];
+            const char* fwd = env;
+            size_t fwd_len = env_len;
+            const char* new_topic = _pollen_wf_emit_topic[0]
+                                      ? _pollen_wf_emit_topic : NULL;
+            size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
+                                                      rebuilt, sizeof(rebuilt),
+                                                      new_topic, NULL);
+            if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
+            for (int t = 0; t < b->n_targets; t++) {
+                _pollen_wf_forward_one(b->targets_host[t],
+                                         b->targets_port[t],
+                                         fwd, fwd_len);
+            }
+            return;  /* first match wins, mirrors workflow-tree `if` */
+        }
+        /* No branch matched — drop silently. */
+    }
+
     /* === M2.3c.1 — workflow setters + dispatch helpers ======= */
 
     static void _pollen_wf_reload_begin(void) {
@@ -967,6 +1077,10 @@ namespace Amalgame.Pollen
         _pollen_wf_n_consumes = 0;
         _pollen_wf_n_nexts = 0;
         _pollen_wf_emit_topic[0] = 0;
+        /* M2.3c.2 — also reset cond branches + set ops so a reload
+         * that drops the `if` / `set` reverts to plain fan-out. */
+        _pollen_cond_clear();
+        _pollen_set_ops_clear();
         /* _pollen_wf_active stays sticky — once a workflow has been
          * loaded, free-form fallback won't kick back in even if the
          * new config is empty. Restart the process to disable. */
@@ -1113,6 +1227,65 @@ namespace Amalgame.Pollen
         return o;
     }
 
+    /* === M2.3c.2 — cond branch setters + dispatch ============ */
+
+    static void _pollen_cond_clear(void) {
+        _pollen_cond_active = 0;
+        _pollen_cond_n_branches = 0;
+        _pollen_cond_current = -1;
+    }
+
+    /* Open a new cond branch. Empty cond_json = else / always-true. */
+    static void _pollen_cond_branch_open(const char* cond_json) {
+        if (_pollen_cond_n_branches >= POLLEN_COND_MAX_BRANCHES) return;
+        _pollen_cond_active = 1;
+        _pollen_cond_current = _pollen_cond_n_branches;
+        pollen_cond_branch_t* b = &_pollen_cond_branches[_pollen_cond_current];
+        strncpy(b->cond_expr, cond_json ? cond_json : "",
+                 sizeof(b->cond_expr) - 1);
+        b->cond_expr[sizeof(b->cond_expr) - 1] = 0;
+        b->n_targets = 0;
+        _pollen_cond_n_branches++;
+    }
+
+    static void _pollen_cond_branch_add_target(const char* host, int port) {
+        if (_pollen_cond_current < 0
+            || _pollen_cond_current >= _pollen_cond_n_branches) return;
+        pollen_cond_branch_t* b = &_pollen_cond_branches[_pollen_cond_current];
+        if (b->n_targets >= POLLEN_MAX_NEXTS) return;
+        strncpy(b->targets_host[b->n_targets], host ? host : "",
+                 POLLEN_HOST_MAX - 1);
+        b->targets_host[b->n_targets][POLLEN_HOST_MAX - 1] = 0;
+        b->targets_port[b->n_targets] = port;
+        b->n_targets++;
+    }
+
+    /* === M2.3c.2 — set-op setters ============================ */
+
+    static void _pollen_set_ops_clear(void) {
+        _pollen_n_set_ops = 0;
+    }
+
+    static void _pollen_set_ops_add(const char* path,
+                                      const char* value_expr) {
+        if (_pollen_n_set_ops >= POLLEN_SET_OPS_MAX) return;
+        pollen_set_op_t* o = &_pollen_set_ops[_pollen_n_set_ops];
+        strncpy(o->path, path ? path : "", POLLEN_COND_VAR_MAX - 1);
+        o->path[POLLEN_COND_VAR_MAX - 1] = 0;
+        strncpy(o->value_expr, value_expr ? value_expr : "null",
+                 sizeof(o->value_expr) - 1);
+        o->value_expr[sizeof(o->value_expr) - 1] = 0;
+        _pollen_n_set_ops++;
+    }
+
+    /* === M2.3c.2 — dispatch helpers (forward decls — bodies live
+     * after the M2.2 cond_eval / expr_eval / state_persist blocks
+     * since they call _pollen_cond_eval_expr / _pollen_eval_expr /
+     * _pollen_state_set + _pollen_extract_root_mid). */
+
+    static void _pollen_cond_forward(const char* env, size_t env_len);
+    static void _pollen_set_ops_apply(const char* env, size_t env_len);
+
     /* Forward to every downstream peer registered via add_next.
      * Caller holds _pollen_wf_mutex (snapshot of nexts is safe). */
     static void _pollen_wf_forward_all(const char* envelope, size_t env_len) {
@@ -1222,7 +1395,20 @@ namespace Amalgame.Pollen
                         }
                     }
                     if (do_forward) {
-                        _pollen_wf_forward_all(rbuf, line_len);
+                        /* M2.3c.2 dispatch sequence :
+                         *   1. apply pending set ops (mutates state.X
+                         *      before the cond eval sees it),
+                         *   2. if cond branches active → cond_forward
+                         *      (first-match wins),
+                         *   3. else → forward to every next. */
+                        if (_pollen_n_set_ops > 0) {
+                            _pollen_set_ops_apply(rbuf, line_len);
+                        }
+                        if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
+                            _pollen_cond_forward(rbuf, line_len);
+                        } else {
+                            _pollen_wf_forward_all(rbuf, line_len);
+                        }
                     }
                 }
                 pthread_mutex_unlock(&_pollen_wf_mutex);
@@ -1481,6 +1667,23 @@ namespace Amalgame.Pollen
         _pollen_wf_set_emit_topic((const char*) topic);
     }
 
+    /* === M2.3c.2 — AM-side cond + set setters =================== */
+
+    static void
+    Amalgame_Pollen_Pollen_CondBranchOpen_c(code_string condJson) {
+        _pollen_cond_branch_open((const char*) condJson);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_CondBranchAddTarget_c(code_string host, int64_t port) {
+        _pollen_cond_branch_add_target((const char*) host, (int) port);
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_SetOpAdd_c(code_string path, code_string valueExpr) {
+        _pollen_set_ops_add((const char*) path, (const char*) valueExpr);
+    }
+
     static code_string
     Amalgame_Pollen_Pollen_PublishSync_c(code_string host, int64_t port,
                                           code_string topicUuid, int64_t topicVersion,
@@ -1661,6 +1864,30 @@ public class Pollen {
 
     public static void WorkflowSetEmitTopic(topic: string) {
         @c { Amalgame_Pollen_Pollen_WorkflowSetEmitTopic_c(topic); }
+    }
+
+    // M2.3c.2 — conditional routing. Sandwiched between
+    // WorkflowReloadBegin / WorkflowReloadCommit alongside the
+    // call/fan_out setters. CondBranchOpen starts a new branch ;
+    // subsequent CondBranchAddTarget calls populate its targets
+    // until the next CondBranchOpen (or ReloadCommit). condJson
+    // accepts the same grammar as Pollen.EvalCond (and / or / not /
+    // in / not_in + leaf ops). Empty cond_json = else branch.
+    public static void CondBranchOpen(condJson: string) {
+        @c { Amalgame_Pollen_Pollen_CondBranchOpen_c(condJson); }
+    }
+
+    public static void CondBranchAddTarget(host: string, port: int) {
+        @c { Amalgame_Pollen_Pollen_CondBranchAddTarget_c(host, (int64_t) port); }
+    }
+
+    // M2.3c.2 — set state.X ops. Each Add registers (path, valueExpr).
+    // At message time the dispatch evaluates valueExpr against the
+    // envelope (same evaluator as Pollen.EvalExpr) and writes the
+    // resulting literal under sharedDir/state/<rootMid>.json before
+    // the cond / forward pass.
+    public static void SetOpAdd(path: string, valueExprJson: string) {
+        @c { Amalgame_Pollen_Pollen_SetOpAdd_c(path, valueExprJson); }
     }
 
     public static int WorkflowVersion() {
