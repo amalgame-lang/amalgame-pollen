@@ -40,6 +40,13 @@ void        Amalgame_Pollen_Pollen_WorkflowSetSelf(code_string role, code_string
 code_string Amalgame_Pollen_Pollen_StateGet(code_string rootMid, code_string path);
 code_bool   Amalgame_Pollen_Pollen_StateSet(code_string rootMid, code_string path, code_string jsonLiteral);
 
+/* M2.2 — expression + cond evaluators used by workflow-tree set/if.
+ * EvalExpr returns the literal form of the evaluated value.
+ * EvalCond evaluates a leaf / composite (and/or/not) / membership
+ * (in/not_in) condition against the envelope. */
+code_string Amalgame_Pollen_Pollen_EvalExpr(code_string envelopeJson, code_string exprJson);
+code_bool   Amalgame_Pollen_Pollen_EvalCond(code_string envelopeJson, code_string condJson);
+
 /* TCP transport */
 void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
 code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
