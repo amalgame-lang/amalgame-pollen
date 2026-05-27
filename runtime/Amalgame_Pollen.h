@@ -17,7 +17,13 @@
 #ifndef AMALGAME_POLLEN_H
 #define AMALGAME_POLLEN_H
 
-#include "Amalgame.h"
+/* _runtime.h provides code_string / code_bool + the GC shims. The
+ * earlier "Amalgame.h" include was a stray — it doesn't exist in the
+ * amc runtime dir, which broke any CONSUMER whose generated C pulls
+ * in this header (the package's own --lib build never tripped it
+ * because facade.c includes _runtime.h directly). */
+#include "_runtime.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
