@@ -83,6 +83,8 @@ code_bool   Amalgame_Pollen_Pollen_EvalCond(code_string envelopeJson, code_strin
 
 /* TCP transport */
 void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
+/* Phase 6.1 — capability advertisement (discovery) */
+void        Amalgame_Pollen_Pollen_StartCapabilityWriter(code_string label, code_string host, int64_t port);
 code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
                                             code_string topicUuid, int64_t topicVersion,
                                             code_string dataJson);

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.13 — 2026-05-27
+
+### Added — Phase 6.1 (capability advertisement / discovery)
+- `Pollen.StartCapabilityWriter(label, host, port)` — spawns a detached thread that rewrites `<sharedDir>/capabilities/<instanceId>.json` every 5s with `{instanceId, host, port, label, actions (= consumed topics), heartbeat, version}`, atomic tmp+rename. Idempotent.
+- This is the node-side half of discovery : the pollen-manager's Infra panel reads these files (`/api/capabilities`) and shows nodes alive / stale (heartbeat > 15s) cross-referenced against the declared `infrastructure.json`.
+- `examples/pollen-node.am` calls it after `WorkflowReloadCommit` (when a shared dir is configured), so a package-driven mesh self-advertises out of the box.
+
+
 ## v0.1.12 — 2026-05-27
 
 ### Added — M4 (debug-aware publish) + consumer-build guard

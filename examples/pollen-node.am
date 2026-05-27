@@ -409,6 +409,14 @@ public class Program {
 
         Pollen.WorkflowReloadCommit()
 
+        // Phase 6.1 — advertise into sharedDir/capabilities/ so the
+        // manager's discovery panel sees this node alive (heartbeat
+        // every 5s). The role is the label ; consumed topics become
+        // the advertised actions.
+        if (String_Length(sharedDir) > 0) {
+            Pollen.StartCapabilityWriter(role, "127.0.0.1", port)
+        }
+
         Console.WriteLine("pollen-node: role={role} listening on :{port} (package-driven)")
         Console.Flush()
         Pollen.StartListener(port)
