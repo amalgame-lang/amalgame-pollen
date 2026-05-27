@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.14 — 2026-05-27
+
+### Added — Phase 6.2 (load metrics)
+- The capability file now carries a `load` object : `{inFlight, msgsHandled}`. `inFlight` is bumped around each dispatch window, `msgsHandled` is the cumulative consumed count. Both are `_Atomic long` so the writer thread reads them without the workflow mutex.
+- The pollen-manager discovery panel shows these per node ("inFlight N · handled M"). After injecting messages you can watch each node's `handled` climb live — and `inFlight` is the primary signal for the upcoming power-of-two load balancer (Phase 6.3).
+
+
 ## v0.1.13 — 2026-05-27
 
 ### Added — Phase 6.1 (capability advertisement / discovery)
