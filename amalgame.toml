@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.1.16"
+version           = "0.1.17"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v2 trees over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -119,6 +119,12 @@ StartCapabilityWriter = { returns = "void" }
 Publish             = { returns = "code_string" }
 PublishSync         = { returns = "code_string" }
 PublishDebug        = { returns = "code_string" }
+
+# v0.1.17 — Mosaic bridge hooks (OnMessage/OnComplete take an AM
+# closure ; Forward re-emits out-of-band keeping the chain)
+OnMessage           = { returns = "void" }
+OnComplete          = { returns = "void" }
+Forward             = { returns = "code_string" }
 
 # Engine introspection (used by tests + manager)
 WorkflowVersion     = { returns = "i64" }

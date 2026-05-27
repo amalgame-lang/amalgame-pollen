@@ -98,6 +98,17 @@ code_string Amalgame_Pollen_Pollen_PublishDebug(code_string host, int64_t port,
                                                  code_string breakpointsJson,
                                                  code_string managerAddr);
 
+/* v0.1.17 — Mosaic bridge hooks. OnMessage/OnComplete take an AM
+ * closure (AmalgameClosure*, defined in _runtime.h) invoked on the
+ * listener worker thread : OnMessage transforms a consumed message's
+ * data before forward (return "" → drop), OnComplete fires when a
+ * consumed message terminates at this node. Forward re-emits a
+ * message out-of-band keeping the chain (fresh mid, parent = the
+ * incoming mid, same rootMessageId, data swapped to newDataJson). */
+void        Amalgame_Pollen_Pollen_OnMessage(AmalgameClosure* handler);
+void        Amalgame_Pollen_Pollen_OnComplete(AmalgameClosure* handler);
+code_string Amalgame_Pollen_Pollen_Forward(code_string envelopeJson, code_string newDataJson);
+
 /* Introspection */
 int64_t     Amalgame_Pollen_Pollen_WorkflowVersion(void);
 code_string Amalgame_Pollen_Pollen_WorkflowActiveRole(void);
