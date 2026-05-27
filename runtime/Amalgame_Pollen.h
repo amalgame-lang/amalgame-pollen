@@ -115,7 +115,7 @@ code_string Amalgame_Pollen_Pollen_Forward(code_string envelopeJson, code_string
  * forwarding (emit topic → power-of-two pick). RegistrySize +
  * ResolveProvider are introspection (tests + manager). */
 void        Amalgame_Pollen_Pollen_StartCapabilityReader(void);
-void        Amalgame_Pollen_Pollen_SetLoadBalance(int on);
+void        Amalgame_Pollen_Pollen_SetLoadBalance(code_bool on);
 int64_t     Amalgame_Pollen_Pollen_RegistrySize(void);
 code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
 
