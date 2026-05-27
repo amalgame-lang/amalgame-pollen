@@ -46,6 +46,10 @@ int main(void) {
         (void*) &Amalgame_Pollen_Pollen_OnMessage,
         (void*) &Amalgame_Pollen_Pollen_OnComplete,
         (void*) &Amalgame_Pollen_Pollen_Forward,
+        (void*) &Amalgame_Pollen_Pollen_StartCapabilityReader,
+        (void*) &Amalgame_Pollen_Pollen_SetLoadBalance,
+        (void*) &Amalgame_Pollen_Pollen_RegistrySize,
+        (void*) &Amalgame_Pollen_Pollen_ResolveProvider,
         (void*) &Amalgame_Pollen_Pollen_WorkflowVersion,
         (void*) &Amalgame_Pollen_Pollen_WorkflowActiveRole,
     };
