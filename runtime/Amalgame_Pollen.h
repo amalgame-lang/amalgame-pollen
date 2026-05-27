@@ -55,6 +55,10 @@ void        Amalgame_Pollen_Pollen_WorkflowSetEmitTopic(code_string topic);
  * the flat-topology setters. */
 void        Amalgame_Pollen_Pollen_CondBranchOpen(code_string condJson);
 void        Amalgame_Pollen_Pollen_CondBranchAddTarget(code_string host, int64_t port);
+/* v0.1.20 — v2 routing : set the current branch's emit topic so it
+ * forwards to a registry-resolved provider (power-of-two) instead of
+ * static targets. Empty → v1 static-target behaviour. */
+void        Amalgame_Pollen_Pollen_CondBranchSetTopic(code_string topic);
 void        Amalgame_Pollen_Pollen_SetOpAdd(code_string path, code_string valueExpr);
 
 /* M2.3c.2b — for / while loops (Phase 5.4). */

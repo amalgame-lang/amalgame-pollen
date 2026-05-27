@@ -130,6 +130,11 @@ namespace Amalgame.Pollen
         char targets_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
         int  targets_port[POLLEN_MAX_NEXTS];
         int  n_targets;
+        /* v0.1.20 — v2 routing : if set, this branch forwards by topic
+         * (registry-resolved via power-of-two) instead of the static
+         * targets above. The branch rebuilds the envelope with this
+         * topic. Empty → v1 behaviour (static targets + global emit). */
+        char topic[POLLEN_TOPIC_MAX];
     } pollen_cond_branch_t;
 
     static int                  _pollen_cond_active = 0;
@@ -1434,12 +1439,27 @@ namespace Amalgame.Pollen
             char rebuilt[8192];
             const char* fwd = env;
             size_t fwd_len = env_len;
-            const char* new_topic = _pollen_wf_emit_topic[0]
-                                      ? _pollen_wf_emit_topic : NULL;
+            /* v0.1.20 — v2 routing : a branch with its own topic
+             * rebuilds with THAT topic (each branch targets a distinct
+             * action) and resolves a live provider via the LB. v1
+             * branches rebuild with the global emit topic + forward to
+             * the static target list. */
+            const char* new_topic = b->topic[0] ? b->topic
+                                      : (_pollen_wf_emit_topic[0]
+                                          ? _pollen_wf_emit_topic : NULL);
             size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                       rebuilt, sizeof(rebuilt),
                                                       new_topic, out_new_mid);
             if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
+            if (b->topic[0] && _pollen_lb_enabled) {
+                char lb_host[POLLEN_HOST_MAX]; int lb_port = 0;
+                if (_pollen_lb_pick(b->topic, lb_host, sizeof(lb_host), &lb_port)) {
+                    _pollen_wf_forward_one(lb_host, lb_port, fwd, fwd_len);
+                }
+                /* topic set but no live provider → drop (no static
+                 * fallback in v2). */
+                return;
+            }
             for (int t = 0; t < b->n_targets; t++) {
                 _pollen_wf_forward_one(b->targets_host[t],
                                          b->targets_port[t],
@@ -1987,7 +2007,20 @@ namespace Amalgame.Pollen
                  sizeof(b->cond_expr) - 1);
         b->cond_expr[sizeof(b->cond_expr) - 1] = 0;
         b->n_targets = 0;
+        b->topic[0] = 0;
         _pollen_cond_n_branches++;
+    }
+
+    /* v0.1.20 — set the current branch's emit topic (v2 registry
+     * routing). When set, _pollen_cond_forward rebuilds with this
+     * topic + resolves a provider via the LB instead of using static
+     * targets. */
+    static void _pollen_cond_branch_set_topic(const char* topic) {
+        if (_pollen_cond_current < 0
+            || _pollen_cond_current >= _pollen_cond_n_branches) return;
+        pollen_cond_branch_t* b = &_pollen_cond_branches[_pollen_cond_current];
+        strncpy(b->topic, topic ? topic : "", POLLEN_TOPIC_MAX - 1);
+        b->topic[POLLEN_TOPIC_MAX - 1] = 0;
     }
 
     static void _pollen_cond_branch_add_target(const char* host, int port) {
@@ -2877,6 +2910,11 @@ namespace Amalgame.Pollen
     }
 
     static void
+    Amalgame_Pollen_Pollen_CondBranchSetTopic_c(code_string topic) {
+        _pollen_cond_branch_set_topic((const char*) topic);
+    }
+
+    static void
     Amalgame_Pollen_Pollen_SetOpAdd_c(code_string path, code_string valueExpr) {
         _pollen_set_ops_add((const char*) path, (const char*) valueExpr);
     }
@@ -3295,6 +3333,16 @@ public class Pollen {
 
     public static void CondBranchAddTarget(host: string, port: int) {
         @c { Amalgame_Pollen_Pollen_CondBranchAddTarget_c(host, (int64_t) port); }
+    }
+
+    // v0.1.20 — v2 routing : set the current branch's emit topic. When
+    // set (and load balancing is on), the matched branch rebuilds the
+    // envelope with this topic and forwards to a live provider resolved
+    // by the power-of-two LB — no static host:port needed. Each branch
+    // targets a distinct action, so each carries its own topic. Leave
+    // it unset for v1 (static CondBranchAddTarget) routing.
+    public static void CondBranchSetTopic(topic: string) {
+        @c { Amalgame_Pollen_Pollen_CondBranchSetTopic_c(topic); }
     }
 
     // M2.3c.2 — set state.X ops. Each Add registers (path, valueExpr).

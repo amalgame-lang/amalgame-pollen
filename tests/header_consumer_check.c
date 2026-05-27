@@ -37,6 +37,7 @@ int main(void) {
         (void*) &Amalgame_Pollen_Pollen_WorkflowSetEmitTopic,
         (void*) &Amalgame_Pollen_Pollen_CondBranchOpen,
         (void*) &Amalgame_Pollen_Pollen_CondBranchAddTarget,
+        (void*) &Amalgame_Pollen_Pollen_CondBranchSetTopic,
         (void*) &Amalgame_Pollen_Pollen_SetOpAdd,
         (void*) &Amalgame_Pollen_Pollen_ForSetup,
         (void*) &Amalgame_Pollen_Pollen_ForAddTarget,
