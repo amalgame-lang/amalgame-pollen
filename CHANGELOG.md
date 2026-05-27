@@ -4,6 +4,21 @@ All notable changes to `amalgame-pollen`. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ;
 versioning follows the upstream package indexing convention.
 
+## v0.1.9 — 2026-05-27
+
+### Added — M2.4 (debug bridge)
+- Listener nodes now honour the debug protocol when an envelope carries a `debug` field. When this node's role matches the pause criteria (`mode=step`, or `mode=breakpoint` + role in `breakpoints[]`, or sticky `hit_bp:true`), the node phones home to the `manager` declared in the envelope (one-shot TCP `DEBUG_PAUSE` + blocking recv for the operator's command) and acts on the reply :
+  - `DEBUG_CONTINUE` → rewrite `mode=breakpoint` `hit_bp=false`, forward.
+  - `DEBUG_STEP_INTO` / `DEBUG_STEP_OVER` → rewrite `mode=step` `hit_bp=false`, forward (every downstream node pauses).
+  - `DEBUG_MUTATE` → rewrite the `data` field from the reply, remap to `then` (continue / step), forward.
+  - `DEBUG_CANCEL` / timeout / manager-unreachable → drop the message (the upstream ACK has already been sent).
+- Self-role for breakpoint matching comes from `Pollen.WorkflowSetSelf(role, …)`.
+- The debug bridge is entirely internal — no new public API. A node opts in simply by having `WorkflowSetSelf` called and receiving debug-tagged envelopes. Protocol matches `pollen-manager`'s `:3001` bridge so existing tooling works against package-driven nodes.
+- 12 new smoke assertions (`tests/debug_bridge_smoke.c`) with a mock manager : continue / cancel / mutate / no-debug-passthrough.
+
+### Not yet ported
+- `executions/` step recorder (`_pollen_wf_record_step`) — the manager's "Live executions" panel won't populate for package nodes until M2.4b / v0.1.10.
+
 ## v0.1.8 — 2026-05-27
 
 ### Added — M2.3c.2b (for / while loops)

@@ -40,6 +40,8 @@ namespace Amalgame.Pollen
     #include <netinet/in.h>
     #include <arpa/inet.h>
     #include <time.h>
+    #include <sys/time.h>
+    #include <errno.h>
     #include <gc.h>
 
     /* Singleton-per-process engine state. v0.1 carries flags only ;
@@ -171,6 +173,12 @@ namespace Amalgame.Pollen
                        char* out_new_mid);
     static void    _pollen_for_forward(const char* env, size_t env_len);
     static void    _pollen_while_forward(const char* env, size_t env_len);
+    /* M2.4 — debug bridge. Returns 1 to proceed (envelope to
+     * dispatch copied into out[0..*out_len)), 0 to drop the message
+     * (operator hit Cancel, or the manager phone-home timed out). */
+    static int     _pollen_debug_process(const char* in, size_t in_len,
+                                           char* out, size_t out_cap,
+                                           size_t* out_len);
 
     /* Portable substring search — memmem is glibc-only and _GNU_SOURCE
      * has to be defined before any system header which is hard to
@@ -1291,6 +1299,343 @@ namespace Amalgame.Pollen
         /* No branch matched — drop silently. */
     }
 
+    /* === M2.4 — debug bridge (Phase 4.5.x) ===================
+     *
+     * When an envelope carries a `debug` field and this node's role
+     * matches the pause criteria, phone home to the manager declared
+     * in the envelope (one-shot TCP connect + DEBUG_PAUSE + recv the
+     * operator's command), then act :
+     *   CANCEL / TIMEOUT / NO_CONN → drop the message
+     *   MUTATE                     → rewrite data + remap to `then`
+     *   STEP_*                     → rewrite mode=step  hit_bp=false
+     *   CONTINUE                   → rewrite mode=breakpoint hit_bp=false
+     * The (possibly rewritten) envelope then flows through the normal
+     * set / cond / for / while / forward dispatch.
+     */
+    #define POLLEN_DBG_STEP_OVER  0
+    #define POLLEN_DBG_STEP_INTO  1
+    #define POLLEN_DBG_CONTINUE   2
+    #define POLLEN_DBG_CANCEL     3
+    #define POLLEN_DBG_MUTATE     4
+    #define POLLEN_DBG_TIMEOUT    5
+    #define POLLEN_DBG_NO_CONN    6
+    #define POLLEN_DBG_NO_PAUSE   7
+
+    static int _pollen_debug_should_pause(const char* envelope,
+                                            size_t envelope_len,
+                                            const char* self_role) {
+        const char* d = _pollen_find(envelope, envelope_len,
+                                       "\"debug\":{\"session\":\"", 20);
+        if (!d) return POLLEN_DBG_NO_PAUSE;
+        const char* hit = _pollen_find(envelope, envelope_len,
+                                         "\"hit_bp\":true", 13);
+        if (hit) return POLLEN_DBG_STEP_INTO;  /* sticky once tripped */
+        const char* mk = _pollen_find(envelope, envelope_len,
+                                        "\"mode\":\"", 8);
+        if (!mk) return POLLEN_DBG_NO_PAUSE;
+        const char* mv = mk + 8;
+        const char* mq = memchr(mv, '"',
+                                  envelope_len - (size_t)(mv - envelope));
+        if (!mq) return POLLEN_DBG_NO_PAUSE;
+        size_t mlen = (size_t)(mq - mv);
+        int is_step = (mlen == 4 && memcmp(mv, "step", 4) == 0);
+        int is_bp   = (mlen == 10 && memcmp(mv, "breakpoint", 10) == 0);
+        if (is_step) return POLLEN_DBG_STEP_INTO;
+        if (!is_bp)  return POLLEN_DBG_NO_PAUSE;
+        /* mode=breakpoint : pause iff our role appears after the
+         * "breakpoints":[ marker. */
+        const char* bps = _pollen_find(envelope, envelope_len,
+                                         "\"breakpoints\":[", 15);
+        if (!bps) return POLLEN_DBG_NO_PAUSE;
+        char needle[80];
+        int nlen = snprintf(needle, sizeof(needle),
+                             "\"role\":\"%s\"", self_role ? self_role : "");
+        if (nlen <= 0 || nlen >= (int) sizeof(needle)) return POLLEN_DBG_NO_PAUSE;
+        size_t off = (size_t)(bps - envelope);
+        const char* hit2 = _pollen_find(envelope + off,
+                                          envelope_len - off,
+                                          needle, (size_t) nlen);
+        return hit2 ? POLLEN_DBG_STEP_INTO : POLLEN_DBG_NO_PAUSE;
+    }
+
+    static int _pollen_debug_extract_manager(const char* envelope,
+                                               size_t envelope_len,
+                                               char* out, size_t out_cap) {
+        const char* m = _pollen_find(envelope, envelope_len,
+                                       "\"manager\":\"", 11);
+        if (!m) return 0;
+        const char* v = m + 11;
+        const char* q = memchr(v, '"',
+                                 envelope_len - (size_t)(v - envelope));
+        if (!q) return 0;
+        size_t vlen = (size_t)(q - v);
+        if (vlen == 0 || vlen >= out_cap) return 0;
+        memcpy(out, v, vlen); out[vlen] = 0;
+        return 1;
+    }
+
+    /* Extract a JSON object / array / string / literal value for a
+     * "key": pair. Writes [start, end) byte offsets. 1 on success. */
+    static int _pollen_extract_json_value(const char* buf, size_t buf_len,
+                                            const char* key, size_t key_len,
+                                            size_t* out_start, size_t* out_end) {
+        const char* k = _pollen_find(buf, buf_len, key, key_len);
+        if (!k) return 0;
+        const char* v = k + key_len;
+        while (v < buf + buf_len && (*v == ' ' || *v == '\t')) v++;
+        if (v >= buf + buf_len) return 0;
+        size_t start = (size_t)(v - buf);
+        char open = *v, close;
+        if      (open == '{') close = '}';
+        else if (open == '[') close = ']';
+        else if (open == '"') {
+            size_t i = start + 1;
+            while (i < buf_len) {
+                if (buf[i] == '\\') { i += 2; continue; }
+                if (buf[i] == '"') { *out_start = start; *out_end = i + 1; return 1; }
+                i++;
+            }
+            return 0;
+        } else {
+            size_t i = start;
+            while (i < buf_len && buf[i] != ',' && buf[i] != '}' && buf[i] != ']'
+                   && buf[i] != ' ' && buf[i] != '\t'
+                   && buf[i] != '\n' && buf[i] != '\r') i++;
+            *out_start = start; *out_end = i; return 1;
+        }
+        int depth = 0;
+        for (size_t i = start; i < buf_len; i++) {
+            char c = buf[i];
+            if (c == '"') {
+                i++;
+                while (i < buf_len) {
+                    if (buf[i] == '\\') { i += 2; continue; }
+                    if (buf[i] == '"') break;
+                    i++;
+                }
+                continue;
+            }
+            if (c == open) depth++;
+            else if (c == close) {
+                depth--;
+                if (depth == 0) { *out_start = start; *out_end = i + 1; return 1; }
+            }
+        }
+        return 0;
+    }
+
+    /* Rewrite debug.mode + debug.hit_bp. 0 on failure (no debug
+     * field — caller forwards verbatim). */
+    static size_t _pollen_debug_rewrite(const char* in, size_t in_len,
+                                          char* out, size_t out_cap,
+                                          const char* new_mode, int new_hit_bp) {
+        const char* m = _pollen_find(in, in_len, "\"mode\":\"", 8);
+        if (!m) return 0;
+        const char* mv_start = m + 8;
+        const char* mv_end = memchr(mv_start, '"',
+                                      in_len - (size_t)(mv_start - in));
+        if (!mv_end) return 0;
+        const char* h = _pollen_find(in, in_len, "\"hit_bp\":", 9);
+        if (!h) return 0;
+        const char* hv_start = h + 9;
+        const char* hv_end;
+        if (in_len - (size_t)(hv_start - in) >= 4
+            && memcmp(hv_start, "true", 4) == 0) {
+            hv_end = hv_start + 4;
+        } else if (in_len - (size_t)(hv_start - in) >= 5
+            && memcmp(hv_start, "false", 5) == 0) {
+            hv_end = hv_start + 5;
+        } else return 0;
+        if (mv_end >= h) return 0;
+        const char* new_hit_str = new_hit_bp ? "true" : "false";
+        size_t new_mode_len = strlen(new_mode);
+        size_t new_hit_len = strlen(new_hit_str);
+        size_t pre = (size_t)(mv_start - in);
+        size_t mid = (size_t)(h - mv_end);
+        size_t tail = (size_t)((in + in_len) - hv_end);
+        size_t total = pre + new_mode_len + mid + 9 + new_hit_len + tail;
+        if (total > out_cap) return 0;
+        size_t o = 0;
+        memcpy(out + o, in, pre); o += pre;
+        memcpy(out + o, new_mode, new_mode_len); o += new_mode_len;
+        memcpy(out + o, mv_end, mid); o += mid;
+        memcpy(out + o, "\"hit_bp\":", 9); o += 9;
+        memcpy(out + o, new_hit_str, new_hit_len); o += new_hit_len;
+        memcpy(out + o, hv_end, tail); o += tail;
+        return o;
+    }
+
+    /* Rewrite the `data` field in-place (anchored start of `"data":`
+     * → start of `,"timestamp":`). 0 on failure. */
+    static size_t _pollen_debug_rewrite_data(const char* in, size_t in_len,
+                                               char* out, size_t out_cap,
+                                               const char* new_data,
+                                               size_t new_data_len) {
+        const char* d = _pollen_find(in, in_len, "\"data\":", 7);
+        if (!d) return 0;
+        const char* d_val_start = d + 7;
+        size_t after_off = (size_t)(d_val_start - in);
+        const char* d_end = _pollen_find(in + after_off, in_len - after_off,
+                                           ",\"timestamp\":", 13);
+        if (!d_end) return 0;
+        size_t pre = (size_t)(d_val_start - in);
+        size_t tail = in_len - (size_t)(d_end - in);
+        size_t total = pre + new_data_len + tail;
+        if (total > out_cap) return 0;
+        memcpy(out, in, pre);
+        memcpy(out + pre, new_data, new_data_len);
+        memcpy(out + pre + new_data_len, d_end, tail);
+        return total;
+    }
+
+    /* One-shot phone-home to the manager. Sends DEBUG_PAUSE + the
+     * full envelope, blocks (60s) for the command line, copies the
+     * raw response into resp_out. Returns the command code. */
+    static int _pollen_debug_pause(const char* envelope, size_t envelope_len,
+                                     const char* manager_host_port,
+                                     const char* session_str,
+                                     const char* role,
+                                     char* resp_out, size_t resp_out_cap) {
+        char host[64];
+        const char* colon = strchr(manager_host_port, ':');
+        if (!colon) return POLLEN_DBG_NO_CONN;
+        size_t hlen = (size_t)(colon - manager_host_port);
+        if (hlen == 0 || hlen >= sizeof(host)) return POLLEN_DBG_NO_CONN;
+        memcpy(host, manager_host_port, hlen); host[hlen] = 0;
+        int port = atoi(colon + 1);
+        if (port <= 0 || port > 65535) return POLLEN_DBG_NO_CONN;
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return POLLEN_DBG_NO_CONN;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        struct timeval ctv = { 3, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        char header[256];
+        int hn = snprintf(header, sizeof(header),
+            "{\"type\":\"DEBUG_PAUSE\",\"session\":\"%s\","
+             "\"role\":\"%s\",\"envelope\":",
+            session_str, role);
+        if (hn <= 0 || hn >= (int) sizeof(header)) { close(fd); return POLLEN_DBG_NO_CONN; }
+        if (send(fd, header, (size_t) hn, MSG_NOSIGNAL) != hn) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        if (send(fd, envelope, envelope_len, MSG_NOSIGNAL) != (ssize_t) envelope_len) {
+            close(fd); return POLLEN_DBG_NO_CONN;
+        }
+        send(fd, "}\n", 2, MSG_NOSIGNAL);
+
+        struct timeval rtv = { 60, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+        char rbuf[8192];
+        ssize_t got = 0, r;
+        while (got < (ssize_t) sizeof(rbuf) - 1) {
+            r = recv(fd, rbuf + got, sizeof(rbuf) - 1 - got, 0);
+            if (r <= 0) break;
+            got += r;
+            if (memchr(rbuf, '\n', got)) break;
+        }
+        close(fd);
+        if (got <= 0) return POLLEN_DBG_TIMEOUT;
+        rbuf[got] = 0;
+        if (resp_out && resp_out_cap > 0) {
+            size_t copy = (size_t) got;
+            if (copy >= resp_out_cap) copy = resp_out_cap - 1;
+            memcpy(resp_out, rbuf, copy); resp_out[copy] = 0;
+        }
+        if (strstr(rbuf, "\"DEBUG_STEP_OVER\""))  return POLLEN_DBG_STEP_OVER;
+        if (strstr(rbuf, "\"DEBUG_STEP_INTO\""))  return POLLEN_DBG_STEP_INTO;
+        if (strstr(rbuf, "\"DEBUG_STEP\""))       return POLLEN_DBG_STEP_INTO;
+        if (strstr(rbuf, "\"DEBUG_CONTINUE\""))   return POLLEN_DBG_CONTINUE;
+        if (strstr(rbuf, "\"DEBUG_CANCEL\""))     return POLLEN_DBG_CANCEL;
+        if (strstr(rbuf, "\"DEBUG_MUTATE\""))     return POLLEN_DBG_MUTATE;
+        return POLLEN_DBG_TIMEOUT;
+    }
+
+    /* Orchestrator : should_pause → phone home → act. Produces the
+     * (possibly rewritten) envelope into `out`. Returns 1 to proceed,
+     * 0 to drop. self_role comes from WorkflowSetSelf (_pollen_pkg_role). */
+    static int _pollen_debug_process(const char* in, size_t in_len,
+                                       char* out, size_t out_cap,
+                                       size_t* out_len) {
+        /* Default : pass through verbatim. */
+        if (in_len > out_cap) { *out_len = 0; return 1; }  /* too big to copy — forward original via caller */
+        memcpy(out, in, in_len);
+        *out_len = in_len;
+
+        const char* dp = _pollen_find(in, in_len, "\"debug\":{\"session\":\"", 20);
+        if (!dp) return 1;
+
+        int should = _pollen_debug_should_pause(in, in_len, _pollen_pkg_role);
+        if (should == POLLEN_DBG_NO_PAUSE) return 1;
+
+        /* Extract session id */
+        const char* sv = dp + 20;
+        const char* sq = memchr(sv, '"', in_len - (size_t)(sv - in));
+        if (!sq) return 1;
+        char session[64];
+        size_t slen = (size_t)(sq - sv);
+        if (slen >= sizeof(session)) return 1;
+        memcpy(session, sv, slen); session[slen] = 0;
+
+        char mgr[96];
+        if (!_pollen_debug_extract_manager(in, in_len, mgr, sizeof(mgr))) return 1;
+
+        char resp[8192]; resp[0] = 0;
+        int cmd = _pollen_debug_pause(in, in_len, mgr, session,
+                                        _pollen_pkg_role, resp, sizeof(resp));
+
+        if (cmd == POLLEN_DBG_CANCEL || cmd == POLLEN_DBG_TIMEOUT
+            || cmd == POLLEN_DBG_NO_CONN) {
+            return 0;  /* drop */
+        }
+
+        char tmp[16384];
+        const char* base = in;
+        size_t base_len = in_len;
+
+        if (cmd == POLLEN_DBG_MUTATE) {
+            size_t ds = 0, de = 0;
+            size_t rlen = strlen(resp);
+            if (_pollen_extract_json_value(resp, rlen, "\"data\":", 7, &ds, &de)) {
+                size_t rn = _pollen_debug_rewrite_data(in, in_len,
+                    tmp, sizeof(tmp), resp + ds, de - ds);
+                if (rn > 0) { base = tmp; base_len = rn; }
+            }
+            const char* t = _pollen_find(resp, rlen, "\"then\":\"", 8);
+            cmd = POLLEN_DBG_CONTINUE;
+            if (t) {
+                const char* tv = t + 8;
+                size_t remain = rlen - (size_t)(tv - resp);
+                if (remain >= 9 && memcmp(tv, "step_into", 9) == 0) cmd = POLLEN_DBG_STEP_INTO;
+                else if (remain >= 9 && memcmp(tv, "step_over", 9) == 0) cmd = POLLEN_DBG_STEP_OVER;
+            }
+        }
+
+        const char* new_mode = NULL;
+        if (cmd == POLLEN_DBG_STEP_OVER || cmd == POLLEN_DBG_STEP_INTO) new_mode = "step";
+        else if (cmd == POLLEN_DBG_CONTINUE) new_mode = "breakpoint";
+
+        if (new_mode) {
+            size_t rn = _pollen_debug_rewrite(base, base_len,
+                out, out_cap, new_mode, 0);
+            if (rn > 0) { *out_len = rn; return 1; }
+        }
+        /* No mode rewrite (or it failed) — emit `base` as-is. */
+        if (base_len <= out_cap) {
+            if (base != out) memcpy(out, base, base_len);
+            *out_len = base_len;
+        }
+        return 1;
+    }
+
     /* === M2.3c.1 — workflow setters + dispatch helpers ======= */
 
     static void _pollen_wf_reload_begin(void) {
@@ -1619,30 +1964,39 @@ namespace Amalgame.Pollen
                         }
                     }
                     if (do_forward) {
-                        /* M2.3c.2 dispatch sequence :
-                         *   1. apply pending set ops (mutates state.X
-                         *      before the cond eval sees it),
-                         *   2. if cond branches active → cond_forward
-                         *      (first-match wins),
-                         *   3. else → forward to every next. */
-                        if (_pollen_n_set_ops > 0) {
-                            _pollen_set_ops_apply(rbuf, line_len);
-                        }
-                        /* M2.3c.2b dispatch priority :
-                         *   while (self-loop bounded) > for (item fan-out)
-                         *   > cond (if / elseif branches)
-                         *   > plain fan_out (forward_all)
-                         * These flags are mutually exclusive per node in
-                         * the workflow-tree schema, but priority is safer
-                         * than asserting exclusion. */
-                        if (_pollen_while_active) {
-                            _pollen_while_forward(rbuf, line_len);
-                        } else if (_pollen_for_active) {
-                            _pollen_for_forward(rbuf, line_len);
-                        } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
-                            _pollen_cond_forward(rbuf, line_len);
-                        } else {
-                            _pollen_wf_forward_all(rbuf, line_len);
+                        /* M2.4 — debug bridge. If the envelope carries
+                         * a debug session + this role should pause,
+                         * phone home to the manager + act on the reply.
+                         * Produces the (possibly mutated / mode-rewritten)
+                         * envelope to dispatch. proceed==0 → operator hit
+                         * Cancel (or manager unreachable) → drop. */
+                        char dbg_env[16384];
+                        size_t dbg_len = 0;
+                        int proceed = _pollen_debug_process(rbuf, line_len,
+                            dbg_env, sizeof(dbg_env), &dbg_len);
+                        if (proceed) {
+                            const char* fenv = (dbg_len > 0) ? dbg_env : rbuf;
+                            size_t flen = (dbg_len > 0) ? dbg_len : line_len;
+                            /* M2.3c.2 dispatch sequence :
+                             *   1. apply pending set ops (mutates state.X
+                             *      before the cond eval sees it),
+                             *   2. dispatch priority :
+                             *        while > for > cond > forward_all
+                             * These route flags are mutually exclusive per
+                             * node in the workflow-tree schema, but priority
+                             * is safer than asserting exclusion. */
+                            if (_pollen_n_set_ops > 0) {
+                                _pollen_set_ops_apply(fenv, flen);
+                            }
+                            if (_pollen_while_active) {
+                                _pollen_while_forward(fenv, flen);
+                            } else if (_pollen_for_active) {
+                                _pollen_for_forward(fenv, flen);
+                            } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
+                                _pollen_cond_forward(fenv, flen);
+                            } else {
+                                _pollen_wf_forward_all(fenv, flen);
+                            }
                         }
                     }
                 }
