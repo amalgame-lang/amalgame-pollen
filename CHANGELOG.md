@@ -10,7 +10,10 @@ versioning follows the upstream package indexing convention.
 - `runtime/Amalgame_Pollen.h` included a stray `"Amalgame.h"` (no such file in the amc runtime dir), which broke **any consumer** whose generated C pulls in the header — `fatal error: Amalgame.h: No such file`. The package's own `--lib` build never tripped it because `facade.c` includes `_runtime.h` directly. Now includes `"_runtime.h"` + `<stdint.h>` like every other package header. This unblocks building a program that does `import Amalgame.Pollen` (e.g. `examples/pollen-node.am`).
 
 ### Added
-- `examples/pollen-node.am` — reference Pollen node binary built entirely on the package (the M3 "thin wrapper"). Parses a `workflow.json`, resolves the role, wires the runtime via the public setters (consumes / emit / next / if-branches), and blocks in `Pollen.StartListener`. Unlike the legacy binary, the `if` cond is evaluated correctly at dispatch.
+- `examples/pollen-node.am` — reference Pollen node binary built entirely on the package (the M3 "thin wrapper"). Parses a `workflow.json`, resolves the role, wires the runtime via the public setters, and blocks in `Pollen.StartListener`. Unlike the legacy binary, the `if` cond is evaluated correctly at dispatch.
+  - M3.1 : consumes / emit / next (call, fan_out) / if-branches.
+  - M3.2 : also wires `set` state ops, `for` loops (var + items + targets), and `while` loops (cond + maxIter + self-loop + exit targets). Verified end-to-end : `if` routes amount>1000→vip / else→standard ; `for ["a","b","c"]` fans out 3 messages to the worker.
+  - Still top-level-sequence only (nested branches resolved one level for if/for `then`/`do` targets). Deeply nested trees are M3.3.
 
 ## v0.1.9 — 2026-05-27
 

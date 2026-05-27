@@ -125,6 +125,129 @@ public class Program {
         }
     }
 
+    // M3.2 — collect the `set` steps that sit between this role's call
+    // and the next dispatcher in the top-level sequence, register each
+    // as a state op. value : object → raw expr ; bare literal → wrapped
+    // as {"const":<lit>} so the package's single eval entrypoint copes.
+    public static void WireSetsAfter(JsonValue treeV, string role) {
+        if (!treeV.IsObject()) { return }
+        if (treeV.Get("type").AsString() != "sequence") { return }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            if (Program.StepNames(steps.Get(i), role)) {
+                var j: int = i + 1
+                while (j < n) {
+                    let s: JsonValue = steps.Get(j)
+                    if (!s.IsObject()) { return }
+                    if (s.Get("type").AsString() != "set") { return }
+                    let p: string = s.Get("path").AsString()
+                    let valueV: JsonValue = s.Get("value")
+                    var expr: string = ""
+                    if (valueV.IsObject()) {
+                        expr = Json.Encode(valueV)
+                    } else {
+                        expr = "{\"const\":" + Json.Encode(valueV) + "}"
+                    }
+                    if (String_Length(p) > 0) { Pollen.SetOpAdd(p, expr) }
+                    j = j + 1
+                }
+                return
+            }
+        }
+    }
+
+    // M3.2 — the dispatchable step that follows this role's dispatcher
+    // (i.e. two dispatchers down, skipping sets). Used for `while`
+    // exit-target resolution : while loops to self, then exits to
+    // whatever comes after the while step in the sequence.
+    public static JsonValue FindStepAfterDispatcher(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return empty }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            if (Program.StepNames(steps.Get(i), role)) {
+                // skip sets → dispatcher
+                var j: int = i + 1
+                while (j < n && steps.Get(j).IsObject()
+                       && steps.Get(j).Get("type").AsString() == "set") { j = j + 1 }
+                if (j >= n) { return empty }
+                // j is the dispatcher (the while) ; skip sets → next
+                var k: int = j + 1
+                while (k < n && steps.Get(k).IsObject()
+                       && steps.Get(k).Get("type").AsString() == "set") { k = k + 1 }
+                if (k < n) { return steps.Get(k) }
+                return empty
+            }
+        }
+        return empty
+    }
+
+    // M3.2 — wire a `for` route : item var + targets of `do` + items.
+    public static void WireFor(JsonValue nodesV, JsonValue forStep) {
+        var itemVar: string = forStep.Get("var").AsString()
+        if (String_Length(itemVar) == 0) { itemVar = "item" }
+        Pollen.ForSetup(itemVar)
+        let doV: JsonValue = forStep.Get("do")
+        if (doV.IsObject()) {
+            let targets: List<string> = Program.ActionTargets(doV)
+            let tn: int = targets.Count()
+            for ti in 0..tn {
+                let tn2: JsonValue = nodesV.Get(targets.Get(ti))
+                if (tn2.IsObject()) {
+                    let h: string = tn2.Get("host").AsString()
+                    let p: int    = tn2.Get("port").AsInt()
+                    if (String_Length(h) > 0 && p > 0) {
+                        Pollen.ForAddTarget(h, p)
+                    }
+                }
+            }
+        }
+        let inV: JsonValue = forStep.Get("in")
+        if (inV.IsArray()) {
+            let items: List<JsonValue> = inV.AsArray()
+            let ic: int = items.Count()
+            for ii in 0..ic {
+                Pollen.ForAddItem(Json.Encode(items.Get(ii)))
+            }
+        }
+    }
+
+    // M3.2 — wire a `while` route : cond + maxIter + self loop + exits.
+    public static void WireWhile(JsonValue nodesV, JsonValue treeV,
+                                   string role, JsonValue whileStep,
+                                   string selfHost, int selfPort) {
+        var condJson: string = ""
+        let condV: JsonValue = whileStep.Get("cond")
+        if (condV.IsObject()) { condJson = Json.Encode(condV) }
+        var maxIter: int = 100
+        let maxV: JsonValue = whileStep.Get("maxIter")
+        if (maxV.IsInt()) { maxIter = maxV.AsInt() }
+        let iterKey: string = "_wf_iter_" + role
+        Pollen.WhileSetup(condJson, iterKey, maxIter, selfHost, selfPort)
+        let exitAction: JsonValue = Program.FindStepAfterDispatcher(treeV, role)
+        if (exitAction.IsObject()) {
+            let exits: List<string> = Program.ActionTargets(exitAction)
+            let ec: int = exits.Count()
+            for ei in 0..ec {
+                let en: JsonValue = nodesV.Get(exits.Get(ei))
+                if (en.IsObject()) {
+                    let eh: string = en.Get("host").AsString()
+                    let ep: int    = en.Get("port").AsInt()
+                    if (String_Length(eh) > 0 && ep > 0) {
+                        Pollen.WhileAddExit(eh, ep)
+                    }
+                }
+            }
+        }
+    }
+
     public static void Main(string[] args) {
         if (Args_Count() == 0) {
             Console.WriteLine("usage: pollen-node <port> --workflow <path> --node-name <role> [--shared-dir <dir>]")
@@ -235,7 +358,10 @@ public class Program {
             }
         }
 
-        // next : the step after this role in the top-level sequence
+        // M3.2 — set ops sitting between this role and its dispatcher
+        Program.WireSetsAfter(treeV, role)
+
+        // next : the dispatcher step after this role (sets skipped)
         let after: JsonValue = Program.FindActionAfter(treeV, role)
         if (after.IsObject()) {
             let kind: string = after.Get("type").AsString()
@@ -245,6 +371,10 @@ public class Program {
                 for ti in 0..tn {
                     Program.WireNext(nodesV, targets.Get(ti))
                 }
+            } else if (kind == "for") {
+                Program.WireFor(nodesV, after)
+            } else if (kind == "while") {
+                Program.WireWhile(nodesV, treeV, role, after, "127.0.0.1", port)
             } else if (kind == "if") {
                 // Each branch → CondBranchOpen(condJson) + targets.
                 let branchesV: JsonValue = after.Get("branches")
