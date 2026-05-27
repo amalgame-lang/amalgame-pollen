@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.11 — 2026-05-27
+
+### Added — M2.4b (executions/ step recorder)
+- Package nodes now write one `<sharedDir>/executions/<mid>-<role>.json` record per forwarded hop, so the pollen-manager "Live executions" panel populates from package-driven nodes (not just the legacy binary).
+- `Pollen.WorkflowSetSelf(role, host, port)` now stores `host` + `port` (was role-only) — needed for the record's `node` field.
+- The forward helpers (`forward_all` / `cond_forward` / `for_forward` / `while_forward`) thread the rebuilt envelope's fresh mid back to the listener, which records `{messageId, parentMessageId, role, topicIn, topicOut, nextCount, node, timestamp, debugSession?}`. Best-effort (`O_CREAT|O_EXCL`, skips dupes/fs errors). Chains reconstruct by walking `parentMessageId`.
+- 7 new smoke assertions (`tests/recorder_smoke.c`). 97 total across the suite.
+
+
 All notable changes to `amalgame-pollen`. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ;
 versioning follows the upstream package indexing convention.
