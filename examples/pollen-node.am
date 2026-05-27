@@ -345,30 +345,46 @@ public class Program {
         return a.Get("topic").AsString()
     }
 
-    // Walk a top-level sequence of `call` steps : the topic of the
-    // action called immediately after `role` ("" if role is last /
-    // absent). Linear-only for this slice.
-    public static string NextActionTopic(JsonValue actionsV, JsonValue treeV,
-                                           string role) {
-        if (!treeV.IsObject()) { return "" }
-        if (treeV.Get("type").AsString() != "sequence") { return "" }
+    // Walk a top-level sequence : the step immediately after the
+    // `call` of `role` (empty JsonValue if role is last / absent).
+    // The caller dispatches on its type (call → linear emit ; if →
+    // conditional branches).
+    public static JsonValue NextStepAfterAction(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
         let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return "" }
+        if (!stepsV.IsArray()) { return empty }
         let steps: List<JsonValue> = stepsV.AsArray()
         let n: int = steps.Count()
         for i in 0..n {
             let s: JsonValue = steps.Get(i)
             if (s.IsObject() && s.Get("type").AsString() == "call"
                 && s.Get("action").AsString() == role) {
-                var j: int = i + 1
-                while (j < n) {
-                    let s2: JsonValue = steps.Get(j)
-                    if (s2.IsObject() && s2.Get("type").AsString() == "call") {
-                        return Program.ActionTopic(actionsV, s2.Get("action").AsString())
+                if (i + 1 < n) { return steps.Get(i + 1) }
+                return empty
+            }
+        }
+        return empty
+    }
+
+    // The action a `then` (or `do`) clause calls — direct call, or the
+    // first call inside a sequence. "" if none.
+    public static string ThenAction(JsonValue thenV) {
+        if (!thenV.IsObject()) { return "" }
+        let kind: string = thenV.Get("type").AsString()
+        if (kind == "call") { return thenV.Get("action").AsString() }
+        if (kind == "sequence") {
+            let stepsV: JsonValue = thenV.Get("steps")
+            if (stepsV.IsArray()) {
+                let steps: List<JsonValue> = stepsV.AsArray()
+                let n: int = steps.Count()
+                for i in 0..n {
+                    let s: JsonValue = steps.Get(i)
+                    if (s.IsObject() && s.Get("type").AsString() == "call") {
+                        return s.Get("action").AsString()
                     }
-                    j = j + 1
                 }
-                return ""
             }
         }
         return ""
@@ -396,22 +412,56 @@ public class Program {
 
         Pollen.WorkflowReloadBegin()
         Pollen.WorkflowAddConsume(myTopic)
-        let emitTopic: string = Program.NextActionTopic(actionsV, treeV, role)
-        if (String_Length(emitTopic) > 0) { Pollen.WorkflowSetEmitTopic(emitTopic) }
+
+        // Dispatch on the step that follows this action in the tree :
+        //   call → linear : emit the next action's topic
+        //   if   → conditional : one branch per {cond, then}, each
+        //          forwarding to its target action's topic (branches
+        //          resolve providers via the registry, like emit does)
+        var routeDesc: string = "terminal"
+        let nextStep: JsonValue = Program.NextStepAfterAction(treeV, role)
+        if (nextStep.IsObject()) {
+            let kind: string = nextStep.Get("type").AsString()
+            if (kind == "call") {
+                let emitTopic: string = Program.ActionTopic(actionsV, nextStep.Get("action").AsString())
+                if (String_Length(emitTopic) > 0) {
+                    Pollen.WorkflowSetEmitTopic(emitTopic)
+                    routeDesc = "→ emit {emitTopic}"
+                }
+            } else if (kind == "if") {
+                let branchesV: JsonValue = nextStep.Get("branches")
+                if (branchesV.IsArray()) {
+                    let branches: List<JsonValue> = branchesV.AsArray()
+                    let bn: int = branches.Count()
+                    var wired: int = 0
+                    for bi in 0..bn {
+                        let br: JsonValue = branches.Get(bi)
+                        if (!br.IsObject()) { continue }
+                        var condJson: string = ""
+                        let condV: JsonValue = br.Get("cond")
+                        if (condV.IsObject()) { condJson = Json.Encode(condV) }
+                        Pollen.CondBranchOpen(condJson)
+                        let act: string = Program.ThenAction(br.Get("then"))
+                        let bt: string = Program.ActionTopic(actionsV, act)
+                        if (String_Length(bt) > 0) {
+                            Pollen.CondBranchSetTopic(bt)
+                            wired = wired + 1
+                        }
+                    }
+                    routeDesc = "if ({wired} branches → topics, registry-routed)"
+                }
+            }
+        }
         Pollen.WorkflowReloadCommit()
 
         // Advertise (writer) + discover (reader), then route by topic :
-        // SetLoadBalance(true) makes forward_all resolve the emit topic
-        // to a live provider (1 → that one ; N → power-of-two).
+        // SetLoadBalance(true) makes forwards (linear + cond branches)
+        // resolve the target topic to a live provider via power-of-two.
         Pollen.StartCapabilityWriter(role, "127.0.0.1", port)
         Pollen.StartCapabilityReader()
         Pollen.SetLoadBalance(true)
 
-        if (String_Length(emitTopic) > 0) {
-            Console.WriteLine("pollen-node v2: action={role} topic={myTopic} → emit={emitTopic} (registry-routed)")
-        } else {
-            Console.WriteLine("pollen-node v2: action={role} topic={myTopic} (terminal)")
-        }
+        Console.WriteLine("pollen-node v2: action={role} topic={myTopic} {routeDesc}")
         Console.Flush()
         Pollen.StartListener(port)
     }
