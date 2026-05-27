@@ -154,6 +154,39 @@ public class OrderRoute {
 
 The same Mosaic app can also act as a workflow node in the middle of the chain : call `Pollen.WorkflowAddConsume` for an upstream topic, run `Pollen.StartListener` in a background pthread, and bridge incoming messages to external systems via your route handlers.
 
+### Bridging to the outside world (v0.1.17)
+
+Pollen itself stays a pure TCP/topic bus — the **adapter** to HTTP (or anything else) is ordinary AM code you write in a Mosaic app that embeds the package, hooked in via three primitives. The node receives a Pollen message, you do the outbound call, and the result re-enters the workflow.
+
+```amalgame
+import Amalgame.Pollen
+import Amalgame.Net.Http   // your egress client
+
+// EGRESS — transform a consumed message before it is forwarded.
+// The handler gets the full envelope JSON and returns the new
+// `data` JSON to forward ("" drops the message). Here it calls an
+// external HTTP service and forwards the response as the new data.
+Pollen.OnMessage(env => {
+    let body: string = Json.GetString(env, "data")   // your accessor
+    let resp: string = Http.PostJson("https://api.example.com/enrich", body)
+    return resp                                       // becomes data.* downstream
+})
+
+// INGRESS reply — fires when an execution terminates at this (leaf)
+// node. Resolve the pending HTTP response, correlating by rootMid.
+Pollen.OnComplete(env => {
+    let root: string = Json.GetString(env, "rootMessageId")
+    Replies.Resolve(root, env)    // your per-request correlation map
+    return ""
+})
+
+// OUT-OF-BAND re-emit — from a Mosaic HTTP-handler thread (NOT from
+// inside OnMessage/OnComplete). Keeps rootMessageId, chains parent.
+let mid: string = Pollen.Forward(savedEnvelope, "{\"approved\":true}")
+```
+
+The wiring (consume topic, nexts, emit topic, `StartListener` on a background pthread) is exactly the same as any node — `OnMessage` just inserts your transform between recv and forward. Handlers run on the listener worker thread under the routing lock, so they must **not** call `Pollen.Forward` (return data / use `Pollen.Publish` instead) ; `Forward` is for separate threads.
+
 ## Limitations (v0.1.x)
 
 - **Singleton-per-process.** Engine state is in static C globals (matches the `pollen` runtime). v0.2 will optionally wrap in an opaque handle so one process can host multiple independent workflows.

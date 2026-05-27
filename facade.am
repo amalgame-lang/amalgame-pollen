@@ -64,6 +64,20 @@ namespace Amalgame.Pollen
     #include <stdatomic.h>
     static _Atomic long _pollen_inflight = 0;
     static _Atomic long _pollen_msgs_handled = 0;
+    /* v0.1.17 — Mosaic bridge hooks. AM closures (AmalgameClosure*
+     * from _runtime.h) invoked from the listener worker. on_message
+     * transforms a consumed message's data before forward (return ""
+     * → drop) ; on_complete fires when a consumed message terminates
+     * at this node (leaf : no nexts/cond/for/while). Both run on the
+     * worker thread under _pollen_wf_mutex, so they must NOT call
+     * Pollen.Forward (would re-lock + deadlock) — return data / use
+     * Publish instead. Forward is for OTHER threads (a Mosaic HTTP
+     * handler re-emitting out-of-band). Set once at wiring time, read
+     * lock-free on the hot path (plain pointer load is atomic enough
+     * for set-once-then-read). AmalgameClosure is defined in
+     * _runtime.h (already included by the generated TU). */
+    static AmalgameClosure* _pollen_on_message  = 0;
+    static AmalgameClosure* _pollen_on_complete = 0;
     /* shared_dir uses the runtime-canonical name (no _pkg_ prefix) so
      * the M2.x state_persist code below ports verbatim from
      * the pollen runtime with zero diff. file-scope static — no link
@@ -78,6 +92,15 @@ namespace Amalgame.Pollen
      * Hot path readers (listener_worker dispatch) take the same
      * mutex for the snapshot + forward window. */
     #include <pthread.h>
+
+    /* bdwgc thread registration — worker threads that invoke AM
+     * closures (OnMessage / OnComplete) must be GC-registered so
+     * their stacks stay scannable, exactly like amalgame-threading.
+     * Declared extern ; resolved from the runtime's libgc (built
+     * with thread support). */
+    extern int GC_pthread_create(pthread_t*, const pthread_attr_t*,
+                                  void* (*)(void*), void*);
+    extern int GC_pthread_detach(pthread_t);
 
     #define POLLEN_MAX_CONSUMES 32
     #define POLLEN_MAX_NEXTS    32
@@ -191,6 +214,10 @@ namespace Amalgame.Pollen
                                          char* out_new_mid);
     static void    _pollen_while_forward(const char* env, size_t env_len,
                                           char* out_new_mid);
+    /* v0.1.17 — swap the "data":<value> field of an envelope. */
+    static size_t  _pollen_replace_data(const char* in, size_t in_len,
+                                          const char* new_data,
+                                          char* out, size_t out_cap);
     /* M2.4 — debug bridge. Returns 1 to proceed (envelope to
      * dispatch copied into out[0..*out_len)), 0 to drop the message
      * (operator hit Cancel, or the manager phone-home timed out). */
@@ -1886,6 +1913,28 @@ namespace Amalgame.Pollen
         return o;
     }
 
+    /* v0.1.17 — replace the "data":<value> field of an envelope with
+     * new_data (a raw JSON value, inserted verbatim). Used by the
+     * OnMessage transform + Pollen.Forward. Returns the rebuilt
+     * length (NOT newline-terminated), 0 on parse / capacity failure
+     * so the caller keeps the original. */
+    static size_t _pollen_replace_data(const char* in, size_t in_len,
+                                         const char* new_data,
+                                         char* out, size_t out_cap) {
+        if (!in || !new_data) return 0;
+        const char* v; size_t vlen;
+        if (!_pollen_json_field(in, in_len, "data", 4, &v, &vlen)) return 0;
+        size_t pre  = (size_t)(v - in);
+        size_t post = pre + vlen;
+        size_t nd   = strlen(new_data);
+        size_t total = pre + nd + (in_len - post);
+        if (total >= out_cap) return 0;
+        memcpy(out, in, pre);
+        memcpy(out + pre, new_data, nd);
+        memcpy(out + pre + nd, in + post, in_len - post);
+        return total;
+    }
+
     /* === M2.3c.2 — cond branch setters + dispatch ============ */
 
     static void _pollen_cond_clear(void) {
@@ -2081,6 +2130,32 @@ namespace Amalgame.Pollen
                             atomic_fetch_add(&_pollen_inflight, 1);
                             const char* fenv = (dbg_len > 0) ? dbg_env : rbuf;
                             size_t flen = (dbg_len > 0) ? dbg_len : line_len;
+                            /* v0.1.17 — Mosaic bridge transform. If an
+                             * OnMessage handler is registered, hand it the
+                             * consumed envelope ; it returns the new data
+                             * JSON to forward ("" → drop the message). Runs
+                             * on this worker thread (GC-registered) under
+                             * the wf mutex, so the handler must NOT call
+                             * Pollen.Forward (would re-lock + deadlock) —
+                             * return data / use Publish instead. */
+                            char hbuf[16384];
+                            int do_dispatch = 1;
+                            if (_pollen_on_message) {
+                                char* env_gc = (char*) GC_MALLOC_ATOMIC(flen + 1);
+                                if (env_gc) {
+                                    memcpy(env_gc, fenv, flen);
+                                    env_gc[flen] = 0;
+                                    char* nd = (char*) AmalgameClosure_call1(
+                                        _pollen_on_message, (void*) env_gc);
+                                    if (nd && nd[0]) {
+                                        size_t hn = _pollen_replace_data(
+                                            fenv, flen, nd, hbuf, sizeof(hbuf));
+                                        if (hn > 0) { fenv = hbuf; flen = hn; }
+                                    } else if (nd) {
+                                        do_dispatch = 0;  /* "" → drop */
+                                    }
+                                }
+                            }
                             /* M2.3c.2 dispatch sequence :
                              *   1. apply pending set ops (mutates state.X
                              *      before the cond eval sees it),
@@ -2089,22 +2164,24 @@ namespace Amalgame.Pollen
                              * These route flags are mutually exclusive per
                              * node in the workflow-tree schema, but priority
                              * is safer than asserting exclusion. */
-                            if (_pollen_n_set_ops > 0) {
+                            if (do_dispatch && _pollen_n_set_ops > 0) {
                                 _pollen_set_ops_apply(fenv, flen);
                             }
                             char fwd_new_mid[37] = {0};
                             int n_nexts = _pollen_wf_n_nexts;
-                            if (_pollen_while_active) {
-                                _pollen_while_forward(fenv, flen, fwd_new_mid);
-                                n_nexts = 1;
-                            } else if (_pollen_for_active) {
-                                _pollen_for_forward(fenv, flen, fwd_new_mid);
-                                n_nexts = _pollen_for_route.n_targets;
-                            } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
-                                _pollen_cond_forward(fenv, flen, fwd_new_mid);
-                                n_nexts = 1;
-                            } else {
-                                _pollen_wf_forward_all(fenv, flen, fwd_new_mid);
+                            if (do_dispatch) {
+                                if (_pollen_while_active) {
+                                    _pollen_while_forward(fenv, flen, fwd_new_mid);
+                                    n_nexts = 1;
+                                } else if (_pollen_for_active) {
+                                    _pollen_for_forward(fenv, flen, fwd_new_mid);
+                                    n_nexts = _pollen_for_route.n_targets;
+                                } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
+                                    _pollen_cond_forward(fenv, flen, fwd_new_mid);
+                                    n_nexts = 1;
+                                } else {
+                                    _pollen_wf_forward_all(fenv, flen, fwd_new_mid);
+                                }
                             }
                             /* M2.4b — record this hop for the manager's
                              * Live executions panel. Best-effort. */
@@ -2145,6 +2222,25 @@ namespace Amalgame.Pollen
                                     tout, n_nexts,
                                     dsess, dsess_len);
                             }
+                            /* v0.1.17 — terminal node : this role has no
+                             * downstream (leaf in the tree), so the
+                             * execution ends here. If an OnComplete handler
+                             * is set, hand it the final envelope (for an
+                             * ingress node to resolve a pending HTTP reply
+                             * by rootMessageId). */
+                            if (do_dispatch && _pollen_on_complete
+                                && _pollen_wf_n_nexts == 0
+                                && !_pollen_cond_active
+                                && !_pollen_for_active
+                                && !_pollen_while_active) {
+                                char* env_gc = (char*) GC_MALLOC_ATOMIC(flen + 1);
+                                if (env_gc) {
+                                    memcpy(env_gc, fenv, flen);
+                                    env_gc[flen] = 0;
+                                    AmalgameClosure_call1(_pollen_on_complete,
+                                                          (void*) env_gc);
+                                }
+                            }
                             atomic_fetch_sub(&_pollen_inflight, 1);  /* Phase 6.2 */
                         }
                     }
@@ -2178,12 +2274,12 @@ namespace Amalgame.Pollen
             int conn = accept(srv, NULL, NULL);
             if (conn < 0) continue;
             pthread_t th;
-            if (pthread_create(&th, NULL,
+            if (GC_pthread_create(&th, NULL,
                                 _pollen_listener_worker,
                                 (void*)(intptr_t) conn) != 0) {
                 close(conn); continue;
             }
-            pthread_detach(th);
+            GC_pthread_detach(th);
         }
         /* unreachable until we add a shutdown path */
         close(srv);
@@ -2269,11 +2365,62 @@ namespace Amalgame.Pollen
         if (port > 0) { _pollen_self_port = (int) port; }
         _pollen_cap_active = 1;
         pthread_t th;
-        if (pthread_create(&th, NULL, _pollen_capability_writer, NULL) == 0) {
-            pthread_detach(th);
+        if (GC_pthread_create(&th, NULL, _pollen_capability_writer, NULL) == 0) {
+            GC_pthread_detach(th);
         } else {
             _pollen_cap_active = 0;
         }
+    }
+
+    /* === v0.1.17 — Mosaic bridge hooks ======================== */
+
+    static void
+    Amalgame_Pollen_Pollen_OnMessage_c(AmalgameClosure* handler) {
+        _pollen_on_message = handler;
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_OnComplete_c(AmalgameClosure* handler) {
+        _pollen_on_complete = handler;
+    }
+
+    /* Re-emit a message into the workflow, preserving the chain :
+     * fresh messageId, parentMessageId = the incoming envelope's mid,
+     * rootMessageId kept, topic rewritten to the configured emit
+     * topic, data optionally swapped to newDataJson ("" keeps the
+     * original). Forwards to all wired nexts. Returns the minted mid
+     * ("" on failure). Safe to call from any thread EXCEPT a worker
+     * running an OnMessage/OnComplete handler (it takes the same
+     * mutex). */
+    static code_string
+    Amalgame_Pollen_Pollen_Forward_c(code_string envelopeJson,
+                                       code_string newDataJson) {
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!envelopeJson) return (code_string) empty;
+        const char* in = (const char*) envelopeJson;
+        size_t in_len = strlen(in);
+
+        char swapped[16384];
+        const char* src = in;
+        size_t src_len = in_len;
+        if (newDataJson && ((const char*) newDataJson)[0]) {
+            size_t sn = _pollen_replace_data(in, in_len,
+                                              (const char*) newDataJson,
+                                              swapped, sizeof(swapped));
+            if (sn > 0) { src = swapped; src_len = sn; }
+        }
+
+        char new_mid[37] = {0};
+        pthread_mutex_lock(&_pollen_wf_mutex);
+        _pollen_wf_forward_all(src, src_len, new_mid);
+        pthread_mutex_unlock(&_pollen_wf_mutex);
+
+        if (!new_mid[0]) return (code_string) empty;
+        char* out = (char*) GC_MALLOC_ATOMIC(37);
+        if (!out) return (code_string) empty;
+        memcpy(out, new_mid, 37);
+        return (code_string) out;
     }
 
     /* M2.3a — UUID v4 generator (RFC 4122 variant + version bits).
@@ -2730,6 +2877,45 @@ public class Pollen {
                                                            topicUuid, (int64_t) topicVersion,
                                                            dataJson, session, mode,
                                                            breakpointsJson, managerAddr); }
+        return mid
+    }
+
+    // v0.1.17 — Mosaic bridge hook. Register an AM transform invoked
+    // for every message this node consumes, BEFORE it is forwarded.
+    // The handler receives the full envelope JSON and returns the new
+    // `data` JSON to forward (return "" to drop the message). Runs on
+    // the listener worker thread (GC-registered) under the routing
+    // lock, so the handler must NOT call Pollen.Forward — return the
+    // data, or use Pollen.Publish, instead. This is how a Mosaic app
+    // embedding Pollen bridges to the outside world (HTTP, …) : the
+    // handler does the egress call (net-http) and returns the
+    // response as the new data. Set once at wiring time.
+    public static void OnMessage(handler: Closure<string, string>) {
+        @c { Amalgame_Pollen_Pollen_OnMessage_c(handler); }
+    }
+
+    // v0.1.17 — fires when a message this node consumes terminates
+    // here (a leaf : no nexts / cond / for / while wired). The
+    // handler receives the final envelope JSON ; its return value is
+    // ignored. Use it on an ingress node to resolve a pending HTTP
+    // response, correlating by the envelope's rootMessageId. Same
+    // threading contract as OnMessage (no Forward from inside).
+    public static void OnComplete(handler: Closure<string, string>) {
+        @c { Amalgame_Pollen_Pollen_OnComplete_c(handler); }
+    }
+
+    // v0.1.17 — re-emit a message into the workflow out-of-band,
+    // preserving the chain : mints a fresh messageId with
+    // parentMessageId = the incoming envelope's mid, keeps
+    // rootMessageId, swaps `data` to newDataJson (pass "" to keep the
+    // original), rewrites the topic to the configured emit topic, and
+    // forwards to all wired nexts. Returns the minted mid ("" on
+    // failure). For deferred / out-of-band re-emission from a Mosaic
+    // HTTP handler thread — do NOT call from an OnMessage/OnComplete
+    // handler (same routing lock → deadlock).
+    public static string Forward(envelopeJson: string, newDataJson: string) {
+        var mid: string = ""
+        @c { mid = Amalgame_Pollen_Pollen_Forward_c(envelopeJson, newDataJson); }
         return mid
     }
 

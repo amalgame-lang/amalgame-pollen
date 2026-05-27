@@ -43,6 +43,9 @@ int main(void) {
         (void*) &Amalgame_Pollen_Pollen_ForAddItem,
         (void*) &Amalgame_Pollen_Pollen_WhileSetup,
         (void*) &Amalgame_Pollen_Pollen_WhileAddExit,
+        (void*) &Amalgame_Pollen_Pollen_OnMessage,
+        (void*) &Amalgame_Pollen_Pollen_OnComplete,
+        (void*) &Amalgame_Pollen_Pollen_Forward,
         (void*) &Amalgame_Pollen_Pollen_WorkflowVersion,
         (void*) &Amalgame_Pollen_Pollen_WorkflowActiveRole,
     };
