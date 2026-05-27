@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.19 — 2026-05-27
+
+### Fixed — consumer header signature for `SetLoadBalance`
+- `Amalgame_Pollen.h` declared `Amalgame_Pollen_Pollen_SetLoadBalance(int on)`, but amc emits the public symbol from the AM `on: bool` parameter as `void(code_bool)`. A **consumer** that imports the package (whose amc-generated C pulls in both the header decl and amc's own decl) hit a hard `conflicting types` compile error. Header now declares `code_bool on`. Caught by building the reference node (`examples/pollen-node.am`) — the package's own `--lib` build and `tests/*.c` never exercise an amc-generated consumer of the AM methods, so `header_consumer_check.c` (which only takes symbol addresses — name-only linkage) passed despite the mismatch. Same regression *class* as the v0.1.10 `#include "Amalgame.h"` bug. Followup : add a reference-node build to CI to make this a hard gate.
+
+### Added — reference node `--load-balance` flag
+- `examples/pollen-node.am` now calls `Pollen.StartCapabilityReader()` whenever a `--shared-dir` is set (keeps the registry view warm) and accepts `--load-balance` to call `Pollen.SetLoadBalance(true)`. Run several instances of the same role (same consume topic, different ports, shared `--shared-dir`, `--load-balance`) and the forward spreads across them via power-of-two.
+
+
 ## v0.1.18 — 2026-05-27
 
 ### Added — Phase 6.2/6.3 (capability registry reader + power-of-two load balancer)

@@ -16,7 +16,7 @@
 //
 // Run :
 //   /tmp/pollen-node-pkg <port> --workflow <path> --node-name <role> \
-//                        [--shared-dir <dir>]
+//                        [--shared-dir <dir>] [--load-balance]
 //
 // Supported tree (M3.1) : top-level sequence of
 //   call / fan_out / if(branches[{cond,then:call}]) / set
@@ -330,7 +330,7 @@ public class Program {
 
     public static void Main(string[] args) {
         if (Args_Count() == 0) {
-            Console.WriteLine("usage: pollen-node <port> --workflow <path> --node-name <role> [--shared-dir <dir>]")
+            Console.WriteLine("usage: pollen-node <port> --workflow <path> --node-name <role> [--shared-dir <dir>] [--load-balance]")
             return
         }
 
@@ -338,6 +338,7 @@ public class Program {
         var workflowPath: string = ""
         var nodeName: string = ""
         var sharedDir: string = ""
+        var loadBalance: bool = false
 
         var i: int = 0
         while (i < Args_Count()) {
@@ -350,6 +351,9 @@ public class Program {
             }
             if (a == "--shared-dir") {
                 if (i + 1 < Args_Count()) { sharedDir = Args_Get(i + 1); i = i + 2; continue }
+            }
+            if (a == "--load-balance") {
+                loadBalance = true; i = i + 1; continue
             }
             if (port == 0) { port = String_ToInt(a) }
             i = i + 1
@@ -503,6 +507,21 @@ public class Program {
         // the advertised actions.
         if (String_Length(sharedDir) > 0) {
             Pollen.StartCapabilityWriter(role, "127.0.0.1", port)
+            // Phase 6.2 — also read the registry so this node can
+            // resolve downstream providers (other replicas advertising
+            // the same topic). Cheap when --load-balance is off ; just
+            // keeps the in-memory view warm.
+            Pollen.StartCapabilityReader()
+        }
+
+        // Phase 6.3 — opt-in power-of-two load balancing. With it on,
+        // a forward picks ONE live provider of the emit topic instead
+        // of the static nexts — run several instances of the same role
+        // (same consume topic, different ports, shared --shared-dir)
+        // and watch the load spread across them.
+        if (loadBalance) {
+            Pollen.SetLoadBalance(true)
+            Console.WriteLine("pollen-node: load balancing ON (power-of-two)")
         }
 
         Console.WriteLine("pollen-node: role={role} listening on :{port} (package-driven)")
