@@ -56,6 +56,14 @@ namespace Amalgame.Pollen
     static char _pollen_cap_instance[37] = "";
     static char _pollen_cap_label[64] = "";
     static int  _pollen_cap_active = 0;
+    /* Phase 6.2 — load metrics reported in the capability file.
+     * inFlight : messages currently being dispatched (bumped around
+     * the forward window). msgsHandled : cumulative consumed count.
+     * _Atomic so the writer thread reads consistent values without
+     * taking the wf mutex. */
+    #include <stdatomic.h>
+    static _Atomic long _pollen_inflight = 0;
+    static _Atomic long _pollen_msgs_handled = 0;
     /* shared_dir uses the runtime-canonical name (no _pkg_ prefix) so
      * the M2.x state_persist code below ports verbatim from
      * the pollen runtime with zero diff. file-scope static — no link
@@ -2067,6 +2075,10 @@ namespace Amalgame.Pollen
                         int proceed = _pollen_debug_process(rbuf, line_len,
                             dbg_env, sizeof(dbg_env), &dbg_len);
                         if (proceed) {
+                            /* Phase 6.2 — load metrics : count this hop +
+                             * mark in-flight for the duration of dispatch. */
+                            atomic_fetch_add(&_pollen_msgs_handled, 1);
+                            atomic_fetch_add(&_pollen_inflight, 1);
                             const char* fenv = (dbg_len > 0) ? dbg_env : rbuf;
                             size_t flen = (dbg_len > 0) ? dbg_len : line_len;
                             /* M2.3c.2 dispatch sequence :
@@ -2133,6 +2145,7 @@ namespace Amalgame.Pollen
                                     tout, n_nexts,
                                     dsess, dsess_len);
                             }
+                            atomic_fetch_sub(&_pollen_inflight, 1);  /* Phase 6.2 */
                         }
                     }
                 }
@@ -2211,14 +2224,17 @@ namespace Amalgame.Pollen
                 pthread_mutex_unlock(&_pollen_wf_mutex);
 
                 int64_t now = _pollen_now_ms_c();
+                long inflight = atomic_load(&_pollen_inflight);
+                long handled  = atomic_load(&_pollen_msgs_handled);
                 char buf[4096];
                 int n = snprintf(buf, sizeof(buf),
                     "{\"instanceId\":\"%s\",\"host\":\"%s\",\"port\":%d,"
                      "\"label\":\"%s\",\"actions\":[%s],"
+                     "\"load\":{\"inFlight\":%ld,\"msgsHandled\":%ld},"
                      "\"heartbeat\":%lld,\"version\":\"amalgame-pollen\"}\n",
                     _pollen_cap_instance, _pollen_self_host, _pollen_self_port,
                     _pollen_cap_label[0] ? _pollen_cap_label : _pollen_cap_instance,
-                    actions, (long long) now);
+                    actions, inflight, handled, (long long) now);
                 if (n > 0 && n < (int) sizeof(buf)) {
                     char path[800], tmp[920];
                     snprintf(path, sizeof(path), "%s/%s.json", dir, _pollen_cap_instance);
