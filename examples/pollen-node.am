@@ -49,6 +49,45 @@ public class Program {
         return false
     }
 
+    // Find a node by key, handling BOTH container shapes :
+    //   - object keyed by role : nodes.Get(key)
+    //   - array of {id, label, ...} : match label or id
+    // The manager saves the array form ; hand-written files use the
+    // object form. Returns a JsonValue ; check IsObject() to detect
+    // "not found".
+    public static JsonValue FindNode(JsonValue nodesV, string key) {
+        if (nodesV.IsObject()) { return nodesV.Get(key) }
+        if (nodesV.IsArray()) {
+            let items: List<JsonValue> = nodesV.AsArray()
+            let n: int = items.Count()
+            for i in 0..n {
+                let it: JsonValue = items.Get(i)
+                if (it.Get("label").AsString() == key) { return it }
+                if (it.Get("id").AsString() == key)    { return it }
+            }
+        }
+        return nodesV.Get("__pollen_missing__")
+    }
+
+    // Iterate node keys (role names) for either container shape.
+    // For the array form the key is the label (preferred) or id.
+    public static List<string> NodeKeys(JsonValue nodesV) {
+        if (nodesV.IsObject()) { return nodesV.Keys() }
+        let out: List<string> = new List<string>()
+        if (nodesV.IsArray()) {
+            let items: List<JsonValue> = nodesV.AsArray()
+            let n: int = items.Count()
+            for i in 0..n {
+                let it: JsonValue = items.Get(i)
+                let lbl: string = it.Get("label").AsString()
+                if (String_Length(lbl) > 0) { out.Add(lbl); continue }
+                let id: string = it.Get("id").AsString()
+                if (String_Length(id) > 0) { out.Add(id) }
+            }
+        }
+        return out
+    }
+
     // Targets a step dispatches to (call → [node], fan_out → nodes,
     // sequence → first non-set step's targets).
     public static List<string> ActionTargets(JsonValue actionV) {
@@ -116,7 +155,7 @@ public class Program {
 
     // Wire one next target (resolve host:port from the node table).
     public static void WireNext(JsonValue nodesV, string role) {
-        let node: JsonValue = nodesV.Get(role)
+        let node: JsonValue = Program.FindNode(nodesV, role)
         if (!node.IsObject()) { return }
         let host: string = node.Get("host").AsString()
         let port: int    = node.Get("port").AsInt()
@@ -199,7 +238,7 @@ public class Program {
             let targets: List<string> = Program.ActionTargets(doV)
             let tn: int = targets.Count()
             for ti in 0..tn {
-                let tn2: JsonValue = nodesV.Get(targets.Get(ti))
+                let tn2: JsonValue = Program.FindNode(nodesV, targets.Get(ti))
                 if (tn2.IsObject()) {
                     let h: string = tn2.Get("host").AsString()
                     let p: int    = tn2.Get("port").AsInt()
@@ -236,7 +275,7 @@ public class Program {
             let exits: List<string> = Program.ActionTargets(exitAction)
             let ec: int = exits.Count()
             for ei in 0..ec {
-                let en: JsonValue = nodesV.Get(exits.Get(ei))
+                let en: JsonValue = Program.FindNode(nodesV, exits.Get(ei))
                 if (en.IsObject()) {
                     let eh: string = en.Get("host").AsString()
                     let ep: int    = en.Get("port").AsInt()
@@ -298,8 +337,11 @@ public class Program {
         }
 
         let nodesV: JsonValue = root.Get("nodes")
-        if (!nodesV.IsObject()) {
-            Console.WriteLine("pollen-node: 'nodes' must be an object keyed by role")
+        // Accept BOTH node container shapes : object keyed by role
+        // (hand-written) OR array of {id,label,...} (manager saves
+        // this). FindNode / NodeKeys abstract over the two.
+        if (!nodesV.IsObject() && !nodesV.IsArray()) {
+            Console.WriteLine("pollen-node: 'nodes' must be an object or array")
             return
         }
         let treeV: JsonValue = root.Get("tree")
@@ -311,11 +353,11 @@ public class Program {
         // Resolve role : --node-name beats port lookup.
         var role: string = nodeName
         if (String_Length(role) == 0) {
-            let keys: List<string> = nodesV.Keys()
+            let keys: List<string> = Program.NodeKeys(nodesV)
             let nk: int = keys.Count()
             for ki in 0..nk {
                 let k: string = keys.Get(ki)
-                if (nodesV.Get(k).Get("port").AsInt() == port) { role = k; break }
+                if (Program.FindNode(nodesV, k).Get("port").AsInt() == port) { role = k; break }
             }
         }
         if (String_Length(role) == 0) {
@@ -323,7 +365,7 @@ public class Program {
             return
         }
 
-        let self: JsonValue = nodesV.Get(role)
+        let self: JsonValue = Program.FindNode(nodesV, role)
         if (!self.IsObject()) {
             Console.WriteLine("pollen-node: role '{role}' not in nodes")
             return
@@ -393,7 +435,7 @@ public class Program {
                         let tc: int = tgts.Count()
                         for ti in 0..tc {
                             let tgtRole: string = tgts.Get(ti)
-                            let tn2: JsonValue = nodesV.Get(tgtRole)
+                            let tn2: JsonValue = Program.FindNode(nodesV, tgtRole)
                             if (tn2.IsObject()) {
                                 let h: string = tn2.Get("host").AsString()
                                 let p: int    = tn2.Get("port").AsInt()

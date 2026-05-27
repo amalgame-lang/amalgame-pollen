@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.15 — 2026-05-27
+
+### Fixed — reference node accepts both node container shapes
+- `examples/pollen-node.am` now resolves nodes from a `workflow.json` whose `nodes` is **either** an object keyed by role **or** an array of `{id, label, …}` entries. The pollen-manager's Save writes the **array** form, so a node restarted against a manager-saved workflow used to fail role resolution (it only handled the object form). New `FindNode` / `NodeKeys` helpers abstract over both (array → match `label`, then `id`).
+- Verified end-to-end : a manager-saved (array) demo workflow routes correctly through package nodes — `amount=1500 → vip`, `amount=50 → standard`.
+
+
 ## v0.1.14 — 2026-05-27
 
 ### Added — Phase 6.2 (load metrics)
