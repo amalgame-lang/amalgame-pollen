@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.16 — 2026-05-27
+
+### Added — M5 (nested-tree role resolution)
+- `examples/pollen-node.am` now resolves a role's routing wherever it lives in the tree, not just the top-level sequence. New recursive `FindRoleSequence` returns the steps list that directly contains the role (descending into `if` branches' `then` and `for` bodies) ; `WireSetsAfter` / `FindActionAfter` / `WireWhile` operate on that containing sequence.
+- A role buried in an `if` branch (e.g. `then: sequence [call vip, call audit]`) now correctly gets its next wired (vip → audit) — previously it fell out of the top-level walk and became terminal.
+- Verified e2e : `ingest → if amount>1000 then [vip → audit]` routes `ingest → vip → audit` (vip nested), audit terminal.
+
+
 ## v0.1.15 — 2026-05-27
 
 ### Fixed — reference node accepts both node container shapes

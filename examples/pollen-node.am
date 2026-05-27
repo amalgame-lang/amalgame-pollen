@@ -125,19 +125,70 @@ public class Program {
         return out
     }
 
-    // The step that immediately follows `role`'s step in the
-    // top-level sequence (empty if role is terminal / not found).
-    public static JsonValue FindActionAfter(JsonValue treeV, string role) {
+    // M5 — recursive walker : return the steps[] list that directly
+    // contains `role`'s step, wherever it lives in the tree (top-level
+    // sequence, or nested inside an `if` branch / `for` body). Empty
+    // list if not found. A role named by a single leaf action (e.g.
+    // an if-branch whose `then` is just call(role), no surrounding
+    // sequence) yields a synthetic 1-step list so the dispatcher
+    // helpers have a consistent shape.
+    public static List<JsonValue> FindRoleSequence(JsonValue action, string role) {
+        let empty: List<JsonValue> = new List<JsonValue>()
+        if (!action.IsObject()) { return empty }
+        let kind: string = action.Get("type").AsString()
+        if (kind == "sequence") {
+            let stepsV: JsonValue = action.Get("steps")
+            if (!stepsV.IsArray()) { return empty }
+            let steps: List<JsonValue> = stepsV.AsArray()
+            let n: int = steps.Count()
+            // 1. named directly at this level → this sequence
+            for i in 0..n {
+                if (Program.StepNames(steps.Get(i), role)) { return steps }
+            }
+            // 2. recurse into nested constructs
+            for i in 0..n {
+                let nested: List<JsonValue> = Program.FindRoleSequence(steps.Get(i), role)
+                if (nested.Count() > 0) { return nested }
+            }
+            return empty
+        }
+        if (kind == "if") {
+            let branchesV: JsonValue = action.Get("branches")
+            if (branchesV.IsArray()) {
+                let branches: List<JsonValue> = branchesV.AsArray()
+                let bn: int = branches.Count()
+                for bi in 0..bn {
+                    let br: JsonValue = branches.Get(bi)
+                    if (!br.IsObject()) { continue }
+                    let thenV: JsonValue = br.Get("then")
+                    let nested: List<JsonValue> = Program.FindRoleSequence(thenV, role)
+                    if (nested.Count() > 0) { return nested }
+                }
+            }
+            return empty
+        }
+        if (kind == "for") {
+            let doV: JsonValue = action.Get("do")
+            if (doV.IsObject()) { return Program.FindRoleSequence(doV, role) }
+            return empty
+        }
+        // leaf : call / fan_out / set / while
+        if (Program.StepNames(action, role)) {
+            let one: List<JsonValue> = new List<JsonValue>()
+            one.Add(action)
+            return one
+        }
+        return empty
+    }
+
+    // The dispatchable step that immediately follows `role`'s step
+    // within its containing sequence `steps` (set steps skipped).
+    // empty if role is terminal in that sequence / not found.
+    public static JsonValue FindActionAfter(List<JsonValue> steps, string role) {
         let empty: JsonValue = new JsonValue()
-        if (!treeV.IsObject()) { return empty }
-        if (treeV.Get("type").AsString() != "sequence") { return empty }
-        let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return empty }
-        let steps: List<JsonValue> = stepsV.AsArray()
         let n: int = steps.Count()
         for i in 0..n {
             if (Program.StepNames(steps.Get(i), role)) {
-                // skip over `set` steps to the next dispatchable one
                 var j: int = i + 1
                 while (j < n) {
                     let s: JsonValue = steps.Get(j)
@@ -168,12 +219,7 @@ public class Program {
     // and the next dispatcher in the top-level sequence, register each
     // as a state op. value : object → raw expr ; bare literal → wrapped
     // as {"const":<lit>} so the package's single eval entrypoint copes.
-    public static void WireSetsAfter(JsonValue treeV, string role) {
-        if (!treeV.IsObject()) { return }
-        if (treeV.Get("type").AsString() != "sequence") { return }
-        let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return }
-        let steps: List<JsonValue> = stepsV.AsArray()
+    public static void WireSetsAfter(List<JsonValue> steps, string role) {
         let n: int = steps.Count()
         for i in 0..n {
             if (Program.StepNames(steps.Get(i), role)) {
@@ -202,13 +248,8 @@ public class Program {
     // (i.e. two dispatchers down, skipping sets). Used for `while`
     // exit-target resolution : while loops to self, then exits to
     // whatever comes after the while step in the sequence.
-    public static JsonValue FindStepAfterDispatcher(JsonValue treeV, string role) {
+    public static JsonValue FindStepAfterDispatcher(List<JsonValue> steps, string role) {
         let empty: JsonValue = new JsonValue()
-        if (!treeV.IsObject()) { return empty }
-        if (treeV.Get("type").AsString() != "sequence") { return empty }
-        let stepsV: JsonValue = treeV.Get("steps")
-        if (!stepsV.IsArray()) { return empty }
-        let steps: List<JsonValue> = stepsV.AsArray()
         let n: int = steps.Count()
         for i in 0..n {
             if (Program.StepNames(steps.Get(i), role)) {
@@ -259,7 +300,7 @@ public class Program {
     }
 
     // M3.2 — wire a `while` route : cond + maxIter + self loop + exits.
-    public static void WireWhile(JsonValue nodesV, JsonValue treeV,
+    public static void WireWhile(JsonValue nodesV, List<JsonValue> steps,
                                    string role, JsonValue whileStep,
                                    string selfHost, int selfPort) {
         var condJson: string = ""
@@ -270,7 +311,7 @@ public class Program {
         if (maxV.IsInt()) { maxIter = maxV.AsInt() }
         let iterKey: string = "_wf_iter_" + role
         Pollen.WhileSetup(condJson, iterKey, maxIter, selfHost, selfPort)
-        let exitAction: JsonValue = Program.FindStepAfterDispatcher(treeV, role)
+        let exitAction: JsonValue = Program.FindStepAfterDispatcher(steps, role)
         if (exitAction.IsObject()) {
             let exits: List<string> = Program.ActionTargets(exitAction)
             let ec: int = exits.Count()
@@ -400,11 +441,16 @@ public class Program {
             }
         }
 
+        // M5 — resolve the sequence that CONTAINS this role (top-level
+        // or nested in an if/for branch), so a buried role still gets
+        // its next wired. set ops + dispatcher are looked up within it.
+        let roleSteps: List<JsonValue> = Program.FindRoleSequence(treeV, role)
+
         // M3.2 — set ops sitting between this role and its dispatcher
-        Program.WireSetsAfter(treeV, role)
+        Program.WireSetsAfter(roleSteps, role)
 
         // next : the dispatcher step after this role (sets skipped)
-        let after: JsonValue = Program.FindActionAfter(treeV, role)
+        let after: JsonValue = Program.FindActionAfter(roleSteps, role)
         if (after.IsObject()) {
             let kind: string = after.Get("type").AsString()
             if (kind == "call" || kind == "fan_out") {
@@ -416,7 +462,7 @@ public class Program {
             } else if (kind == "for") {
                 Program.WireFor(nodesV, after)
             } else if (kind == "while") {
-                Program.WireWhile(nodesV, treeV, role, after, "127.0.0.1", port)
+                Program.WireWhile(nodesV, roleSteps, role, after, "127.0.0.1", port)
             } else if (kind == "if") {
                 // Each branch → CondBranchOpen(condJson) + targets.
                 let branchesV: JsonValue = after.Get("branches")
