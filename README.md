@@ -130,6 +130,30 @@ The listener's dispatch priority on each matched message :
 
 A drop of any feature on reload reverts to plain fan-out (no sticky state across reload).
 
+### Workflow schema v2 — abstract actions + registry routing (in progress)
+
+The v1 schema binds the tree to concrete instances (`nodes{host,port}`). The **v2** schema (`"schema": "workflow-tree/v2"`) makes the tree reference abstract **actions** ; an `actions{}` block maps each to a topic, and the *binding* to a running instance comes from discovery (Phase 6.2/6.3) — no `host:port` in the workflow at all :
+
+```json
+{
+  "schema": "workflow-tree/v2",
+  "actions": {
+    "ingest":  { "topic": "order.in" },
+    "enrich":  { "topic": "order.enrich" },
+    "persist": { "topic": "order.persist" }
+  },
+  "tree": { "type": "sequence", "steps": [
+    { "type": "call", "action": "ingest" },
+    { "type": "call", "action": "enrich" },
+    { "type": "call", "action": "persist" }
+  ] }
+}
+```
+
+A node runs `pollen-node <port> --workflow wf.json --node-name <action> --shared-dir <dir>` : it consumes the action's topic, advertises it (writer), reads the registry (reader), and forwards the emit topic to a live provider resolved by the power-of-two LB. Run several instances of the same action (different ports, shared dir) → the load spreads, no config. The **action's logic itself** (HTTP call, etc.) lives in a Mosaic app embedding the package, via `OnMessage`/`OnComplete` — Pollen stays a pure topic bus.
+
+Status : this slice handles **linear `call`/`sequence`** pipelines (`examples/workflow-v2-linear.json`, proven end-to-end). `if`/`for`/`while` in v2 (registry-routed branches) + the manager's action-graph UI land in the next slices. v1 (`nodes{}`) still works in parallel.
+
 ## Embedding example
 
 A Mosaic web app that routes inbound HTTP POSTs into a workflow :

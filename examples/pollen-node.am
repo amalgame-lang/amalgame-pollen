@@ -328,6 +328,94 @@ public class Program {
         }
     }
 
+    // ── v2 schema (workflow-tree/v2) ──────────────────────────
+    // The tree references abstract `action`s ; `actions{}` maps each
+    // to a topic. Routing is registry-based : a node advertises the
+    // topic it consumes, the upstream forwards by topic and the
+    // power-of-two LB resolves a live provider. No host:port in the
+    // workflow — the binding comes from discovery (Phase 6.2/6.3).
+    // This slice handles LINEAR call/sequence pipelines ; if/for/while
+    // in v2 land in the next slice (need registry-routed branches).
+
+    // actions{} : action name → { "topic": "..." }.
+    public static string ActionTopic(JsonValue actionsV, string action) {
+        if (!actionsV.IsObject()) { return "" }
+        let a: JsonValue = actionsV.Get(action)
+        if (!a.IsObject()) { return "" }
+        return a.Get("topic").AsString()
+    }
+
+    // Walk a top-level sequence of `call` steps : the topic of the
+    // action called immediately after `role` ("" if role is last /
+    // absent). Linear-only for this slice.
+    public static string NextActionTopic(JsonValue actionsV, JsonValue treeV,
+                                           string role) {
+        if (!treeV.IsObject()) { return "" }
+        if (treeV.Get("type").AsString() != "sequence") { return "" }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return "" }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            let s: JsonValue = steps.Get(i)
+            if (s.IsObject() && s.Get("type").AsString() == "call"
+                && s.Get("action").AsString() == role) {
+                var j: int = i + 1
+                while (j < n) {
+                    let s2: JsonValue = steps.Get(j)
+                    if (s2.IsObject() && s2.Get("type").AsString() == "call") {
+                        return Program.ActionTopic(actionsV, s2.Get("action").AsString())
+                    }
+                    j = j + 1
+                }
+                return ""
+            }
+        }
+        return ""
+    }
+
+    // Full v2 lifecycle for this node's action. Registry-routed, so a
+    // --shared-dir is mandatory (discovery is how forwards find peers).
+    public static void RunV2(JsonValue actionsV, JsonValue treeV,
+                               string role, int port, string sharedDir) {
+        if (String_Length(role) == 0) {
+            Console.WriteLine("pollen-node v2: --node-name <action> required")
+            return
+        }
+        let myTopic: string = Program.ActionTopic(actionsV, role)
+        if (String_Length(myTopic) == 0) {
+            Console.WriteLine("pollen-node v2: action '{role}' has no topic in actions{}")
+            return
+        }
+        if (String_Length(sharedDir) == 0) {
+            Console.WriteLine("pollen-node v2: --shared-dir required (registry routing)")
+            return
+        }
+        Pollen.WorkflowSetSharedDir(sharedDir)
+        Pollen.WorkflowSetSelf(role, "127.0.0.1", port)
+
+        Pollen.WorkflowReloadBegin()
+        Pollen.WorkflowAddConsume(myTopic)
+        let emitTopic: string = Program.NextActionTopic(actionsV, treeV, role)
+        if (String_Length(emitTopic) > 0) { Pollen.WorkflowSetEmitTopic(emitTopic) }
+        Pollen.WorkflowReloadCommit()
+
+        // Advertise (writer) + discover (reader), then route by topic :
+        // SetLoadBalance(true) makes forward_all resolve the emit topic
+        // to a live provider (1 → that one ; N → power-of-two).
+        Pollen.StartCapabilityWriter(role, "127.0.0.1", port)
+        Pollen.StartCapabilityReader()
+        Pollen.SetLoadBalance(true)
+
+        if (String_Length(emitTopic) > 0) {
+            Console.WriteLine("pollen-node v2: action={role} topic={myTopic} → emit={emitTopic} (registry-routed)")
+        } else {
+            Console.WriteLine("pollen-node v2: action={role} topic={myTopic} (terminal)")
+        }
+        Console.Flush()
+        Pollen.StartListener(port)
+    }
+
     public static void Main(string[] args) {
         if (Args_Count() == 0) {
             Console.WriteLine("usage: pollen-node <port> --workflow <path> --node-name <role> [--shared-dir <dir>] [--load-balance]")
@@ -381,17 +469,29 @@ public class Program {
             return
         }
 
+        let treeV: JsonValue = root.Get("tree")
+        if (!treeV.IsObject()) {
+            Console.WriteLine("pollen-node: 'tree' missing (needs a workflow-tree)")
+            return
+        }
+
+        // v2 schema : abstract actions + registry routing. Detected by
+        // schema=="workflow-tree/v2" or an actions{} block. Linear
+        // call/sequence only in this slice ; falls through to v1 below
+        // for the nodes{}-based (host:port) workflows.
+        let schemaStr: string = root.Get("schema").AsString()
+        let actionsV: JsonValue = root.Get("actions")
+        if (schemaStr == "workflow-tree/v2" || actionsV.IsObject()) {
+            Program.RunV2(actionsV, treeV, nodeName, port, sharedDir)
+            return
+        }
+
         let nodesV: JsonValue = root.Get("nodes")
         // Accept BOTH node container shapes : object keyed by role
         // (hand-written) OR array of {id,label,...} (manager saves
         // this). FindNode / NodeKeys abstract over the two.
         if (!nodesV.IsObject() && !nodesV.IsArray()) {
             Console.WriteLine("pollen-node: 'nodes' must be an object or array")
-            return
-        }
-        let treeV: JsonValue = root.Get("tree")
-        if (!treeV.IsObject()) {
-            Console.WriteLine("pollen-node: 'tree' missing (M3.1 needs a workflow-tree)")
             return
         }
 
