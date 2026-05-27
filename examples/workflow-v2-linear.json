@@ -1,0 +1,15 @@
+{
+  "schema": "workflow-tree/v2",
+  "name": "v2-linear-demo",
+  "version": 1,
+  "actions": {
+    "ingest":  { "topic": "order.in" },
+    "enrich":  { "topic": "order.enrich" },
+    "persist": { "topic": "order.persist" }
+  },
+  "tree": { "type": "sequence", "steps": [
+    { "type": "call", "action": "ingest" },
+    { "type": "call", "action": "enrich" },
+    { "type": "call", "action": "persist" }
+  ] }
+}
