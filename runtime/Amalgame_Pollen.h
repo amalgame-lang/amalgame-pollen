@@ -109,6 +109,16 @@ void        Amalgame_Pollen_Pollen_OnMessage(AmalgameClosure* handler);
 void        Amalgame_Pollen_Pollen_OnComplete(AmalgameClosure* handler);
 code_string Amalgame_Pollen_Pollen_Forward(code_string envelopeJson, code_string newDataJson);
 
+/* v0.1.18 — Phase 6.2/6.3 capability reader + power-of-two LB.
+ * StartCapabilityReader spawns a 2s scan thread building an in-memory
+ * registry of live providers. SetLoadBalance toggles load-balanced
+ * forwarding (emit topic → power-of-two pick). RegistrySize +
+ * ResolveProvider are introspection (tests + manager). */
+void        Amalgame_Pollen_Pollen_StartCapabilityReader(void);
+void        Amalgame_Pollen_Pollen_SetLoadBalance(int on);
+int64_t     Amalgame_Pollen_Pollen_RegistrySize(void);
+code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
+
 /* Introspection */
 int64_t     Amalgame_Pollen_Pollen_WorkflowVersion(void);
 code_string Amalgame_Pollen_Pollen_WorkflowActiveRole(void);

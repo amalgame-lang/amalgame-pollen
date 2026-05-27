@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.18 — 2026-05-27
+
+### Added — Phase 6.2/6.3 (capability registry reader + power-of-two load balancer)
+- `Pollen.StartCapabilityReader()` — spawns a detached thread that scans the sharedDir `capabilities/` dir every 2s, parses each provider's `{host, port, actions[], load.inFlight, heartbeat}`, drops stale entries (heartbeat > 15s old), and atomic-swaps an in-memory registry (own mutex, independent of the workflow mutex). The read half of discovery, complementing the v0.1.13 writer.
+- `Pollen.SetLoadBalance(on)` — toggles load-balanced forwarding. When **on**, a forward resolves the emit topic against the registry and sends to a **single** provider chosen by **power-of-two-choices** (sample 2, lower `inFlight` wins) instead of the static nexts. When **off** (default) or when no provider advertises the topic, the static nexts are used verbatim — so single-instance setups are byte-for-byte unchanged.
+- `Pollen.ResolveProvider(topic) → "host:port"` — runs the same power-of-two pick and returns the winner (or `""` if none). For the manager's LB preview + deterministic testing.
+- `Pollen.RegistrySize() → int` — number of live providers currently in the registry (post staleness filter). Introspection for tests + the manager.
+
+### Design note
+- This wires LB onto the **existing** workflow schema (the emit topic *is* the action a downstream consumes ; replicas of a role advertise the same topic). No schema change — the upcoming v2 `action:` schema + migration tool build on top. Keeps the demo green while the LB mechanics land.
+- `tests/lb_smoke.c` — 6 assertions : registry build + staleness exclusion, deterministic lower-inFlight pick (+ sole-provider + unknown-topic `""`), and an end-to-end LB forward that lands on the resolved provider rather than the static next. 154 assertions total across 13 files.
+
+
 ## v0.1.17 — 2026-05-27
 
 ### Added — Mosaic bridge hooks (egress/ingress to the outside world)
