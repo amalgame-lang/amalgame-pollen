@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.17 — 2026-05-27
+
+### Added — Mosaic bridge hooks (egress/ingress to the outside world)
+- `Pollen.OnMessage(handler: Closure<string, string>)` — register an AM transform invoked for every message this node **consumes**, before it is forwarded. The handler receives the full envelope JSON and returns the **new `data` JSON** to forward (`""` → drop the message). The worker then forwards as usual (mid/parent/topic rewrite, cond/for/while routing all still apply). This is the **egress bridge** : a Mosaic app embedding Pollen does the outbound HTTP call (amalgame-net-http) inside the handler and returns the response as the new data — Pollen stays pure-TCP, the adapter lives in user AM code.
+- `Pollen.OnComplete(handler: Closure<string, string>)` — fires when a consumed message **terminates at this node** (a leaf : no nexts / cond / for / while wired). The handler receives the final envelope JSON (return ignored). Use it on an ingress node to resolve a pending HTTP response, correlating by `rootMessageId`.
+- `Pollen.Forward(envelopeJson, newDataJson) → mid` — re-emit a message into the workflow **out-of-band**, preserving the chain : fresh `messageId`, `parentMessageId` = the incoming mid, `rootMessageId` kept, `data` swapped to `newDataJson` (`""` keeps the original), topic rewritten to the configured emit topic, forwarded to all wired nexts. For deferred re-emission from a Mosaic HTTP-handler thread.
+
+### Changed
+- Listener-worker + capability-writer threads now spawn via `GC_pthread_create` (was raw `pthread_create`) so they are bdwgc-registered — required now that workers invoke AM closures (OnMessage/OnComplete) which allocate GC memory.
+
+### Notes / limitations
+- OnMessage/OnComplete handlers run **on the worker thread under the routing mutex**, so they must NOT call `Pollen.Forward` (re-lock → deadlock) — return the data, or use `Pollen.Publish`, instead. `Forward` is for *other* threads (a Mosaic HTTP handler). Same precedent as the M4 debug bridge, which already does network IO under that mutex.
+- `tests/bridge_smoke.c` — 16 assertions : transform-then-forward, `""`-drop, leaf OnComplete fire (+ rootMessageId/data carried), out-of-band Forward (data swap + topic rewrite + parent chain). 148 assertions total across 12 files.
+
+
 ## v0.1.16 — 2026-05-27
 
 ### Added — M5 (nested-tree role resolution)
