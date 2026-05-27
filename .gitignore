@@ -1,0 +1,6 @@
+# Reference node build artifact (platform-specific binary).
+# Build it with examples/build-pollen-node.sh.
+/examples/pollen-node
+
+# amc local package cache
+/.amalgame-cache/
