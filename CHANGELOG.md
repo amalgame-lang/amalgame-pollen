@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.12 — 2026-05-27
+
+### Added — M4 (debug-aware publish) + consumer-build guard
+- `Pollen.PublishDebug(host, port, topic, ver, dataJson, session, mode, breakpointsJson, managerAddr) → mid` — builds a MESSAGE envelope carrying the `debug` field (session / mode / manager / breakpoints / hit_bp) so a stepping run phones home from each paused hop. Centralises the envelope the pollen-manager hand-rolled in `/api/inject`. `messageId == rootMessageId` (originator, which the manager's hand-rolled version omitted). 9 smoke assertions (`tests/publish_debug_smoke.c`).
+- `tests/header_consumer_check.c` — compile + link guard that the public `Amalgame_Pollen.h` is includable by a consumer (takes the address of all 26 public entry points). This is the test that would have caught the v0.1.10 `#include "Amalgame.h"` regression ; the package's own `--lib` build never exercised the header from a consumer's POV. 132 assertions total across 11 files.
+
+
 ## v0.1.11 — 2026-05-27
 
 ### Added — M2.4b (executions/ step recorder)

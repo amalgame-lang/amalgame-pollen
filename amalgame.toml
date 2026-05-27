@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.1.11"
+version           = "0.1.12"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v2 trees over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -117,6 +117,7 @@ EvalCond            = { returns = "code_bool" }
 StartListener       = { returns = "void" }
 Publish             = { returns = "code_string" }
 PublishSync         = { returns = "code_string" }
+PublishDebug        = { returns = "code_string" }
 
 # Engine introspection (used by tests + manager)
 WorkflowVersion     = { returns = "i64" }
