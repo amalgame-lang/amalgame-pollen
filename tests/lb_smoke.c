@@ -41,6 +41,8 @@ extern void Amalgame_Pollen_Pollen_WorkflowReloadCommit(void);
 extern void Amalgame_Pollen_Pollen_WorkflowAddConsume(code_string topic);
 extern void Amalgame_Pollen_Pollen_WorkflowAddNext(code_string host, int64_t port);
 extern void Amalgame_Pollen_Pollen_WorkflowSetEmitTopic(code_string topic);
+extern void Amalgame_Pollen_Pollen_CondBranchOpen(code_string condJson);
+extern void Amalgame_Pollen_Pollen_CondBranchSetTopic(code_string topic);
 
 static int failures = 0;
 static int asserts  = 0;
@@ -198,6 +200,38 @@ int main(void) {
                 "LB forwarded to the resolved provider (B), not the static next");
     EXPECT_TRUE(strstr(captured, "\"topic\":{\"uuid\":\"lb.topic\"") != NULL,
                 "LB-forwarded envelope carries the emit topic");
+
+    /* ---- Phase 5 : v2 cond branch routes by topic (registry) ---- */
+    /* A cond branch with a topic set (CondBranchSetTopic) must rebuild
+     * with that topic and forward to a registry-resolved provider,
+     * not a static target. Reuse provider B (lb.topic) as the branch
+     * target ; an always-true branch (empty cond) routes there. */
+    mock_port = pB; captured_len = 0; captured[0] = 0;
+    pthread_t thB2; pthread_create(&thB2, NULL, mock_capture, NULL);
+    msleep(50);
+
+    int pCond = pick_port();
+    Amalgame_Pollen_Pollen_SetLoadBalance(1);
+    Amalgame_Pollen_Pollen_WorkflowReloadBegin();
+    Amalgame_Pollen_Pollen_WorkflowAddConsume((code_string) "cin");
+    Amalgame_Pollen_Pollen_CondBranchOpen((code_string) "");   /* always-true / else */
+    Amalgame_Pollen_Pollen_CondBranchSetTopic((code_string) "lb.topic");
+    Amalgame_Pollen_Pollen_WorkflowReloadCommit();
+
+    static int pCond_stash; pCond_stash = pCond;
+    pthread_t thCond; pthread_create(&thCond, NULL, node_listener, &pCond_stash);
+    pthread_detach(thCond);
+    msleep(50);
+
+    Amalgame_Pollen_Pollen_PublishSync(
+        (code_string) "127.0.0.1", (int64_t) pCond,
+        (code_string) "cin", (int64_t) 1,
+        (code_string) "{\"v\":2}", (int64_t) 2000);
+    pthread_join(thB2, NULL);
+    EXPECT_TRUE(captured_len > 0,
+                "cond branch with a topic routed to a registry-resolved provider");
+    EXPECT_TRUE(strstr(captured, "\"topic\":{\"uuid\":\"lb.topic\"") != NULL,
+                "cond branch rebuilt the envelope with the branch topic");
 
     if (failures != 0) {
         fprintf(stderr, "FAIL lb smoke (%d / %d failed)\n", failures, asserts);

@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.20 — 2026-05-27
+
+### Added — v2 conditional routing by topic (registry-resolved `if` branches)
+- `Pollen.CondBranchSetTopic(topic)` — give a cond branch its own emit topic. When set (and load balancing is on), the matched branch rebuilds the envelope with **that** topic (each branch targets a distinct action) and forwards to a live provider resolved by the power-of-two LB — no static `host:port`. This is the `if` half of v2 registry routing : a workflow's `if` branches name abstract actions, and the binding to a running instance comes from discovery, exactly like the linear `call` path.
+- Branches without a topic keep v1 behaviour (static `CondBranchAddTarget` + the global emit topic), so existing cond workflows are unchanged.
+- `tests/lb_smoke.c` gains 2 assertions (8 total) : a topic-set branch routes to a registry-resolved provider and rebuilds with the branch topic. 156 assertions total across 13 files.
+
+### Note
+- This is the runtime half. The reference node (`examples/pollen-node.am` `RunV2`) wires v2 `if` trees onto it (branch `then` → action → `CondBranchSetTopic`), and the manager visualises the conditional routing live. `for`/`while` in v2 are the next slice.
+
+
 ## v0.1.19 — 2026-05-27
 
 ### Fixed — consumer header signature for `SetLoadBalance`
