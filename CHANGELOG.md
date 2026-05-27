@@ -4,6 +4,14 @@ All notable changes to `amalgame-pollen`. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) ;
 versioning follows the upstream package indexing convention.
 
+## v0.1.10 — 2026-05-27
+
+### Fixed
+- `runtime/Amalgame_Pollen.h` included a stray `"Amalgame.h"` (no such file in the amc runtime dir), which broke **any consumer** whose generated C pulls in the header — `fatal error: Amalgame.h: No such file`. The package's own `--lib` build never tripped it because `facade.c` includes `_runtime.h` directly. Now includes `"_runtime.h"` + `<stdint.h>` like every other package header. This unblocks building a program that does `import Amalgame.Pollen` (e.g. `examples/pollen-node.am`).
+
+### Added
+- `examples/pollen-node.am` — reference Pollen node binary built entirely on the package (the M3 "thin wrapper"). Parses a `workflow.json`, resolves the role, wires the runtime via the public setters (consumes / emit / next / if-branches), and blocks in `Pollen.StartListener`. Unlike the legacy binary, the `if` cond is evaluated correctly at dispatch.
+
 ## v0.1.9 — 2026-05-27
 
 ### Added — M2.4 (debug bridge)
