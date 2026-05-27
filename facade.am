@@ -48,6 +48,10 @@ namespace Amalgame.Pollen
      * M2-M3 will copy in the full runtime from pollen.am. */
     static int _pollen_pkg_loaded = 0;
     static char _pollen_pkg_role[64] = "";
+    /* M2.4b — self identity for the executions/ recorder. Populated
+     * by WorkflowSetSelf alongside the role. */
+    static char _pollen_self_host[64] = "127.0.0.1";
+    static int  _pollen_self_port = 0;
     /* shared_dir uses the runtime-canonical name (no _pkg_ prefix) so
      * the M2.x state_persist code below ports verbatim from
      * the pollen runtime with zero diff. file-scope static — no link
@@ -171,8 +175,10 @@ namespace Amalgame.Pollen
                        char* out, size_t out_cap,
                        const char* new_topic,
                        char* out_new_mid);
-    static void    _pollen_for_forward(const char* env, size_t env_len);
-    static void    _pollen_while_forward(const char* env, size_t env_len);
+    static void    _pollen_for_forward(const char* env, size_t env_len,
+                                         char* out_new_mid);
+    static void    _pollen_while_forward(const char* env, size_t env_len,
+                                          char* out_new_mid);
     /* M2.4 — debug bridge. Returns 1 to proceed (envelope to
      * dispatch copied into out[0..*out_len)), 0 to drop the message
      * (operator hit Cancel, or the manager phone-home timed out). */
@@ -221,7 +227,76 @@ namespace Amalgame.Pollen
             strncpy(_pollen_pkg_role, role, sizeof(_pollen_pkg_role) - 1);
             _pollen_pkg_role[sizeof(_pollen_pkg_role) - 1] = 0;
         }
-        (void) host; (void) port;
+        if (host) {
+            strncpy(_pollen_self_host, (const char*) host,
+                     sizeof(_pollen_self_host) - 1);
+            _pollen_self_host[sizeof(_pollen_self_host) - 1] = 0;
+        }
+        _pollen_self_port = (int) port;
+    }
+
+    /* M2.4b — write one execution step record under
+     * <sharedDir>/executions/<mid>-<role>.json. Best-effort :
+     * O_CREAT|O_EXCL skips duplicates, any fs error is ignored.
+     * The manager's Live panel reads these + walks parentMessageId
+     * backwards to reconstruct the chain. All string args are
+     * length-delimited so callers can pass recv-buffer pointers. */
+    static void _pollen_wf_record_step(const char* mid_out, size_t mid_out_len,
+                                         const char* parent_mid, size_t parent_mid_len,
+                                         const char* topic_in, size_t topic_in_len,
+                                         const char* topic_out, int n_nexts,
+                                         const char* dbg_session, size_t dbg_session_len) {
+        if (!_pollen_shared_dir[0] || !mid_out || mid_out_len == 0) return;
+        char path[1024];
+        int pn = snprintf(path, sizeof(path), "%s/executions/%.*s-%s.json",
+                          _pollen_shared_dir,
+                          (int) mid_out_len, mid_out,
+                          _pollen_pkg_role[0] ? _pollen_pkg_role : "node");
+        if (pn <= 0 || pn >= (int) sizeof(path)) return;
+        /* ensure the executions/ dir exists */
+        char d[600];
+        snprintf(d, sizeof(d), "%s/executions", _pollen_shared_dir);
+        mkdir(d, 0755);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) return;
+        char dbg_suffix[96] = "";
+        if (dbg_session && dbg_session_len > 0 && dbg_session_len < 64) {
+            snprintf(dbg_suffix, sizeof(dbg_suffix),
+                ",\"debugSession\":\"%.*s\"",
+                (int) dbg_session_len, dbg_session);
+        }
+        char buf[1400];
+        int64_t now = _pollen_now_ms_c();
+        int n;
+        if (parent_mid && parent_mid_len > 0) {
+            n = snprintf(buf, sizeof(buf),
+                "{\"messageId\":\"%.*s\",\"parentMessageId\":\"%.*s\","
+                 "\"role\":\"%s\",\"topicIn\":\"%.*s\",\"topicOut\":\"%s\","
+                 "\"nextCount\":%d,\"node\":\"%s:%d\",\"timestamp\":%lld%s}\n",
+                (int) mid_out_len, mid_out,
+                (int) parent_mid_len, parent_mid,
+                _pollen_pkg_role,
+                (int) topic_in_len, topic_in ? topic_in : "",
+                topic_out ? topic_out : "",
+                n_nexts, _pollen_self_host, _pollen_self_port,
+                (long long) now, dbg_suffix);
+        } else {
+            n = snprintf(buf, sizeof(buf),
+                "{\"messageId\":\"%.*s\",\"parentMessageId\":null,"
+                 "\"role\":\"%s\",\"topicIn\":\"%.*s\",\"topicOut\":\"%s\","
+                 "\"nextCount\":%d,\"node\":\"%s:%d\",\"timestamp\":%lld%s}\n",
+                (int) mid_out_len, mid_out,
+                _pollen_pkg_role,
+                (int) topic_in_len, topic_in ? topic_in : "",
+                topic_out ? topic_out : "",
+                n_nexts, _pollen_self_host, _pollen_self_port,
+                (long long) now, dbg_suffix);
+        }
+        if (n > 0 && n < (int) sizeof(buf)) {
+            ssize_t w = write(fd, buf, (size_t) n);
+            (void) w;
+        }
+        close(fd);
     }
 
     /* === Phase 5.3 — per-execution state file =================
@@ -1168,7 +1243,8 @@ namespace Amalgame.Pollen
      * = items[i], then rebuilds the envelope (new mid + parent
      * chain + topic rewrite) and forwards to every target.
      * Total messages = n_items × n_targets. */
-    static void _pollen_for_forward(const char* env, size_t env_len) {
+    static void _pollen_for_forward(const char* env, size_t env_len,
+                                      char* out_new_mid) {
         char root[64];
         int have_root = _pollen_extract_root_mid(env, env_len,
                                                    root, sizeof(root));
@@ -1189,7 +1265,7 @@ namespace Amalgame.Pollen
                                       ? _pollen_wf_emit_topic : NULL;
             size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                       rebuilt, sizeof(rebuilt),
-                                                      new_topic, NULL);
+                                                      new_topic, out_new_mid);
             const char* fwd = rn > 0 ? rebuilt : env;
             size_t fwd_len = rn > 0 ? rn : env_len;
             for (int t = 0; t < _pollen_for_route.n_targets; t++) {
@@ -1205,7 +1281,8 @@ namespace Amalgame.Pollen
      * iter + forwards to self. On exit forwards to every exit
      * target. Auto-iter checked BEFORE cond so a runaway loop
      * always terminates. */
-    static void _pollen_while_forward(const char* env, size_t env_len) {
+    static void _pollen_while_forward(const char* env, size_t env_len,
+                                        char* out_new_mid) {
         char root[64];
         int have_root = _pollen_extract_root_mid(env, env_len,
                                                    root, sizeof(root));
@@ -1244,7 +1321,7 @@ namespace Amalgame.Pollen
                                       ? _pollen_wf_emit_topic : NULL;
             size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                       rebuilt, sizeof(rebuilt),
-                                                      new_topic, NULL);
+                                                      new_topic, out_new_mid);
             const char* fwd = rn > 0 ? rebuilt : env;
             size_t fwd_len = rn > 0 ? rn : env_len;
             _pollen_wf_forward_one(_pollen_while_route.loop_host,
@@ -1259,7 +1336,7 @@ namespace Amalgame.Pollen
                                   ? _pollen_wf_emit_topic : NULL;
         size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                   rebuilt, sizeof(rebuilt),
-                                                  new_topic, NULL);
+                                                  new_topic, out_new_mid);
         const char* fwd = rn > 0 ? rebuilt : env;
         size_t fwd_len = rn > 0 ? rn : env_len;
         for (int i = 0; i < _pollen_while_route.n_exits; i++) {
@@ -1273,7 +1350,8 @@ namespace Amalgame.Pollen
      * rebuild the envelope (new mid + parent chain + optional topic
      * rewrite) and forward to that branch's target list. No match :
      * drop silently (caller already ACKed). */
-    static void _pollen_cond_forward(const char* env, size_t env_len) {
+    static void _pollen_cond_forward(const char* env, size_t env_len,
+                                       char* out_new_mid) {
         for (int i = 0; i < _pollen_cond_n_branches; i++) {
             pollen_cond_branch_t* b = &_pollen_cond_branches[i];
             int pass = _pollen_cond_eval_expr(env, env_len,
@@ -1287,7 +1365,7 @@ namespace Amalgame.Pollen
                                       ? _pollen_wf_emit_topic : NULL;
             size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                       rebuilt, sizeof(rebuilt),
-                                                      new_topic, NULL);
+                                                      new_topic, out_new_mid);
             if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
             for (int t = 0; t < b->n_targets; t++) {
                 _pollen_wf_forward_one(b->targets_host[t],
@@ -1852,12 +1930,16 @@ namespace Amalgame.Pollen
      * since they call _pollen_cond_eval_expr / _pollen_eval_expr /
      * _pollen_state_set + _pollen_extract_root_mid). */
 
-    static void _pollen_cond_forward(const char* env, size_t env_len);
+    static void _pollen_cond_forward(const char* env, size_t env_len,
+                                       char* out_new_mid);
     static void _pollen_set_ops_apply(const char* env, size_t env_len);
 
     /* Forward to every downstream peer registered via add_next.
-     * Caller holds _pollen_wf_mutex (snapshot of nexts is safe). */
-    static void _pollen_wf_forward_all(const char* envelope, size_t env_len) {
+     * Caller holds _pollen_wf_mutex (snapshot of nexts is safe).
+     * out_new_mid (37-byte buf, may be NULL) receives the rebuilt
+     * envelope's fresh mid for the executions recorder. */
+    static void _pollen_wf_forward_all(const char* envelope, size_t env_len,
+                                         char* out_new_mid) {
         char rebuilt[8192];
         const char* fwd = envelope;
         size_t fwd_len = env_len;
@@ -1865,7 +1947,7 @@ namespace Amalgame.Pollen
                                   _pollen_wf_emit_topic : NULL;
         size_t rn = _pollen_wf_rebuild_envelope(envelope, env_len,
                                                   rebuilt, sizeof(rebuilt),
-                                                  new_topic, NULL);
+                                                  new_topic, out_new_mid);
         if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
         for (int i = 0; i < _pollen_wf_n_nexts; i++) {
             _pollen_wf_forward_one(_pollen_wf_next_host[i],
@@ -1911,6 +1993,10 @@ namespace Amalgame.Pollen
                  *   wf inactive                  : ACK (free-form fallback) */
                 int do_ack = 1;
                 int do_forward = 0;
+                /* M2.4b — capture topic_in extent for the executions
+                 * recorder (set in the matched block below). */
+                const char* topic_in = NULL;
+                size_t topic_in_len = 0;
                 pthread_mutex_lock(&_pollen_wf_mutex);
                 if (_pollen_wf_active && _pollen_wf_n_consumes > 0) {
                     const char* tp = _pollen_find(rbuf, line_len,
@@ -1923,6 +2009,8 @@ namespace Amalgame.Pollen
                         if (tq && _pollen_wf_topic_consumed(
                                 tp, (size_t)(tq - tp))) {
                             matched = 1;
+                            topic_in = tp;
+                            topic_in_len = (size_t)(tq - tp);
                         }
                     }
                     if (matched) {
@@ -1988,14 +2076,58 @@ namespace Amalgame.Pollen
                             if (_pollen_n_set_ops > 0) {
                                 _pollen_set_ops_apply(fenv, flen);
                             }
+                            char fwd_new_mid[37] = {0};
+                            int n_nexts = _pollen_wf_n_nexts;
                             if (_pollen_while_active) {
-                                _pollen_while_forward(fenv, flen);
+                                _pollen_while_forward(fenv, flen, fwd_new_mid);
+                                n_nexts = 1;
                             } else if (_pollen_for_active) {
-                                _pollen_for_forward(fenv, flen);
+                                _pollen_for_forward(fenv, flen, fwd_new_mid);
+                                n_nexts = _pollen_for_route.n_targets;
                             } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
-                                _pollen_cond_forward(fenv, flen);
+                                _pollen_cond_forward(fenv, flen, fwd_new_mid);
+                                n_nexts = 1;
                             } else {
-                                _pollen_wf_forward_all(fenv, flen);
+                                _pollen_wf_forward_all(fenv, flen, fwd_new_mid);
+                            }
+                            /* M2.4b — record this hop for the manager's
+                             * Live executions panel. Best-effort. */
+                            if (fwd_new_mid[0] && _pollen_shared_dir[0]) {
+                                /* incoming mid = parent of this hop */
+                                const char* pmp = _pollen_find(fenv, flen,
+                                                                 MID_KEY, MID_KEY_LEN);
+                                const char* parent = NULL; size_t parent_len = 0;
+                                if (pmp) {
+                                    /* the incoming mid is the ORIGINAL
+                                     * envelope's mid, but fenv may have
+                                     * been rewritten (debug). use rbuf for
+                                     * the true incoming mid. */
+                                    const char* imp = _pollen_find(rbuf, line_len,
+                                                                     MID_KEY, MID_KEY_LEN);
+                                    if (imp) {
+                                        imp += MID_KEY_LEN;
+                                        const char* imq = memchr(imp, '"',
+                                            line_len - (size_t)(imp - rbuf));
+                                        if (imq) { parent = imp; parent_len = (size_t)(imq - imp); }
+                                    }
+                                }
+                                /* debug session (optional) */
+                                const char* dseg = _pollen_find(rbuf, line_len,
+                                    "\"debug\":{\"session\":\"", 20);
+                                const char* dsess = NULL; size_t dsess_len = 0;
+                                if (dseg) {
+                                    dsess = dseg + 20;
+                                    const char* dq = memchr(dsess, '"',
+                                        line_len - (size_t)(dsess - rbuf));
+                                    if (dq) dsess_len = (size_t)(dq - dsess);
+                                }
+                                const char* tout = _pollen_wf_emit_topic[0]
+                                                     ? _pollen_wf_emit_topic : NULL;
+                                _pollen_wf_record_step(fwd_new_mid, 36,
+                                    parent, parent_len,
+                                    topic_in, topic_in_len,
+                                    tout, n_nexts,
+                                    dsess, dsess_len);
                             }
                         }
                     }
