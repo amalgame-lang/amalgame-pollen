@@ -89,6 +89,12 @@ code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
 code_string Amalgame_Pollen_Pollen_PublishSync(code_string host, int64_t port,
                                                 code_string topicUuid, int64_t topicVersion,
                                                 code_string dataJson, int64_t timeoutMs);
+code_string Amalgame_Pollen_Pollen_PublishDebug(code_string host, int64_t port,
+                                                 code_string topicUuid, int64_t topicVersion,
+                                                 code_string dataJson,
+                                                 code_string session, code_string mode,
+                                                 code_string breakpointsJson,
+                                                 code_string managerAddr);
 
 /* Introspection */
 int64_t     Amalgame_Pollen_Pollen_WorkflowVersion(void);
