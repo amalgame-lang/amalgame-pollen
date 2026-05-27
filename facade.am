@@ -191,6 +191,37 @@ namespace Amalgame.Pollen
     static int                  _pollen_while_active = 0;
     static pollen_while_route_t _pollen_while_route;
 
+    /* === Phase 6.2/6.3 — capability registry + load balancer ====
+     *
+     * The capability WRITER (Phase 6.1) advertises this node ; the
+     * READER thread below scans the sharedDir capabilities dir every
+     * 2s and rebuilds an in-memory registry of live providers (those
+     * whose heartbeat is < POLLEN_REG_STALE_MS old). The LB resolver
+     * maps an emit topic → the providers advertising it → a single
+     * pick via power-of-two-choices (lower inFlight wins). Forwarding
+     * uses it only when SetLoadBalance(true) is set, else the static
+     * nexts are used verbatim (so single-instance demos are
+     * unchanged). The registry has its own mutex — independent of the
+     * wf mutex, so a forward (holding wf) can read it freely. */
+    #define POLLEN_REG_MAX        128
+    #define POLLEN_REG_ACTIONS_MAX 16
+    #define POLLEN_REG_STALE_MS   15000
+
+    typedef struct {
+        char    host[POLLEN_HOST_MAX];
+        int     port;
+        char    actions[POLLEN_REG_ACTIONS_MAX][POLLEN_TOPIC_MAX];
+        int     n_actions;
+        long    inflight;
+        int64_t heartbeat;
+    } pollen_provider_t;
+
+    static pollen_provider_t _pollen_reg[POLLEN_REG_MAX];
+    static int               _pollen_reg_n = 0;
+    static pthread_mutex_t   _pollen_reg_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static int               _pollen_reader_active = 0;
+    static int               _pollen_lb_enabled = 0;
+
     static const char _pollen_pkg_unimpl_warning[] =
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
         "M2-M3 migration from pollen.am in progress.\n";
@@ -218,6 +249,9 @@ namespace Amalgame.Pollen
     static size_t  _pollen_replace_data(const char* in, size_t in_len,
                                           const char* new_data,
                                           char* out, size_t out_cap);
+    /* v0.1.18 — LB resolver : emit topic → live provider (power-of-two). */
+    static int     _pollen_lb_pick(const char* topic, char* out_host,
+                                     size_t host_cap, int* out_port);
     /* M2.4 — debug bridge. Returns 1 to proceed (envelope to
      * dispatch copied into out[0..*out_len)), 0 to drop the message
      * (operator hit Cancel, or the manager phone-home timed out). */
@@ -2010,6 +2044,18 @@ namespace Amalgame.Pollen
                                                   rebuilt, sizeof(rebuilt),
                                                   new_topic, out_new_mid);
         if (rn > 0) { fwd = rebuilt; fwd_len = rn; }
+        /* Phase 6.3 — load-balanced forward : if enabled and the emit
+         * topic resolves to a live provider, forward to that ONE pick
+         * (power-of-two) instead of the static nexts. Falls back to
+         * the static nexts when LB is off or no provider is known, so
+         * single-instance demos are unchanged. */
+        if (_pollen_lb_enabled && new_topic) {
+            char lb_host[POLLEN_HOST_MAX]; int lb_port = 0;
+            if (_pollen_lb_pick(new_topic, lb_host, sizeof(lb_host), &lb_port)) {
+                _pollen_wf_forward_one(lb_host, lb_port, fwd, fwd_len);
+                return;
+            }
+        }
         for (int i = 0; i < _pollen_wf_n_nexts; i++) {
             _pollen_wf_forward_one(_pollen_wf_next_host[i],
                                      _pollen_wf_next_port[i],
@@ -2370,6 +2416,191 @@ namespace Amalgame.Pollen
         } else {
             _pollen_cap_active = 0;
         }
+    }
+
+    /* === Phase 6.2/6.3 — capability reader + LB resolver ====== */
+
+    #include <dirent.h>
+
+    /* Parse one capability file's JSON into a provider slot. Returns
+     * 1 on success (host + port + ≥1 advertised action). */
+    static int _pollen_reg_parse_one(const char* buf, size_t len,
+                                       pollen_provider_t* p) {
+        const char* v; size_t vlen;
+        p->n_actions = 0; p->inflight = 0; p->heartbeat = 0;
+        p->host[0] = 0; p->port = 0;
+
+        if (_pollen_json_field(buf, len, "host", 4, &v, &vlen)
+            && vlen >= 2 && *v == '"') {
+            size_t hl = vlen - 2;
+            if (hl >= sizeof(p->host)) hl = sizeof(p->host) - 1;
+            memcpy(p->host, v + 1, hl); p->host[hl] = 0;
+        }
+        if (_pollen_json_field(buf, len, "port", 4, &v, &vlen)) {
+            char tmp[16]; size_t cn = vlen < 15 ? vlen : 15;
+            memcpy(tmp, v, cn); tmp[cn] = 0; p->port = atoi(tmp);
+        }
+        if (_pollen_json_field(buf, len, "heartbeat", 9, &v, &vlen)) {
+            char tmp[24]; size_t cn = vlen < 23 ? vlen : 23;
+            memcpy(tmp, v, cn); tmp[cn] = 0; p->heartbeat = (int64_t) atoll(tmp);
+        }
+        /* inFlight is nested under "load" but the key is unique. */
+        {
+            const char* k = _pollen_find(buf, len, "\"inFlight\":", 11);
+            if (k) p->inflight = atol(k + 11);
+        }
+        if (_pollen_json_field(buf, len, "actions", 7, &v, &vlen)
+            && vlen >= 2 && *v == '[') {
+            const char* q = v + 1;
+            const char* end = v + vlen - 1;
+            while (q < end && p->n_actions < POLLEN_REG_ACTIONS_MAX) {
+                while (q < end && (*q == ' ' || *q == ',' || *q == '\n'
+                                   || *q == '\t' || *q == '\r')) q++;
+                if (q >= end || *q != '"') break;
+                q++;
+                const char* s = q;
+                while (q < end && *q != '"') {
+                    if (*q == '\\' && q + 1 < end) q++;
+                    q++;
+                }
+                size_t al = (size_t)(q - s);
+                if (al >= POLLEN_TOPIC_MAX) al = POLLEN_TOPIC_MAX - 1;
+                memcpy(p->actions[p->n_actions], s, al);
+                p->actions[p->n_actions][al] = 0;
+                p->n_actions++;
+                if (q < end) q++;
+            }
+        }
+        return (p->host[0] && p->port > 0 && p->n_actions > 0);
+    }
+
+    /* Reader thread : every 2s, scan the sharedDir capabilities dir,
+     * parse + drop stale (heartbeat > POLLEN_REG_STALE_MS old), and
+     * atomic-swap the in-memory registry under its own mutex. */
+    static void* _pollen_capability_reader(void* arg) {
+        (void) arg;
+        for (;;) {
+            if (_pollen_shared_dir[0]) {
+                char dir[600];
+                snprintf(dir, sizeof(dir), "%s/capabilities", _pollen_shared_dir);
+                DIR* d = opendir(dir);
+                if (d) {
+                    pollen_provider_t tmp[POLLEN_REG_MAX];
+                    int tn = 0;
+                    int64_t now = _pollen_now_ms_c();
+                    struct dirent* de;
+                    while ((de = readdir(d)) != NULL && tn < POLLEN_REG_MAX) {
+                        const char* nm = de->d_name;
+                        size_t nl = strlen(nm);
+                        if (nl < 6 || strcmp(nm + nl - 5, ".json") != 0) continue;
+                        if (strstr(nm, ".tmp.")) continue;
+                        char path[800];
+                        snprintf(path, sizeof(path), "%s/%s", dir, nm);
+                        int fd = open(path, O_RDONLY);
+                        if (fd < 0) continue;
+                        char fbuf[4096];
+                        ssize_t fn = read(fd, fbuf, sizeof(fbuf) - 1);
+                        close(fd);
+                        if (fn <= 0) continue;
+                        fbuf[fn] = 0;
+                        pollen_provider_t p;
+                        if (!_pollen_reg_parse_one(fbuf, (size_t) fn, &p)) continue;
+                        if (now - p.heartbeat > POLLEN_REG_STALE_MS) continue;
+                        tmp[tn++] = p;
+                    }
+                    closedir(d);
+                    pthread_mutex_lock(&_pollen_reg_mutex);
+                    if (tn > 0) memcpy(_pollen_reg, tmp,
+                                       sizeof(pollen_provider_t) * (size_t) tn);
+                    _pollen_reg_n = tn;
+                    pthread_mutex_unlock(&_pollen_reg_mutex);
+                }
+            }
+            usleep(2000 * 1000);  /* 2s */
+        }
+        return NULL;
+    }
+
+    /* Power-of-two-choices pick among live providers of `topic`.
+     * Writes the winner's host/port ; returns 1 on success, 0 if no
+     * provider advertises the topic. */
+    static int _pollen_lb_pick(const char* topic, char* out_host,
+                                 size_t host_cap, int* out_port) {
+        if (!topic || !topic[0]) return 0;
+        int cand[POLLEN_REG_MAX]; int nc = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n && nc < POLLEN_REG_MAX; i++) {
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++) {
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) {
+                    cand[nc++] = i; break;
+                }
+            }
+        }
+        int chosen = -1;
+        if (nc == 1) {
+            chosen = cand[0];
+        } else if (nc >= 2) {
+            unsigned int r1 = 0, r2 = 0;
+            getrandom(&r1, sizeof(r1), 0);
+            getrandom(&r2, sizeof(r2), 0);
+            int i1 = cand[r1 % (unsigned) nc];
+            int i2 = cand[r2 % (unsigned) nc];
+            if (i1 == i2) i2 = cand[(r2 % (unsigned) nc + 1) % (unsigned) nc];
+            chosen = (_pollen_reg[i1].inflight <= _pollen_reg[i2].inflight)
+                       ? i1 : i2;
+        }
+        int ok = 0;
+        if (chosen >= 0) {
+            strncpy(out_host, _pollen_reg[chosen].host, host_cap - 1);
+            out_host[host_cap - 1] = 0;
+            *out_port = _pollen_reg[chosen].port;
+            ok = 1;
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        return ok;
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_StartCapabilityReader_c(void) {
+        if (_pollen_reader_active) return;  /* idempotent */
+        _pollen_reader_active = 1;
+        pthread_t th;
+        if (GC_pthread_create(&th, NULL, _pollen_capability_reader, NULL) == 0) {
+            GC_pthread_detach(th);
+        } else {
+            _pollen_reader_active = 0;
+        }
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_SetLoadBalance_c(int on) {
+        _pollen_lb_enabled = on ? 1 : 0;
+    }
+
+    static int64_t
+    Amalgame_Pollen_Pollen_RegistrySize_c(void) {
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        int n = _pollen_reg_n;
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        return (int64_t) n;
+    }
+
+    static code_string
+    Amalgame_Pollen_Pollen_ResolveProvider_c(code_string topic) {
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!topic) return (code_string) empty;
+        char host[POLLEN_HOST_MAX]; int port = 0;
+        if (!_pollen_lb_pick((const char*) topic, host, sizeof(host), &port)) {
+            return (code_string) empty;
+        }
+        char buf[POLLEN_HOST_MAX + 16];
+        int n = snprintf(buf, sizeof(buf), "%s:%d", host, port);
+        if (n <= 0 || n >= (int) sizeof(buf)) return (code_string) empty;
+        char* out = (char*) GC_MALLOC_ATOMIC((size_t) n + 1);
+        if (!out) return (code_string) empty;
+        memcpy(out, buf, (size_t) n); out[n] = 0;
+        return (code_string) out;
     }
 
     /* === v0.1.17 — Mosaic bridge hooks ======================== */
@@ -2839,6 +3070,43 @@ public class Pollen {
     // Idempotent : a second call is a no-op.
     public static void StartCapabilityWriter(label: string, host: string, port: int) {
         @c { Amalgame_Pollen_Pollen_StartCapabilityWriter_c(label, host, (int64_t) port); }
+    }
+
+    // Phase 6.2 — start the capability READER : a detached thread that
+    // scans <sharedDir>/capabilities/*.json every 2s and rebuilds an
+    // in-memory registry of live providers (heartbeat < 15s), keyed by
+    // the actions (= consumed topics) they advertise. Idempotent. Call
+    // it on any node that forwards with load balancing enabled.
+    public static void StartCapabilityReader() {
+        @c { Amalgame_Pollen_Pollen_StartCapabilityReader_c(); }
+    }
+
+    // Phase 6.3 — toggle load-balanced forwarding. When ON, a forward
+    // resolves the emit topic against the registry and sends to ONE
+    // provider chosen by power-of-two-choices (lower inFlight wins),
+    // instead of the static nexts. When OFF (default) or when no
+    // provider is known, the static nexts are used verbatim — so
+    // single-instance setups are unchanged. Requires StartCapabilityReader.
+    public static void SetLoadBalance(on: bool) {
+        @c { Amalgame_Pollen_Pollen_SetLoadBalance_c(on ? 1 : 0); }
+    }
+
+    // Phase 6.3 — number of live providers currently in the registry
+    // (post staleness filter). Introspection for tests + the manager.
+    public static int RegistrySize() {
+        var n: int = 0
+        @c { n = (int) Amalgame_Pollen_Pollen_RegistrySize_c(); }
+        return n
+    }
+
+    // Phase 6.3 — resolve a topic to a single provider "host:port" via
+    // the same power-of-two pick used by forwarding. Returns "" if no
+    // live provider advertises the topic. For the manager's LB preview
+    // + tests (deterministic when inFlight differs between providers).
+    public static string ResolveProvider(topic: string) {
+        var s: string = ""
+        @c { s = Amalgame_Pollen_Pollen_ResolveProvider_c(topic); }
+        return s
     }
 
     // Synchronous publish — same envelope shape as Publish but
