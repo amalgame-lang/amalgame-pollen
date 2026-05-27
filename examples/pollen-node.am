@@ -1,0 +1,286 @@
+// examples/pollen-node.am
+//
+// Reference Pollen node binary built ENTIRELY on the amalgame-pollen
+// package — no legacy runtime. This is the M3 "thin wrapper" : it
+// parses a workflow.json, resolves this node's role, wires the
+// package's workflow runtime via the public setters, and blocks in
+// Pollen.StartListener.
+//
+// Unlike the legacy pollen-node-tcp binary, the `if` cond is
+// evaluated correctly at dispatch (the package's cond_eval, 28
+// smoke assertions), so conditional routing actually works.
+//
+// Build :
+//   amc package add pollen
+//   amc examples/pollen-node.am -o /tmp/pollen-node-pkg
+//
+// Run :
+//   /tmp/pollen-node-pkg <port> --workflow <path> --node-name <role> \
+//                        [--shared-dir <dir>]
+//
+// Supported tree (M3.1) : top-level sequence of
+//   call / fan_out / if(branches[{cond,then:call}]) / set
+// for / while + nested branches are M3.2.
+
+import Amalgame.Pollen
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+
+    // Does this step call / fan_out to `role` ?
+    public static bool StepNames(JsonValue actionV, string role) {
+        if (!actionV.IsObject()) { return false }
+        let kind: string = actionV.Get("type").AsString()
+        if (kind == "call") {
+            return actionV.Get("node").AsString() == role
+        }
+        if (kind == "fan_out") {
+            let nodesV: JsonValue = actionV.Get("nodes")
+            if (!nodesV.IsArray()) { return false }
+            let nodes: List<JsonValue> = nodesV.AsArray()
+            let n: int = nodes.Count()
+            for i in 0..n {
+                if (nodes.Get(i).AsString() == role) { return true }
+            }
+        }
+        return false
+    }
+
+    // Targets a step dispatches to (call → [node], fan_out → nodes,
+    // sequence → first non-set step's targets).
+    public static List<string> ActionTargets(JsonValue actionV) {
+        let out: List<string> = new List<string>()
+        if (!actionV.IsObject()) { return out }
+        let kind: string = actionV.Get("type").AsString()
+        if (kind == "call") {
+            let nV: string = actionV.Get("node").AsString()
+            if (String_Length(nV) > 0) { out.Add(nV) }
+            return out
+        }
+        if (kind == "fan_out") {
+            let nodesV: JsonValue = actionV.Get("nodes")
+            if (!nodesV.IsArray()) { return out }
+            let nodes: List<JsonValue> = nodesV.AsArray()
+            let n: int = nodes.Count()
+            for i in 0..n {
+                let s: string = nodes.Get(i).AsString()
+                if (String_Length(s) > 0) { out.Add(s) }
+            }
+            return out
+        }
+        if (kind == "sequence") {
+            let stepsV: JsonValue = actionV.Get("steps")
+            if (!stepsV.IsArray()) { return out }
+            let steps: List<JsonValue> = stepsV.AsArray()
+            let sn: int = steps.Count()
+            for i in 0..sn {
+                let s: JsonValue = steps.Get(i)
+                if (!s.IsObject()) { continue }
+                if (s.Get("type").AsString() == "set") { continue }
+                return Program.ActionTargets(s)
+            }
+        }
+        return out
+    }
+
+    // The step that immediately follows `role`'s step in the
+    // top-level sequence (empty if role is terminal / not found).
+    public static JsonValue FindActionAfter(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return empty }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            if (Program.StepNames(steps.Get(i), role)) {
+                // skip over `set` steps to the next dispatchable one
+                var j: int = i + 1
+                while (j < n) {
+                    let s: JsonValue = steps.Get(j)
+                    if (s.IsObject() && s.Get("type").AsString() == "set") {
+                        j = j + 1
+                        continue
+                    }
+                    return s
+                }
+                return empty
+            }
+        }
+        return empty
+    }
+
+    // Wire one next target (resolve host:port from the node table).
+    public static void WireNext(JsonValue nodesV, string role) {
+        let node: JsonValue = nodesV.Get(role)
+        if (!node.IsObject()) { return }
+        let host: string = node.Get("host").AsString()
+        let port: int    = node.Get("port").AsInt()
+        if (String_Length(host) > 0 && port > 0) {
+            Pollen.WorkflowAddNext(host, port)
+        }
+    }
+
+    public static void Main(string[] args) {
+        if (Args_Count() == 0) {
+            Console.WriteLine("usage: pollen-node <port> --workflow <path> --node-name <role> [--shared-dir <dir>]")
+            return
+        }
+
+        var port: int = 0
+        var workflowPath: string = ""
+        var nodeName: string = ""
+        var sharedDir: string = ""
+
+        var i: int = 0
+        while (i < Args_Count()) {
+            let a: string = Args_Get(i)
+            if (a == "--workflow") {
+                if (i + 1 < Args_Count()) { workflowPath = Args_Get(i + 1); i = i + 2; continue }
+            }
+            if (a == "--node-name") {
+                if (i + 1 < Args_Count()) { nodeName = Args_Get(i + 1); i = i + 2; continue }
+            }
+            if (a == "--shared-dir") {
+                if (i + 1 < Args_Count()) { sharedDir = Args_Get(i + 1); i = i + 2; continue }
+            }
+            if (port == 0) { port = String_ToInt(a) }
+            i = i + 1
+        }
+
+        if (port <= 0) {
+            Console.WriteLine("pollen-node: need a positive port as the first arg")
+            return
+        }
+        if (String_Length(workflowPath) == 0) {
+            Console.WriteLine("pollen-node: --workflow <path> required")
+            return
+        }
+        if (!File_Exists(workflowPath)) {
+            Console.WriteLine("pollen-node: workflow file not found: {workflowPath}")
+            return
+        }
+
+        let body: string = File_ReadAll(workflowPath)
+        let parser: JsonParser = new JsonParser(body)
+        let root: JsonValue = parser.ParseTopLevel()
+        if (parser.HasFailed()) {
+            let e: string = parser.ErrorMsg()
+            Console.WriteLine("pollen-node: workflow parse failed: {e}")
+            return
+        }
+
+        let nodesV: JsonValue = root.Get("nodes")
+        if (!nodesV.IsObject()) {
+            Console.WriteLine("pollen-node: 'nodes' must be an object keyed by role")
+            return
+        }
+        let treeV: JsonValue = root.Get("tree")
+        if (!treeV.IsObject()) {
+            Console.WriteLine("pollen-node: 'tree' missing (M3.1 needs a workflow-tree)")
+            return
+        }
+
+        // Resolve role : --node-name beats port lookup.
+        var role: string = nodeName
+        if (String_Length(role) == 0) {
+            let keys: List<string> = nodesV.Keys()
+            let nk: int = keys.Count()
+            for ki in 0..nk {
+                let k: string = keys.Get(ki)
+                if (nodesV.Get(k).Get("port").AsInt() == port) { role = k; break }
+            }
+        }
+        if (String_Length(role) == 0) {
+            Console.WriteLine("pollen-node: no role matches port :{port}")
+            return
+        }
+
+        let self: JsonValue = nodesV.Get(role)
+        if (!self.IsObject()) {
+            Console.WriteLine("pollen-node: role '{role}' not in nodes")
+            return
+        }
+
+        if (String_Length(sharedDir) > 0) {
+            Pollen.WorkflowSetSharedDir(sharedDir)
+        }
+        Pollen.WorkflowSetSelf(role, "127.0.0.1", port)
+
+        // ── Configure the runtime for this role ──
+        Pollen.WorkflowReloadBegin()
+
+        // consumes
+        let consumesV: JsonValue = self.Get("consumes")
+        if (consumesV.IsArray()) {
+            let cs: List<JsonValue> = consumesV.AsArray()
+            let cn: int = cs.Count()
+            for ci in 0..cn {
+                let topic: string = cs.Get(ci).AsString()
+                if (String_Length(topic) > 0) { Pollen.WorkflowAddConsume(topic) }
+            }
+        }
+
+        // emit topic (first of emits[])
+        let emitsV: JsonValue = self.Get("emits")
+        if (emitsV.IsArray()) {
+            let es: List<JsonValue> = emitsV.AsArray()
+            if (es.Count() > 0) {
+                let emit: string = es.Get(0).AsString()
+                if (String_Length(emit) > 0) { Pollen.WorkflowSetEmitTopic(emit) }
+            }
+        }
+
+        // next : the step after this role in the top-level sequence
+        let after: JsonValue = Program.FindActionAfter(treeV, role)
+        if (after.IsObject()) {
+            let kind: string = after.Get("type").AsString()
+            if (kind == "call" || kind == "fan_out") {
+                let targets: List<string> = Program.ActionTargets(after)
+                let tn: int = targets.Count()
+                for ti in 0..tn {
+                    Program.WireNext(nodesV, targets.Get(ti))
+                }
+            } else if (kind == "if") {
+                // Each branch → CondBranchOpen(condJson) + targets.
+                let branchesV: JsonValue = after.Get("branches")
+                if (branchesV.IsArray()) {
+                    let branches: List<JsonValue> = branchesV.AsArray()
+                    let bn: int = branches.Count()
+                    for bi in 0..bn {
+                        let br: JsonValue = branches.Get(bi)
+                        if (!br.IsObject()) { continue }
+                        var condJson: string = ""
+                        let condV: JsonValue = br.Get("cond")
+                        if (condV.IsObject()) { condJson = Json.Encode(condV) }
+                        Pollen.CondBranchOpen(condJson)
+                        let thenV: JsonValue = br.Get("then")
+                        let tgts: List<string> = Program.ActionTargets(thenV)
+                        let tc: int = tgts.Count()
+                        for ti in 0..tc {
+                            let tgtRole: string = tgts.Get(ti)
+                            let tn2: JsonValue = nodesV.Get(tgtRole)
+                            if (tn2.IsObject()) {
+                                let h: string = tn2.Get("host").AsString()
+                                let p: int    = tn2.Get("port").AsInt()
+                                if (String_Length(h) > 0 && p > 0) {
+                                    Pollen.CondBranchAddTarget(h, p)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Pollen.WorkflowReloadCommit()
+
+        Console.WriteLine("pollen-node: role={role} listening on :{port} (package-driven)")
+        Console.Flush()
+        Pollen.StartListener(port)
+    }
+}
