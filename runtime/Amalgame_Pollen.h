@@ -76,6 +76,9 @@ void        Amalgame_Pollen_Pollen_WhileAddExit(code_string host, int64_t port);
 /* v0.1.22 — v2 routing : exit topic resolved via LB. Loop body still
  * uses the self host:port passed to WhileSetup. */
 void        Amalgame_Pollen_Pollen_WhileSetExitTopic(code_string topic);
+/* v0.1.23 — explicit while.body : iteration goes to the body action's
+ * topic (LB-resolved) instead of looping to self. */
+void        Amalgame_Pollen_Pollen_WhileSetBodyTopic(code_string topic);
 
 /* Phase 5.3 — per-execution state file under sharedDir/state/<rootMid>.json.
  * StateGet returns the raw JSON literal for the key (or "" if absent).

@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1.23 — 2026-05-28
+
+### Added — explicit `while.body` (uniform schema with `for.do` / `if.then`)
+- `Pollen.WhileSetBodyTopic(topic)` — set the body action's consume topic. When set (+ LB on), the controller forwards each iteration to a registry-resolved provider of that topic (the body action) instead of looping to self. The body action processes one iteration and forwards back to the controller (its emit topic = the controller's consume topic), which re-evaluates the cond + bumps iter, and so on. Empty → v1 fallback (loop to self).
+- 37 public symbols.
+
+### Why
+- `if { branches[].then }`, `for { do }`, `while { … }` all expressed bodies differently — `while` was the outlier (no `body` field, implicit self-loop). v2 schema gets uniform : `while { cond, maxIter, body }`. Mirrors n8n / Temporal-style flow editors and makes `while` representable in a DAG editor without special-casing.
+
+### Reference node wiring
+- `RunV2` `while` branch : if `while.body` is set, calls `WhileSetBodyTopic(actionTopic(body.action))`.
+- A role that is the body of some `while` (detected by walking the tree) has its emit topic set to the controller's consume topic, so the body's forward returns to the controller.
+- New helpers : `FindWhileController(treeV, role)`.
+
+### Notes
+- v1 path (`while` without `body`, looping to self via `loop_host:loop_port`) still works untouched.
+- v0.1.22's `WhileSetExitTopic` is unchanged.
+
+
 ## v0.1.22 — 2026-05-27
 
 ### Added — v2 `while` routing (registry-resolved exit)
