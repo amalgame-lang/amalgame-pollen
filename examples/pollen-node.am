@@ -439,6 +439,51 @@ public class Program {
         return false
     }
 
+    // v0.1.24 — return the `while` step in the top-level sequence whose
+    // body contains `role`. Empty JsonValue if role isn't in any body.
+    // Used by the iterator wiring to fetch cond / maxIter.
+    public static JsonValue FindWhileForRoleInBody(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return empty }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            let s: JsonValue = steps.Get(i)
+            if (!s.IsObject()) { continue }
+            if (s.Get("type").AsString() != "while") { continue }
+            if (Program.BodyContains(s.Get("body"), role)) { return s }
+        }
+        return empty
+    }
+
+    // v0.1.24 — return the action of the call step right after the
+    // while whose body contains `role`. "" if no such step.
+    public static string FindAfterWhile(JsonValue treeV, string role) {
+        if (!treeV.IsObject()) { return "" }
+        if (treeV.Get("type").AsString() != "sequence") { return "" }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return "" }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            let s: JsonValue = steps.Get(i)
+            if (!s.IsObject()) { continue }
+            if (s.Get("type").AsString() != "while") { continue }
+            if (!Program.BodyContains(s.Get("body"), role)) { continue }
+            if (i + 1 < n) {
+                let after: JsonValue = steps.Get(i + 1)
+                if (after.IsObject() && after.Get("type").AsString() == "call") {
+                    return after.Get("action").AsString()
+                }
+            }
+            return ""
+        }
+        return ""
+    }
+
     // If `role` is in some while's body sequence and another call
     // follows it in that sequence, return that next call's action.
     // Returns "" if role is the last call in its body sequence, or
@@ -583,42 +628,20 @@ public class Program {
                 }
                 routeDesc = "for ({itemCount} items → {doTopic}, registry-routed)"
             } else if (kind == "while") {
-                // v2 while : loops back to this node (loop body
-                // rebuilds with emit_topic = self's consume topic).
-                // Exit goes to the next action's topic via registry.
-                var condJson: string = ""
-                let condV: JsonValue = nextStep.Get("cond")
-                if (condV.IsObject()) { condJson = Json.Encode(condV) }
-                var maxIter: int = 100
-                let maxV: JsonValue = nextStep.Get("maxIter")
-                if (maxV.IsInt()) { maxIter = maxV.AsInt() }
-                let iterKey: string = "_wf_iter_" + role
-                Pollen.WorkflowSetEmitTopic(myTopic)
-                Pollen.WhileSetup(condJson, iterKey, maxIter, "127.0.0.1", port)
-                // v0.1.23 — explicit while.body : the iteration goes
-                // to the body action instead of looping to self. The
-                // body action consumes its topic, processes once, and
-                // forwards back to this controller.
-                var bodyDesc: string = "loop→self"
-                let bodyAction: string = Program.ThenAction(nextStep.Get("body"))
-                if (String_Length(bodyAction) > 0) {
-                    let bodyTopic: string = Program.ActionTopic(actionsV, bodyAction)
+                // v0.1.24 — the role before a while is just a one-shot
+                // hand-off : it emits to the body's first action and
+                // never re-iterates. The body's LAST step (matched in
+                // the fallback below) handles cond/iter and decides
+                // loop-back vs exit. Matches the user mental model and
+                // brings while in line with for (one-shot upstream).
+                let bodyFirst: string = Program.ThenAction(nextStep.Get("body"))
+                if (String_Length(bodyFirst) > 0) {
+                    let bodyTopic: string = Program.ActionTopic(actionsV, bodyFirst)
                     if (String_Length(bodyTopic) > 0) {
-                        Pollen.WhileSetBodyTopic(bodyTopic)
-                        bodyDesc = "body→" + bodyTopic
+                        Pollen.WorkflowSetEmitTopic(bodyTopic)
+                        routeDesc = "→ while body → emit {bodyTopic}"
                     }
                 }
-                let exitStep: JsonValue = Program.StepAfterWhile(treeV, role)
-                var exitDesc: string = "terminal"
-                if (exitStep.IsObject()) {
-                    let exitAction: string = Program.ThenAction(exitStep)
-                    let exitTopic: string = Program.ActionTopic(actionsV, exitAction)
-                    if (String_Length(exitTopic) > 0) {
-                        Pollen.WhileSetExitTopic(exitTopic)
-                        exitDesc = "exit→" + exitTopic
-                    }
-                }
-                routeDesc = "while (maxIter={maxIter}, {bodyDesc}, {exitDesc})"
             }
         }
         // v0.1.23 — am I the body action of some while in the tree?
@@ -633,9 +656,11 @@ public class Program {
                 //   - another call follows in the body sequence
                 //     → emit to THAT next step's topic (intra-body
                 //       linear flow).
-                //   - I'm the last call in the body
-                //     → emit back to the controller's topic so the
-                //       while re-evaluates (closes the loop).
+                //   - I'm the LAST call of the body
+                //     → v0.1.24 : I become the iterator. Bump iter via
+                //       a set op, then a cond branch picks body-first
+                //       (loop) or after-while (exit). The controller
+                //       before the while never re-runs.
                 let nextInBody: string = Program.FindWhileNext(treeV, role)
                 if (String_Length(nextInBody) > 0) {
                     let nextTopic: string = Program.ActionTopic(actionsV, nextInBody)
@@ -644,10 +669,43 @@ public class Program {
                         routeDesc = "while body step → emit " + nextTopic
                     }
                 } else {
-                    let ctrlTopic: string = Program.ActionTopic(actionsV, ctrlAction)
-                    if (String_Length(ctrlTopic) > 0) {
-                        Pollen.WorkflowSetEmitTopic(ctrlTopic)
-                        routeDesc = "while body → emit " + ctrlTopic
+                    let whileStep: JsonValue = Program.FindWhileForRoleInBody(treeV, role)
+                    if (whileStep.IsObject()) {
+                        var maxIter: int = 100
+                        let maxV: JsonValue = whileStep.Get("maxIter")
+                        if (maxV.IsInt()) { maxIter = maxV.AsInt() }
+                        let iterKey: string = "_wf_iter_" + ctrlAction
+                        // 1. Bump iter on each entry to this step.
+                        let bumpExpr: string = "{\"op\":\"+\",\"left\":{\"var\":\"state." + iterKey + "\"},\"right\":{\"const\":1}}"
+                        Pollen.SetOpAdd("state." + iterKey, bumpExpr)
+                        // 2. Build the combined cond  iter<maxIter ∧ userCond.
+                        let iterCheck: string = "{\"op\":\"<\",\"var\":\"state." + iterKey + "\",\"value\":" + String_FromInt(maxIter) + "}"
+                        var userCondJson: string = ""
+                        let condV: JsonValue = whileStep.Get("cond")
+                        if (condV.IsObject()) { userCondJson = Json.Encode(condV) }
+                        var combinedCond: string = iterCheck
+                        if (String_Length(userCondJson) > 0) {
+                            combinedCond = "{\"op\":\"and\",\"args\":["
+                                + iterCheck + "," + userCondJson + "]}"
+                        }
+                        // 3. Branch 1 = loop : combinedCond → body-first action.
+                        let bodyFirst: string = Program.ThenAction(whileStep.Get("body"))
+                        let bodyTopic: string = Program.ActionTopic(actionsV, bodyFirst)
+                        Pollen.CondBranchOpen(combinedCond)
+                        if (String_Length(bodyTopic) > 0) {
+                            Pollen.CondBranchSetTopic(bodyTopic)
+                        }
+                        // 4. Branch 2 = else (exit) : after-while action.
+                        let afterAction: string = Program.FindAfterWhile(treeV, role)
+                        Pollen.CondBranchOpen("")
+                        if (String_Length(afterAction) > 0) {
+                            let afterTopic: string = Program.ActionTopic(actionsV, afterAction)
+                            if (String_Length(afterTopic) > 0) {
+                                Pollen.CondBranchSetTopic(afterTopic)
+                            }
+                        }
+                        routeDesc = "while body (last) → iterator " +
+                            "[loop:" + bodyTopic + ", exit:" + afterAction + "]"
                     }
                 }
             }
