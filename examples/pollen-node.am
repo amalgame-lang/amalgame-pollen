@@ -390,6 +390,33 @@ public class Program {
         return empty
     }
 
+    // v0.1.23 — if `role` is the body action of some `while` step in
+    // the top-level sequence, return the action of the call right
+    // before that while (the loop controller). "" otherwise. Used by
+    // RunV2 to wire the body's emit topic back to the controller.
+    public static string FindWhileController(JsonValue treeV, string role) {
+        if (!treeV.IsObject()) { return "" }
+        if (treeV.Get("type").AsString() != "sequence") { return "" }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return "" }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            let s: JsonValue = steps.Get(i)
+            if (!s.IsObject()) { continue }
+            if (s.Get("type").AsString() != "while") { continue }
+            let bodyAction: string = Program.ThenAction(s.Get("body"))
+            if (bodyAction != role) { continue }
+            if (i == 0) { return "" }
+            let prev: JsonValue = steps.Get(i - 1)
+            if (prev.IsObject() && prev.Get("type").AsString() == "call") {
+                return prev.Get("action").AsString()
+            }
+            return ""
+        }
+        return ""
+    }
+
     // The action a `then` (or `do`) clause calls — direct call, or the
     // first call inside a sequence. "" if none.
     public static string ThenAction(JsonValue thenV) {
@@ -503,12 +530,21 @@ public class Program {
                 let maxV: JsonValue = nextStep.Get("maxIter")
                 if (maxV.IsInt()) { maxIter = maxV.AsInt() }
                 let iterKey: string = "_wf_iter_" + role
-                // Loop body rebuilds with emit_topic → this action's
-                // own consume topic, then forwards to self host:port
-                // (deterministic — looping through the registry would
-                // bounce between replicas of this role).
                 Pollen.WorkflowSetEmitTopic(myTopic)
                 Pollen.WhileSetup(condJson, iterKey, maxIter, "127.0.0.1", port)
+                // v0.1.23 — explicit while.body : the iteration goes
+                // to the body action instead of looping to self. The
+                // body action consumes its topic, processes once, and
+                // forwards back to this controller.
+                var bodyDesc: string = "loop→self"
+                let bodyAction: string = Program.ThenAction(nextStep.Get("body"))
+                if (String_Length(bodyAction) > 0) {
+                    let bodyTopic: string = Program.ActionTopic(actionsV, bodyAction)
+                    if (String_Length(bodyTopic) > 0) {
+                        Pollen.WhileSetBodyTopic(bodyTopic)
+                        bodyDesc = "body→" + bodyTopic
+                    }
+                }
                 let exitStep: JsonValue = Program.StepAfterWhile(treeV, role)
                 var exitDesc: string = "terminal"
                 if (exitStep.IsObject()) {
@@ -516,10 +552,25 @@ public class Program {
                     let exitTopic: string = Program.ActionTopic(actionsV, exitAction)
                     if (String_Length(exitTopic) > 0) {
                         Pollen.WhileSetExitTopic(exitTopic)
-                        exitDesc = "exit → " + exitTopic
+                        exitDesc = "exit→" + exitTopic
                     }
                 }
-                routeDesc = "while (maxIter={maxIter}, loop→self, {exitDesc}, registry-routed)"
+                routeDesc = "while (maxIter={maxIter}, {bodyDesc}, {exitDesc})"
+            }
+        }
+        // v0.1.23 — am I the body action of some while in the tree?
+        // If yes, emit topic = the controller's consume topic so each
+        // body iteration forwards back to the loop controller. Runs
+        // after the dispatch above so a body action that has its own
+        // "next" in the tree (rare) is not overridden silently.
+        if (String_Length(routeDesc) == 0 || routeDesc == "terminal") {
+            let ctrlAction: string = Program.FindWhileController(treeV, role)
+            if (String_Length(ctrlAction) > 0) {
+                let ctrlTopic: string = Program.ActionTopic(actionsV, ctrlAction)
+                if (String_Length(ctrlTopic) > 0) {
+                    Pollen.WorkflowSetEmitTopic(ctrlTopic)
+                    routeDesc = "while body → emit " + ctrlTopic
+                }
             }
         }
         Pollen.WorkflowReloadCommit()
