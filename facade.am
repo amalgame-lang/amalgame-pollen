@@ -195,6 +195,13 @@ namespace Amalgame.Pollen
         char exit_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
         int  exit_port[POLLEN_MAX_NEXTS];
         int  n_exits;
+        /* v0.1.22 — v2 routing : if set, on exit the envelope is
+         * rebuilt with this topic and forwarded to a registry-
+         * resolved provider (power-of-two) instead of the static
+         * exit_host[]. The loop body still uses loop_host:loop_port
+         * (self) since that's deterministic — looping through the
+         * registry would bounce between replicas of the loop role. */
+        char exit_topic[POLLEN_TOPIC_MAX];
     } pollen_while_route_t;
 
     static int                  _pollen_while_active = 0;
@@ -1273,6 +1280,7 @@ namespace Amalgame.Pollen
         _pollen_while_route.loop_host[0] = 0;
         _pollen_while_route.loop_port = 0;
         _pollen_while_route.n_exits = 0;
+        _pollen_while_route.exit_topic[0] = 0;
     }
 
     static void _pollen_while_setup(const char* cond_json,
@@ -1294,6 +1302,16 @@ namespace Amalgame.Pollen
         _pollen_while_route.loop_host[POLLEN_HOST_MAX - 1] = 0;
         _pollen_while_route.loop_port = self_port;
         _pollen_while_route.n_exits = 0;
+        _pollen_while_route.exit_topic[0] = 0;
+    }
+
+    /* v0.1.22 — v2 routing : set the exit topic. When set (+ LB on),
+     * on exit the envelope is rebuilt with this topic and forwarded
+     * to a registry-resolved provider — no static exit targets. */
+    static void _pollen_while_set_exit_topic(const char* topic) {
+        strncpy(_pollen_while_route.exit_topic, topic ? topic : "",
+                 POLLEN_TOPIC_MAX - 1);
+        _pollen_while_route.exit_topic[POLLEN_TOPIC_MAX - 1] = 0;
     }
 
     static void _pollen_while_add_exit(const char* host, int port) {
@@ -1438,15 +1456,29 @@ namespace Amalgame.Pollen
             return;
         }
 
-        if (_pollen_while_route.n_exits == 0) return;
+        /* v0.1.22 — v2 exit by topic : rebuild with the exit topic
+         * and resolve a live provider via the LB. v1 keeps the static
+         * exit list + global emit topic. No exits at all → drop. */
+        if (_pollen_while_route.exit_topic[0] == 0
+            && _pollen_while_route.n_exits == 0) return;
         char rebuilt[8192];
-        const char* new_topic = _pollen_wf_emit_topic[0]
-                                  ? _pollen_wf_emit_topic : NULL;
+        const char* new_topic = _pollen_while_route.exit_topic[0]
+                                  ? _pollen_while_route.exit_topic
+                                  : (_pollen_wf_emit_topic[0]
+                                      ? _pollen_wf_emit_topic : NULL);
         size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                   rebuilt, sizeof(rebuilt),
                                                   new_topic, out_new_mid);
         const char* fwd = rn > 0 ? rebuilt : env;
         size_t fwd_len = rn > 0 ? rn : env_len;
+        if (_pollen_while_route.exit_topic[0] && _pollen_lb_enabled) {
+            char lb_host[POLLEN_HOST_MAX]; int lb_port = 0;
+            if (_pollen_lb_pick(_pollen_while_route.exit_topic,
+                                 lb_host, sizeof(lb_host), &lb_port)) {
+                _pollen_wf_forward_one(lb_host, lb_port, fwd, fwd_len);
+            }
+            return;
+        }
         for (int i = 0; i < _pollen_while_route.n_exits; i++) {
             _pollen_wf_forward_one(_pollen_while_route.exit_host[i],
                                      _pollen_while_route.exit_port[i],
@@ -2989,6 +3021,11 @@ namespace Amalgame.Pollen
         _pollen_while_add_exit((const char*) host, (int) port);
     }
 
+    static void
+    Amalgame_Pollen_Pollen_WhileSetExitTopic_c(code_string topic) {
+        _pollen_while_set_exit_topic((const char*) topic);
+    }
+
     static code_string
     Amalgame_Pollen_Pollen_PublishSync_c(code_string host, int64_t port,
                                           code_string topicUuid, int64_t topicVersion,
@@ -3433,6 +3470,15 @@ public class Pollen {
 
     public static void WhileAddExit(host: string, port: int) {
         @c { Amalgame_Pollen_Pollen_WhileAddExit_c(host, (int64_t) port); }
+    }
+
+    // v0.1.22 — v2 routing : set the while's EXIT topic. When set
+    // (+ LB on), on exit the envelope is rebuilt with this topic and
+    // forwarded to a registry-resolved provider — no static exit
+    // targets. The loop body still uses selfHost:selfPort (passed to
+    // WhileSetup) so the iteration stays on this node deterministically.
+    public static void WhileSetExitTopic(topic: string) {
+        @c { Amalgame_Pollen_Pollen_WhileSetExitTopic_c(topic); }
     }
 
     public static int WorkflowVersion() {
