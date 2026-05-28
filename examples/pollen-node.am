@@ -450,6 +450,26 @@ public class Program {
                     }
                     routeDesc = "if ({wired} branches → topics, registry-routed)"
                 }
+            } else if (kind == "for") {
+                // v2 for : fan one message per item to the `do` action,
+                // registry-resolved per iteration.
+                var itemVar: string = nextStep.Get("var").AsString()
+                if (String_Length(itemVar) == 0) { itemVar = "item" }
+                Pollen.ForSetup(itemVar)
+                let doAction: string = Program.ThenAction(nextStep.Get("do"))
+                let doTopic: string = Program.ActionTopic(actionsV, doAction)
+                if (String_Length(doTopic) > 0) { Pollen.ForSetTopic(doTopic) }
+                let inV: JsonValue = nextStep.Get("in")
+                var itemCount: int = 0
+                if (inV.IsArray()) {
+                    let items: List<JsonValue> = inV.AsArray()
+                    let ic: int = items.Count()
+                    for ii in 0..ic {
+                        Pollen.ForAddItem(Json.Encode(items.Get(ii)))
+                        itemCount = itemCount + 1
+                    }
+                }
+                routeDesc = "for ({itemCount} items → {doTopic}, registry-routed)"
             }
         }
         Pollen.WorkflowReloadCommit()
