@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.21 — 2026-05-27
+
+### Added — v2 `for` routing (registry-resolved fan-out per item)
+- `Pollen.ForSetTopic(topic)` — set the `for` route's emit topic. When set (+ LB on), each iteration rebuilds with that topic and forwards to a live provider resolved by power-of-two — no static targets. Items spread across replicas of the `do` action. The `while > for > cond > forward_all` dispatch priority is unchanged. v1 (`ForAddTarget` + static fan-out) still works when no topic is set.
+- 35 public symbols declared. 156 assertions total.
+
+### Note
+- The reference node `RunV2` now wires `for` trees (`for { var, in, do }` → `ForSetup` + `ForSetTopic(actionTopic(do.action))` + `ForAddItem` per item). `while` v2 is the next slice.
+
+
 ## v0.1.20 — 2026-05-27
 
 ### Added — v2 conditional routing by topic (registry-resolved `if` branches)

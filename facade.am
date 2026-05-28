@@ -177,6 +177,10 @@ namespace Amalgame.Pollen
         char target_host[POLLEN_MAX_NEXTS][POLLEN_HOST_MAX];
         int  target_port[POLLEN_MAX_NEXTS];
         int  n_targets;
+        /* v0.1.21 — v2 routing : if set, each iteration rebuilds with
+         * this topic and forwards to a registry-resolved provider
+         * (power-of-two), instead of the static targets above. */
+        char topic[POLLEN_TOPIC_MAX];
     } pollen_for_route_t;
 
     static int                _pollen_for_active = 0;
@@ -1220,16 +1224,27 @@ namespace Amalgame.Pollen
         _pollen_for_route.n_items = 0;
         _pollen_for_route.n_targets = 0;
         _pollen_for_route.item_var[0] = 0;
+        _pollen_for_route.topic[0] = 0;
     }
 
     static void _pollen_for_setup(const char* var) {
         _pollen_for_active = 1;
         _pollen_for_route.n_items = 0;
         _pollen_for_route.n_targets = 0;
+        _pollen_for_route.topic[0] = 0;
         strncpy(_pollen_for_route.item_var,
                  var && var[0] ? var : "item",
                  POLLEN_COND_VAR_MAX - 1);
         _pollen_for_route.item_var[POLLEN_COND_VAR_MAX - 1] = 0;
+    }
+
+    /* v0.1.21 — v2 routing : each iteration rebuilds with this topic
+     * and resolves a live provider via the LB, instead of fanning out
+     * to static targets. Empty → v1 behaviour. */
+    static void _pollen_for_set_topic(const char* topic) {
+        strncpy(_pollen_for_route.topic, topic ? topic : "",
+                 POLLEN_TOPIC_MAX - 1);
+        _pollen_for_route.topic[POLLEN_TOPIC_MAX - 1] = 0;
     }
 
     static void _pollen_for_add_target(const char* host, int port) {
@@ -1339,13 +1354,28 @@ namespace Amalgame.Pollen
                 _pollen_state_set(root, state_path, item);
             }
             char rebuilt[8192];
-            const char* new_topic = _pollen_wf_emit_topic[0]
-                                      ? _pollen_wf_emit_topic : NULL;
+            /* v0.1.21 — v2 routing : when the for has its own topic,
+             * each iteration rebuilds with THAT topic and resolves a
+             * live provider via the LB (no static targets needed).
+             * Empty topic → v1 behaviour (global emit + static fan). */
+            const char* new_topic = _pollen_for_route.topic[0]
+                                      ? _pollen_for_route.topic
+                                      : (_pollen_wf_emit_topic[0]
+                                          ? _pollen_wf_emit_topic : NULL);
             size_t rn = _pollen_wf_rebuild_envelope(env, env_len,
                                                       rebuilt, sizeof(rebuilt),
                                                       new_topic, out_new_mid);
             const char* fwd = rn > 0 ? rebuilt : env;
             size_t fwd_len = rn > 0 ? rn : env_len;
+            if (_pollen_for_route.topic[0] && _pollen_lb_enabled) {
+                char lb_host[POLLEN_HOST_MAX]; int lb_port = 0;
+                if (_pollen_lb_pick(_pollen_for_route.topic,
+                                     lb_host, sizeof(lb_host), &lb_port)) {
+                    _pollen_wf_forward_one(lb_host, lb_port, fwd, fwd_len);
+                }
+                /* topic set but no live provider → drop this item. */
+                continue;
+            }
             for (int t = 0; t < _pollen_for_route.n_targets; t++) {
                 _pollen_wf_forward_one(_pollen_for_route.target_host[t],
                                          _pollen_for_route.target_port[t],
@@ -2937,6 +2967,11 @@ namespace Amalgame.Pollen
     }
 
     static void
+    Amalgame_Pollen_Pollen_ForSetTopic_c(code_string topic) {
+        _pollen_for_set_topic((const char*) topic);
+    }
+
+    static void
     Amalgame_Pollen_Pollen_WhileSetup_c(code_string condJson,
                                           code_string iterKey,
                                           int64_t maxIter,
@@ -3369,6 +3404,16 @@ public class Pollen {
 
     public static void ForAddItem(itemLit: string) {
         @c { Amalgame_Pollen_Pollen_ForAddItem_c(itemLit); }
+    }
+
+    // v0.1.21 — v2 routing : set the for route's emit topic. When
+    // set (+ LB on), each iteration rebuilds with this topic and
+    // forwards to a live provider resolved by the power-of-two LB —
+    // no static targets needed. Each item triggers one resolution
+    // (items spread across replicas of the do-action). Leave it
+    // unset for v1 (static ForAddTarget) routing.
+    public static void ForSetTopic(topic: string) {
+        @c { Amalgame_Pollen_Pollen_ForSetTopic_c(topic); }
     }
 
     // M2.3c.2b — while loop. Self-loop bounded by maxIter, with

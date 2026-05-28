@@ -65,6 +65,8 @@ void        Amalgame_Pollen_Pollen_SetOpAdd(code_string path, code_string valueE
 void        Amalgame_Pollen_Pollen_ForSetup(code_string itemVar);
 void        Amalgame_Pollen_Pollen_ForAddTarget(code_string host, int64_t port);
 void        Amalgame_Pollen_Pollen_ForAddItem(code_string itemLit);
+/* v0.1.21 — v2 routing : per-iteration topic resolved via LB. */
+void        Amalgame_Pollen_Pollen_ForSetTopic(code_string topic);
 void        Amalgame_Pollen_Pollen_WhileSetup(code_string condJson,
                                                 code_string iterKey,
                                                 int64_t maxIter,
