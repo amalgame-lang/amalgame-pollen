@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.1.20"
+version           = "0.1.21"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v2 trees over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -103,6 +103,7 @@ SetOpAdd               = { returns = "void" }
 ForSetup               = { returns = "void" }
 ForAddTarget           = { returns = "void" }
 ForAddItem             = { returns = "void" }
+ForSetTopic            = { returns = "void" }
 WhileSetup             = { returns = "void" }
 WhileAddExit           = { returns = "void" }
 

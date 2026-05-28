@@ -42,6 +42,7 @@ int main(void) {
         (void*) &Amalgame_Pollen_Pollen_ForSetup,
         (void*) &Amalgame_Pollen_Pollen_ForAddTarget,
         (void*) &Amalgame_Pollen_Pollen_ForAddItem,
+        (void*) &Amalgame_Pollen_Pollen_ForSetTopic,
         (void*) &Amalgame_Pollen_Pollen_WhileSetup,
         (void*) &Amalgame_Pollen_Pollen_WhileAddExit,
         (void*) &Amalgame_Pollen_Pollen_OnMessage,
