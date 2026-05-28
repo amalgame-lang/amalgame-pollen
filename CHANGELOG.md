@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.22 — 2026-05-27
+
+### Added — v2 `while` routing (registry-resolved exit)
+- `Pollen.WhileSetExitTopic(topic)` — set the `while` route's EXIT topic. When set (+ LB on), on exit the envelope is rebuilt with that topic and forwarded to a live provider resolved by power-of-two — no static exit targets. The **loop body** still uses `selfHost:selfPort` (passed to `WhileSetup`) so iteration stays on this node deterministically (looping through the registry would bounce between replicas of the loop role).
+- 36 public symbols, 156 assertions.
+
+### Significance
+- **v2 runtime is now complete** : linear `call` (forward_all + LB) + `if` (cond branches by topic, v0.1.20) + `for` (per-item fan-out by topic, v0.1.21) + `while` (loop self + exit by topic, v0.1.22). The reference node `RunV2` wires all four. v1 (`nodes{}` + static targets) still works in parallel.
+- Next : manager editor v2 — render `actions{}` in the DAG + outline + author v2 trees from the UI.
+
+
 ## v0.1.21 — 2026-05-27
 
 ### Added — v2 `for` routing (registry-resolved fan-out per item)
