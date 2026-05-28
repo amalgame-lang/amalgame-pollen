@@ -405,14 +405,77 @@ public class Program {
             let s: JsonValue = steps.Get(i)
             if (!s.IsObject()) { continue }
             if (s.Get("type").AsString() != "while") { continue }
-            let bodyAction: string = Program.ThenAction(s.Get("body"))
-            if (bodyAction != role) { continue }
+            if (!Program.BodyContains(s.Get("body"), role)) { continue }
             if (i == 0) { return "" }
             let prev: JsonValue = steps.Get(i - 1)
             if (prev.IsObject() && prev.Get("type").AsString() == "call") {
                 return prev.Get("action").AsString()
             }
             return ""
+        }
+        return ""
+    }
+
+    // True if `role` is the action of a `call` step anywhere in the
+    // body (single call or any position of a body sequence).
+    public static bool BodyContains(JsonValue bodyV, string role) {
+        if (!bodyV.IsObject()) { return false }
+        let kind: string = bodyV.Get("type").AsString()
+        if (kind == "call") {
+            return bodyV.Get("action").AsString() == role
+        }
+        if (kind == "sequence") {
+            let stepsV: JsonValue = bodyV.Get("steps")
+            if (stepsV.IsArray()) {
+                let steps: List<JsonValue> = stepsV.AsArray()
+                let n: int = steps.Count()
+                for i in 0..n {
+                    let st: JsonValue = steps.Get(i)
+                    if (st.IsObject() && st.Get("type").AsString() == "call"
+                        && st.Get("action").AsString() == role) { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    // If `role` is in some while's body sequence and another call
+    // follows it in that sequence, return that next call's action.
+    // Returns "" if role is the last call in its body sequence, or
+    // if role isn't in any body, or if the body is a single call.
+    public static string FindWhileNext(JsonValue treeV, string role) {
+        if (!treeV.IsObject()) { return "" }
+        if (treeV.Get("type").AsString() != "sequence") { return "" }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return "" }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            let s: JsonValue = steps.Get(i)
+            if (!s.IsObject()) { continue }
+            if (s.Get("type").AsString() != "while") { continue }
+            let bodyV: JsonValue = s.Get("body")
+            if (!bodyV.IsObject()) { continue }
+            if (bodyV.Get("type").AsString() != "sequence") { continue }
+            let bsV: JsonValue = bodyV.Get("steps")
+            if (!bsV.IsArray()) { continue }
+            let bs: List<JsonValue> = bsV.AsArray()
+            let bn: int = bs.Count()
+            for j in 0..bn {
+                let st: JsonValue = bs.Get(j)
+                if (!st.IsObject()) { continue }
+                if (st.Get("type").AsString() != "call") { continue }
+                if (st.Get("action").AsString() != role) { continue }
+                var k: int = j + 1
+                while (k < bn) {
+                    let nx: JsonValue = bs.Get(k)
+                    if (nx.IsObject() && nx.Get("type").AsString() == "call") {
+                        return nx.Get("action").AsString()
+                    }
+                    k = k + 1
+                }
+                return ""
+            }
         }
         return ""
     }
@@ -566,10 +629,26 @@ public class Program {
         if (String_Length(routeDesc) == 0 || routeDesc == "terminal") {
             let ctrlAction: string = Program.FindWhileController(treeV, role)
             if (String_Length(ctrlAction) > 0) {
-                let ctrlTopic: string = Program.ActionTopic(actionsV, ctrlAction)
-                if (String_Length(ctrlTopic) > 0) {
-                    Pollen.WorkflowSetEmitTopic(ctrlTopic)
-                    routeDesc = "while body → emit " + ctrlTopic
+                // Inside a while body : two cases.
+                //   - another call follows in the body sequence
+                //     → emit to THAT next step's topic (intra-body
+                //       linear flow).
+                //   - I'm the last call in the body
+                //     → emit back to the controller's topic so the
+                //       while re-evaluates (closes the loop).
+                let nextInBody: string = Program.FindWhileNext(treeV, role)
+                if (String_Length(nextInBody) > 0) {
+                    let nextTopic: string = Program.ActionTopic(actionsV, nextInBody)
+                    if (String_Length(nextTopic) > 0) {
+                        Pollen.WorkflowSetEmitTopic(nextTopic)
+                        routeDesc = "while body step → emit " + nextTopic
+                    }
+                } else {
+                    let ctrlTopic: string = Program.ActionTopic(actionsV, ctrlAction)
+                    if (String_Length(ctrlTopic) > 0) {
+                        Pollen.WorkflowSetEmitTopic(ctrlTopic)
+                        routeDesc = "while body → emit " + ctrlTopic
+                    }
                 }
             }
         }
