@@ -368,6 +368,28 @@ public class Program {
         return empty
     }
 
+    // Walk a top-level sequence : the step TWO positions after the
+    // `call` of `role` (i.e. what comes after the role's dispatcher
+    // step). Used by `while` to find the exit target.
+    public static JsonValue StepAfterWhile(JsonValue treeV, string role) {
+        let empty: JsonValue = new JsonValue()
+        if (!treeV.IsObject()) { return empty }
+        if (treeV.Get("type").AsString() != "sequence") { return empty }
+        let stepsV: JsonValue = treeV.Get("steps")
+        if (!stepsV.IsArray()) { return empty }
+        let steps: List<JsonValue> = stepsV.AsArray()
+        let n: int = steps.Count()
+        for i in 0..n {
+            let s: JsonValue = steps.Get(i)
+            if (s.IsObject() && s.Get("type").AsString() == "call"
+                && s.Get("action").AsString() == role) {
+                if (i + 2 < n) { return steps.Get(i + 2) }
+                return empty
+            }
+        }
+        return empty
+    }
+
     // The action a `then` (or `do`) clause calls — direct call, or the
     // first call inside a sequence. "" if none.
     public static string ThenAction(JsonValue thenV) {
@@ -470,6 +492,34 @@ public class Program {
                     }
                 }
                 routeDesc = "for ({itemCount} items → {doTopic}, registry-routed)"
+            } else if (kind == "while") {
+                // v2 while : loops back to this node (loop body
+                // rebuilds with emit_topic = self's consume topic).
+                // Exit goes to the next action's topic via registry.
+                var condJson: string = ""
+                let condV: JsonValue = nextStep.Get("cond")
+                if (condV.IsObject()) { condJson = Json.Encode(condV) }
+                var maxIter: int = 100
+                let maxV: JsonValue = nextStep.Get("maxIter")
+                if (maxV.IsInt()) { maxIter = maxV.AsInt() }
+                let iterKey: string = "_wf_iter_" + role
+                // Loop body rebuilds with emit_topic → this action's
+                // own consume topic, then forwards to self host:port
+                // (deterministic — looping through the registry would
+                // bounce between replicas of this role).
+                Pollen.WorkflowSetEmitTopic(myTopic)
+                Pollen.WhileSetup(condJson, iterKey, maxIter, "127.0.0.1", port)
+                let exitStep: JsonValue = Program.StepAfterWhile(treeV, role)
+                var exitDesc: string = "terminal"
+                if (exitStep.IsObject()) {
+                    let exitAction: string = Program.ThenAction(exitStep)
+                    let exitTopic: string = Program.ActionTopic(actionsV, exitAction)
+                    if (String_Length(exitTopic) > 0) {
+                        Pollen.WhileSetExitTopic(exitTopic)
+                        exitDesc = "exit → " + exitTopic
+                    }
+                }
+                routeDesc = "while (maxIter={maxIter}, loop→self, {exitDesc}, registry-routed)"
             }
         }
         Pollen.WorkflowReloadCommit()
