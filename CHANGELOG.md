@@ -2,6 +2,55 @@
 
 ## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
 
+### Added — Pollen v3 runtime loader + AST + name resolver (Phase 2, C-side)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher", §"Memory bounds".
+
+- C-side static buffers in the top-level `@c` block:
+  - `_pollen_v3_ast[4096]` (`POLLEN_MAX_AST_NODES`) — flat AST pool,
+    indexed by int32. Each node carries `kind`, two child slots,
+    `next_sibling` for sequence chains, `goto_kind`/`goto_idx` for
+    resolved targets, and GC-allocated `name` / `expr` / `bind_key`.
+  - `_pollen_v3_entries[256]` (`POLLEN_MAX_ENTRIES`) — entries pool
+    with `name`, `on_topic`, `do_root`, `returns_expr`, `params[8]`.
+  - `_pollen_v3_anchors[4096]` (`POLLEN_MAX_ANCHORS_TOTAL`).
+  - `_pollen_v3_actions[256]` (`POLLEN_MAX_ACTIONS`).
+  - `_pollen_v3_args_pool[1024]` — flat pool for `goto.args[]`.
+- Setter API: `_pollen_v3_reload_begin` → 18 setters → `_pollen_v3_reload_commit`.
+  The commit step runs `_pollen_v3_resolve_gotos`, which walks the
+  AST and links every `goto` node to its target entry / anchor idx.
+- Introspection API: 11 `_pollen_v3_count_*` / `_pollen_v3_node_*`
+  / `_pollen_v3_entry_*` accessors for tests + dispatcher debug.
+
+- AM-side `Pollen.WorkflowLoadV3(path) → bool` walks the JSON via
+  `JsonParser` and drives the C setters. Mirrors the v2 reload
+  pattern (Begin → setters → Commit) — Phase 3's dispatcher will
+  consume the populated buffers directly.
+
+- AM-side introspection wrappers : `WorkflowV3IsActive` /
+  `WorkflowV3EntryCount` / `WorkflowV3AnchorCount` / `WorkflowV3NodeCount` /
+  `WorkflowV3EntryName(eidx)` / `WorkflowV3EntryDoRoot(eidx)` /
+  `WorkflowV3NodeKind(idx)` / `WorkflowV3NodeChild0(idx)` /
+  `WorkflowV3NodeNext(idx)` / `WorkflowV3NodeGotoKind(idx)` /
+  `WorkflowV3NodeGotoIdx(idx)` / `WorkflowV3NodeName(idx)` /
+  `WorkflowV3LoadErrorMsg`.
+
+### Tests
+
+- `tests/v3_loader_smoke.am` (+ `build-v3-loader-smoke.sh`) — loads
+  every v3 example, asserts entries / anchors / actions counts, then
+  walks the feature-demo AST to verify the structural shape
+  (sibling chain + child0 nesting + goto resolution against both
+  entry and anchor targets). 67 assertions, all green.
+
+### Notes
+
+- v2 dispatcher / routing tables stay alive in parallel — this phase
+  is loader-only, no execution yet. Phase 3 wires the tree-walker.
+- Goto resolution happens at commit time ; unresolved targets are
+  flagged in the load-error trail so the dispatcher (Phase 3) can
+  fail-fast even if a workflow slips through the validator.
+
 ### Added — Pollen v3 CEL-lite expression engine (Phase 1, AM-side)
 
 Spec : `docs/proposals/pollen-v3-cel-lite.md`. Lives in `facade.am`.
