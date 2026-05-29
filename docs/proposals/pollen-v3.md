@@ -264,13 +264,17 @@ The v3 validator enforces:
    is never `goto`-targeted → **warn** ("return value will be
    discarded by bus dispatcher").
 6. **Cycle detection**. Statically walk the goto call-graph; any
-   strongly-connected component (recursion) is **rejected at load**
-   unless explicitly opted in via a per-workflow
-   `"allow_recursion": true` flag (not in v0.2.0 — future feature).
+   strongly-connected component (recursion) is **rejected at load**.
+   No opt-in flag in v0.2.0 — recursion is deferred to v4 entirely
+   (decision locked 2026-05-29).
 7. **Depth bound**. The dispatcher's call-stack is capped at
    ~64 frames at runtime; the validator additionally warns if a
    static call-chain exceeds 32 (heuristic for "you might want to
    refactor").
+8. **CEL-lite syntax**. Every `cond` / `value` / `in` expression
+   string must parse cleanly under the CEL-lite grammar (see
+   "Expression language" below). Parse errors are **rejected at
+   load** with the source span pointed at.
 
 ## Runtime architecture — interpreter, not router
 
@@ -325,6 +329,21 @@ the parent + adds its binding.
 - Static cycle detection at validation time prevents trivial
   recursion (A→A or A→B→A) from ever reaching runtime.
 
+### Memory bounds (locked 2026-05-29)
+
+Fixed-size static buffers, no per-dispatch malloc. Overrun → clear
+load-time error with the offending workflow + count. Each bound is
+overridable via env var for advanced users / stress tests.
+
+| Constant | Default | Env override |
+|---|---|---|
+| `POLLEN_MAX_ENTRIES` | 256 per workflow file | `POLLEN_MAX_ENTRIES` |
+| `POLLEN_MAX_ANCHORS_PER_ENTRY` | 64 | `POLLEN_MAX_ANCHORS_PER_ENTRY` |
+| `POLLEN_MAX_AST_NODES` | 4096 per workflow file | `POLLEN_MAX_AST_NODES` |
+| `POLLEN_CALL_STACK_MAX` | 64 frames | `POLLEN_CALL_STACK_MAX` |
+| `POLLEN_MAX_CEL_TOKENS` | 256 per expression | `POLLEN_MAX_CEL_TOKENS` |
+| `POLLEN_MAX_CEL_AST_NODES` | 128 per expression | `POLLEN_MAX_CEL_AST_NODES` |
+
 ### State scoping
 
 - `state.X` reads / writes are **shared across the call-stack
@@ -343,7 +362,7 @@ call.action = "store"
 Lookup actions[].topic → "data.store"
    ↓
 Capability registry: who consumes "data.store"?
-   ├─ 0 providers → drop + log warning (TODO: error mode?)
+   ├─ 0 providers → on_error policy (see below)
    ├─ 1 provider  → send to that one
    ├─ N providers, mode=="one" → power-of-two-choices pick → send to one
    └─ N providers, mode=="all" → send to all
@@ -352,6 +371,99 @@ Capability registry: who consumes "data.store"?
 The registry lookup is **per call invocation**, not per workflow
 load. A provider that comes up mid-run becomes discoverable on the
 next call, without restarting the workflow.
+
+#### `on_error` policy on `call` (locked 2026-05-29)
+
+Each `call` step accepts an optional `on_error` field:
+
+| Value | Behavior on 0 providers |
+|---|---|
+| `"log"` *(default)* | Emit a warning to the bus log, continue the message-chain past this step (the step is treated as if completed with no return value). |
+| `"fail"` | Abort the current message-chain immediately, emit an error log with the goto-chain context. The caller frame's `bind` key is left unset. |
+| `"drop"` | Silently skip the step (no log, no abort). For best-effort fan-out where missing providers are expected. |
+
+For `mode: "all"` with 0 providers, the same policy applies (a
+broadcast to nobody is treated identically to a unicast that can't
+resolve). For `mode: "all"` with N>0 providers where some deliveries
+fail at the transport layer, that's a separate "delivery retry"
+concern (out of scope for v0.2).
+
+## Expression language — CEL-lite (locked 2026-05-29)
+
+v2 used `_pollen_cond_eval_expr` (`facade.am:618`), a small custom
+walker, for conditions in `if.cases[].when`, `while.cond`,
+`for.in`, and `set.value`. v3 upgrades to a documented mini-DSL —
+**CEL-lite** — so expressions are validatable at load time, errors
+are pointable, and the language surface is teachable.
+
+CEL-lite is a strict subset of Google's CEL (Common Expression
+Language). The chosen subset is intentionally small to fit a hand-
+written lexer + Pratt parser + tree-walking evaluator in ~600
+lines of AM, and to keep the AST under `POLLEN_MAX_CEL_AST_NODES`.
+
+### Supported types
+
+- `int` (i64), `float` (f64), `bool`, `string`
+- `list<T>` (homogeneous via runtime check), `null`
+- Path access: `state.X`, `params.X`, `msg.data.X`, dotted chains
+  on json-shaped maps (e.g. `msg.data.user.id`)
+
+### Supported operators
+
+| Class | Operators | Notes |
+|---|---|---|
+| Arithmetic | `+ - * / %` | int+int → int, otherwise float |
+| Comparison | `== != < <= > >=` | strict, no implicit conversion across types |
+| Logical | `&& \|\| !` | short-circuit |
+| String | `+` (concat), `in` (substring + list membership) | |
+| List | `in`, `len(x)`, `x[i]` | indexed read only, no write |
+| Conditional | `cond ? a : b` | both branches type-checked |
+| Grouping | `( )` | |
+
+Precedence follows CEL (same as C). All operators are left-assoc
+except `?:` (right-assoc).
+
+### Supported literals + calls
+
+- Literals: `42`, `3.14`, `"hello"`, `true`, `false`, `null`, `[1,2,3]`
+- Builtins: `len(s)`, `len(list)`, `int(x)`, `float(x)`, `string(x)`,
+  `bool(x)`, `contains(s, sub)`, `startsWith(s, p)`, `endsWith(s, p)`
+- **No** user-defined functions, no closures, no comprehensions, no
+  macros (defer to v4 if requested)
+
+### Examples
+
+```
+// while.cond — loop until queue is drained
+state.queue.len > 0 && state.tries < 5
+
+// if.cases[].when — branch on a JSON field
+msg.data.kind == "user" && msg.data.user.role in ["admin", "owner"]
+
+// for.in — iterate a list expression
+state.candidates
+
+// set.value — compute a new field
+"user-" + string(msg.data.id) + "-" + state.suffix
+```
+
+### Error handling at eval time
+
+- Type mismatch (e.g. `int + string`) → step fails with `on_error`
+  policy (defaults to `"log"` and continues; future: per-step
+  override). The chain is logged with the source span pointed at.
+- Path miss (`state.X` where `X` undefined) → evaluates to `null`,
+  consistent with JSON dotted access. `null` comparison with `==`
+  /`!=` is allowed; with `<` etc. it's a type error.
+- Division by zero → returns `null` (not abort).
+
+### Validator integration
+
+The validator parses every expression string at load time. Parse
+errors are **load-time rejected** (rule 8). Type-checking happens
+at eval time (since `msg.data.X` is unknown statically), but the
+validator does emit warnings for trivially-typed mismatches
+(e.g. `"a" + 1`).
 
 ## UI architecture — flowchart with arrows, not block-nested
 
@@ -399,25 +511,63 @@ function of the AST + the resolved goto-graph. There is no
   we override to dash-style + endpoint highlight to distinguish from
   local sibling-arrows.
 
-### Sub-workflow navigation (tabs)
+### Sub-workflow navigation (list sidebar, locked 2026-05-29)
 
-**Tabs at the top of the canvas, one per entry.** The entry name
-is the tab label. A small bus icon (📡 or similar) on tabs whose
-entry has `on:`; flag icon (🚩) on tabs that are pure-callable.
+**Pivot from the initial tabs proposal.** Tabs imitate a "files open
+in an IDE" mental model, but an entry isn't a file context — it's a
+node in the workflow, often related to others (goto inbound, called-by).
+The list shape scales to 50+ entries with search + fold and lets us
+show rich per-entry metadata permanently (badge `📡` for bus-triggered,
+`🚩` for callable-only, `called by N`, `dead` warning). Tab-bars
+truncate to a label and scroll horizontally past 10–12 entries.
 
-- Active tab shows the entry's AST as a flowchart.
-- A goto step in the canvas is clickable: clicking jumps to the
-  target's tab + scrolls to the target step.
+**Left sidebar** lists every entry, grouped:
+
+```
+┌─────────────────────────┐
+│ [Search…]               │
+├─────────────────────────┤
+│ 📡 Bus-triggered     ▼  │
+│   ▸ via-cron         3  │
+│   ▸ via-http-hook    1  │
+├─────────────────────────┤
+│ 🚩 Callable          ▼  │
+│   ▸ shared-pipeline 12  │
+│   ▸ after-fetch      5  │
+├─────────────────────────┤
+│ ⚠ Dead (unreachable) ▶  │
+└─────────────────────────┘
+```
+
+Per-row metadata:
+- Badge `📡` if the entry has `on:`, `🚩` if pure-callable.
+- Right-aligned number = inbound `goto` count.
+- Italic + `⚠` if the entry is unreachable (validator rule 2).
+- Dot indicator if the entry is currently being debugged (Phase 5 debug mode).
+
+Anchors fold under their parent entry as nested rows (depth-1):
+```
+▸ shared-pipeline       12
+    🚩 after-fetch       5
+    🚩 cleanup           2
+```
+
+Group headers (`📡 Bus-triggered`, `🚩 Callable`, `⚠ Dead`) are
+foldable. Search box filters by entry/anchor name with substring
+match. State persisted in localStorage per workflow file.
+
+- Selecting a sidebar row swaps the canvas to that entry's flowchart.
+- A `goto` step in the canvas is clickable: clicking selects the
+  target's sidebar row + scrolls the canvas to the target step.
 - Breadcrumb above the canvas shows the goto call-stack when the
   manager is in step-by-step debug mode: `via-cron → shared-pipeline → after-fetch`.
 
-When the number of entries grows beyond ~10-15, the tab bar may
-get crowded. **Mitigation deferred to v4**:
-- Search/filter entries
-- Group tabs into folders
-- Switch to sidebar tree view as an opt-in
-For v3 release, accept the tab-bar growth and document the
-"refactor into multiple workflow files" pattern as the scaling story.
+No schema change required — sidebar UI is a pure function of the
+loaded workflow (entries[] + anchor names + goto-graph + validator
+output). When the number of entries grows past ~50 in a single file,
+the docs recommend splitting into multiple workflow files (each file
+remains a self-contained unit; cross-file goto is **not** supported
+in v0.2 — kept as an open question for v4).
 
 ### Folding
 
@@ -431,14 +581,20 @@ keyed by path.
 
 ## Implementation phases
 
-### Phase 1 — Schema v3 spec + validator + examples
-**Time**: 2-3 days
+### Phase 1 — Schema v3 spec + validator + CEL-lite + examples
+**Time**: 4-6 days *(grown from 2-3d: CEL-lite added per Q4 decision)*
 
-- [ ] Lock the v3 schema (this doc).
-- [ ] Write a v3 validator in AM (`facade.am` — `WorkflowValidateV3`).
-- [ ] Convert all v2 examples in `examples/` to v3 equivalents.
-- [ ] Write a v2 → v3 migration script.
-- [ ] Static cycle detection across `goto` call-graph.
+- [x] Lock the v3 schema (this doc).
+- [ ] CEL-lite lexer + Pratt parser + tree-walking evaluator in AM
+      (`src/v3/cel.am`), under `POLLEN_MAX_CEL_*` bounds.
+- [ ] Write a v3 validator in AM (`facade.am` — `WorkflowValidateV3`),
+      enforcing rules 1–8 incl. CEL-lite parse + static cycle detection
+      (DFS strongly-connected-components on the goto call-graph).
+- [ ] Convert all v2 examples in `examples/` to v3 equivalents (target
+      5–10 covering: nested for/while/if, multi-entry, dual-mode,
+      anchors, mid-body resume via goto, `call.mode: all`, `on_error`).
+- [ ] Write a v2 → v3 migration script (preserves semantics, emits
+      goto/anchor as needed, fails loudly on patterns it can't translate).
 
 ### Phase 2 — v3 loader + AST + name resolver in runtime
 **Time**: 3-5 days
@@ -502,25 +658,23 @@ keyed by path.
 
 **Total**: ~4 weeks of focused work.
 
-## Open questions to settle before Phase 2
+## Resolved decisions (2026-05-29 session)
 
-1. **State scoping precise semantics**. Shared across one
-   bus-message lifetime is the proposal. Confirmed? Or do we want
-   per-goto-frame state copies that merge on return?
-2. **Error handling on `call` 0-providers**. Drop silently (today),
-   drop + log, fail the message-chain explicitly? Probably needs a
-   per-workflow `on_error` policy.
-3. **Recursion opt-in**. v0.2.0 rejects all recursion at validation.
-   Should we allow opt-in via `"allow_recursion": true` for advanced
-   users? Or defer to v4?
-4. **Expression language**. Today `cond` strings use a custom walker
-   (`_pollen_cond_eval_expr` at `facade.am:618`). Sufficient for v3?
-   Or upgrade to a small embedded DSL (e.g. CEL-lite)?
-5. **Binary persistence**. The AST + call-stack + name-resolver
-   buffers — what's the upper bound? `POLLEN_MAX_*` constants need
-   updating.
-6. **Tabs scaling beyond 10-15 entries**. Search? Folders? Sidebar
-   tree opt-in? Or just document "split into multiple files"?
+The six open questions are locked. Each links to the section that
+bakes the choice into the spec.
+
+| # | Question | Decision | Where in this doc |
+|---|---|---|---|
+| 1 | State scoping with gotos | **Shared bus-message lifetime.** `state.X` is a per-message blackboard visible across all call-stack frames; `params[]` is frame-local. | "State scoping" |
+| 2 | `call` 0-providers behavior | **Drop + log by default**, per-step `on_error: "log" \| "fail" \| "drop"` override. No workflow-level policy. | "`call` resolution" → "`on_error` policy" |
+| 3 | Recursion opt-in | **Defer to v4 entirely.** v0.2 rejects all cycles at load (DFS SCC on goto call-graph). No `allow_recursion` flag. | Validator rule 6 |
+| 4 | Expression language | **CEL-lite.** Hand-written lexer + Pratt parser + tree-walking evaluator AM-side. Strict CEL subset, ~600 LOC target. Documented grammar + supported types + builtins. | "Expression language — CEL-lite" |
+| 5 | Memory bounds | **Fixed-size static buffers**, default constants tunable via env var. entries=256, anchors/entry=64, AST=4096, callstack=64, CEL tokens=256, CEL AST=128. | "Memory bounds" |
+| 6 | UI tabs scaling | **Pivot from tabs to list sidebar (left).** Grouped by trigger type, foldable, with rich metadata (badges, called-by counts). Scales to 50+; recommend file split beyond. | "Sub-workflow navigation (list sidebar)" |
+
+These six were the gating items for Phase 2. Phase 1 scope grew from
+2-3d to 4-6d to accommodate the CEL-lite lexer/parser/eval — see
+Implementation phases.
 
 ## Compatibility
 
