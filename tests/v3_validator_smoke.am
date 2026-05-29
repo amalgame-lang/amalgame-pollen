@@ -1,0 +1,76 @@
+// tests/v3_validator_smoke.am
+//
+// Pollen v3 Phase 1 — smoke test for Pollen.WorkflowValidateV3.
+//
+// Loads every examples/workflow-v3-*.json file shipped with this
+// package, runs the validator, and asserts each one comes back
+// with zero error-level diagnostics. Warnings are allowed.
+//
+// Run :
+//   ./tests/build-v3-validator-smoke.sh
+//   ./tests/v3_validator_smoke
+//
+// Exit code 0 = all green, 1 = at least one example failed.
+
+import Amalgame.Pollen
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+
+    public static int CountErrors(diags: List<string>) {
+        let n: int = diags.Count()
+        var nErr: int = 0
+        for i in 0..n {
+            let d: string = diags.Get(i)
+            // Diags are formatted "[severity ruleN] path: msg" ; an
+            // entry is an error iff its severity prefix says so.
+            if (String_StartsWith(d, "[error ")) { nErr = nErr + 1 }
+        }
+        return nErr
+    }
+
+    public static bool RunOne(path: string) {
+        Console.WriteLine("── {path}")
+        let diags: List<string> = Pollen.WorkflowValidateV3(path)
+        let nErr: int = Program.CountErrors(diags)
+        let nTotal: int = diags.Count()
+        let nWarn: int = nTotal - nErr
+        if (nTotal > 0) {
+            for i in 0..nTotal {
+                Console.WriteLine("    " + diags.Get(i))
+            }
+        }
+        let errStr: string = String_FromInt(nErr)
+        let warnStr: string = String_FromInt(nWarn)
+        Console.WriteLine("  → {errStr} errors, {warnStr} warnings")
+        return nErr == 0
+    }
+
+    public static void Main(string[] args) {
+        let examples: List<string> = new List<string>()
+        examples.Add("examples/workflow-v3-linear.json")
+        examples.Add("examples/workflow-v3-if.json")
+        examples.Add("examples/workflow-v3-for.json")
+        examples.Add("examples/workflow-v3-while.json")
+        examples.Add("examples/workflow-v3-control-flow.json")
+        examples.Add("examples/workflow-v3-call-modes.json")
+        examples.Add("examples/workflow-v3-multi-entry.json")
+        examples.Add("examples/workflow-v3-anchor-resume.json")
+        examples.Add("examples/workflow-v3-feature-demo.json")
+
+        let n: int = examples.Count()
+        var allOK: bool = true
+        for i in 0..n {
+            let p: string = examples.Get(i)
+            if (!Program.RunOne(p)) { allOK = false }
+        }
+
+        if (allOK) {
+            Console.WriteLine("OK — all v3 examples validate clean")
+        } else {
+            Console.WriteLine("FAIL — at least one example has errors")
+        }
+    }
+}

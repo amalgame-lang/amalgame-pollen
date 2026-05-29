@@ -4,3 +4,6 @@
 
 # amc local package cache
 /.amalgame-cache/
+
+# v3 validator smoke test binary (built by tests/build-v3-validator-smoke.sh)
+/tests/v3_validator_smoke
