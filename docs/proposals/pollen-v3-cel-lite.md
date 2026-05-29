@@ -131,11 +131,18 @@ intermediate node is a runtime value, not an expressible type.
 
 ### Path access (`.` chain)
 
-- Roots: `state`, `params`, `msg`. Anything else as an ident at the
-  root of a path → parse error (caught at validation, rule 8).
-- `state.X` reads the bus-message-lifetime blackboard; `params.X`
-  reads the current frame's bound params; `msg.data.X` walks the
-  envelope.
+- **Well-known roots**: `state`, `params`, `msg`.
+  - `state.X` reads the bus-message-lifetime blackboard.
+  - `params.X` reads the current frame's bound params.
+  - `msg.data.X` walks the bus envelope.
+- **Loop-bound roots**: every enclosing `for.var` binding contributes
+  a path root for the duration of its body. Example: `for var "item"
+  in state.items do { ... }` binds `item` as a root inside the body,
+  so `item.priority > 5` parses cleanly.
+- Anything else as an ident at the root of a path is parse-permissive
+  but evaluates to `null` at runtime (consistent with JSON path miss).
+  The validator emits a **warn** for unknown roots (typo signal:
+  `stat.X` likely means `state.X`).
 - Missing intermediate key → the whole path evaluates to `null`,
   no error (JSON dotted convention).
 - A path can have at most 8 segments after the root (configurable).

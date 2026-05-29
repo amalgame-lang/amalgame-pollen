@@ -1,0 +1,28 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-while-demo",
+  "version": 1,
+  "actions": {
+    "ingest": { "topic": "order.in" },
+    "retry":  { "topic": "order.retry" },
+    "done":   { "topic": "order.done" }
+  },
+  "entries": [
+    {
+      "name": "main",
+      "on":   "order.in",
+      "do":   [
+        { "type": "call", "action": "ingest" },
+        { "type": "while",
+          "cond":    "state.tries < 5 && state.last_status != 200",
+          "maxIter": 5,
+          "do":      [
+            { "type": "call", "action": "retry" },
+            { "type": "set", "key": "state.tries",
+              "value": "(state.tries == null ? 0 : state.tries) + 1" }
+          ] },
+        { "type": "call", "action": "done" }
+      ]
+    }
+  ]
+}
