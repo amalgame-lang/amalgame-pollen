@@ -3175,6 +3175,1229 @@ import Amalgame.String
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+//  Pollen v3 — CEL-lite expression language
+// ─────────────────────────────────────────────────────────────────
+//
+// Spec : docs/proposals/pollen-v3-cel-lite.md. Three blocks below :
+//   1. Lexer            — char-by-char tokenizer
+//   2. Pratt parser     — precedence table → AST nodes (indexed)
+//   3. Tree-walking eval — operates on a tagged-union value
+//
+// Validator rule 8 invokes Lex+Parse for every expression field;
+// the evaluator is exposed for runtime use (Phase 3 dispatcher).
+
+// ── Token / node / value kinds ───────────────────────────────────
+
+public enum CelTokKind {
+    Int      // i64 literal
+    Float    // f64 literal
+    Str      // string literal
+    Bool     // true / false
+    Null     // null
+    Ident    // identifier
+    LParen   // (
+    RParen   // )
+    LBrack   // [
+    RBrack   // ]
+    Comma    // ,
+    Dot      // .
+    Question // ?
+    Colon    // :
+    Plus     // +
+    Minus    // -
+    Star     // *
+    Slash    // /
+    Percent  // %
+    Eq       // ==
+    Neq      // !=
+    Lt       // <
+    Le       // <=
+    Gt       // >
+    Ge       // >=
+    And      // &&
+    Or       // ||
+    Not      // !
+    In       // in
+    Eof
+}
+
+public enum CelNodeKind {
+    LitInt
+    LitFloat
+    LitStr
+    LitBool
+    LitNull
+    Ident       // bare identifier (well-known root or builtin name)
+    Call        // identifier(args...)
+    List_       // [a, b, c]
+    Unary       // -x, !x
+    Binary      // arithmetic / comparison / logical / `in`
+    Index       // a[i]
+    DotAccess   // a.b
+    Ternary     // c ? t : f
+}
+
+public enum CelValKind {
+    Null
+    Bool
+    Int
+    Float
+    Str
+    List_
+}
+
+// ── CelToken ─────────────────────────────────────────────────────
+
+public class CelToken {
+    public Kind:     CelTokKind
+    public Text:     string
+    public IntVal:   int
+    public FloatVal: float
+    public StrVal:   string   // unescaped payload for CelTokKind.Str
+    public Col:      int
+
+    public CelToken(kind: CelTokKind, text: string, col: int) {
+        this.Kind     = kind
+        this.Text     = text
+        this.IntVal   = 0
+        this.FloatVal = 0.0
+        this.StrVal   = ""
+        this.Col      = col
+    }
+}
+
+// ── CelLexer ─────────────────────────────────────────────────────
+//
+// Produces a List<CelToken>. On failure, sets Failed + ErrMsg/ErrCol
+// and stops emitting. Caller checks HasFailed() before parsing.
+// Max token count enforced via POLLEN_MAX_CEL_TOKENS (256).
+
+public class CelLexer {
+    private Source: string
+    private Pos:    int
+    private Failed: bool
+    private ErrMsg: string
+    private ErrCol: int
+
+    public CelLexer(string source) {
+        this.Source = source
+        this.Pos    = 0
+        this.Failed = false
+        this.ErrMsg = ""
+        this.ErrCol = 0
+    }
+
+    public bool   HasFailed() { return this.Failed }
+    public string ErrorMsg()  { return this.ErrMsg }
+    public int    ErrorCol()  { return this.ErrCol }
+
+    private void Fail(string msg) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.ErrMsg = msg
+        this.ErrCol = this.Pos
+    }
+
+    private bool AtEnd() { return this.Pos >= String_Length(this.Source) }
+
+    private string Peek() {
+        if (this.AtEnd()) { return "" }
+        return String_CharAt1(this.Source, this.Pos)
+    }
+
+    private string PeekAt(int off) {
+        let i: int = this.Pos + off
+        if (i < 0)                            { return "" }
+        if (i >= String_Length(this.Source))  { return "" }
+        return String_CharAt1(this.Source, i)
+    }
+
+    private string Advance() {
+        if (this.AtEnd()) { return "" }
+        let c: string = String_CharAt1(this.Source, this.Pos)
+        this.Pos = this.Pos + 1
+        return c
+    }
+
+    private static bool IsDigit(string c) {
+        if (String_Length(c) == 0) { return false }
+        return String_IndexOf("0123456789", c) >= 0
+    }
+
+    private static bool IsAlpha(string c) {
+        if (String_Length(c) == 0) { return false }
+        if (c == "_") { return true }
+        if (String_IndexOf("abcdefghijklmnopqrstuvwxyz", c) >= 0) { return true }
+        if (String_IndexOf("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0) { return true }
+        return false
+    }
+
+    private static bool IsAlphaNum(string c) {
+        return CelLexer.IsAlpha(c) || CelLexer.IsDigit(c)
+    }
+
+    public List<CelToken> Lex() {
+        let toks: List<CelToken> = new List<CelToken>()
+        while (!this.AtEnd() && !this.Failed) {
+            let c: string = this.Peek()
+            // whitespace
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+                this.Advance()
+                continue
+            }
+            let startCol: int = this.Pos
+
+            // identifier / keyword
+            if (CelLexer.IsAlpha(c)) {
+                var s: string = ""
+                while (!this.AtEnd() && CelLexer.IsAlphaNum(this.Peek())) {
+                    s = s + this.Advance()
+                }
+                if (s == "true") {
+                    let t: CelToken = new CelToken(CelTokKind.Bool, s, startCol)
+                    t.IntVal = 1
+                    toks.Add(t)
+                } else if (s == "false") {
+                    let t: CelToken = new CelToken(CelTokKind.Bool, s, startCol)
+                    t.IntVal = 0
+                    toks.Add(t)
+                } else if (s == "null") {
+                    toks.Add(new CelToken(CelTokKind.Null, s, startCol))
+                } else if (s == "in") {
+                    toks.Add(new CelToken(CelTokKind.In, s, startCol))
+                } else {
+                    toks.Add(new CelToken(CelTokKind.Ident, s, startCol))
+                }
+                continue
+            }
+
+            // number — int or float
+            if (CelLexer.IsDigit(c)) {
+                var intPart: string = ""
+                while (!this.AtEnd() && CelLexer.IsDigit(this.Peek())) {
+                    intPart = intPart + this.Advance()
+                }
+                if (this.Peek() == "." && CelLexer.IsDigit(this.PeekAt(1))) {
+                    var fracPart: string = "" + this.Advance() // '.'
+                    while (!this.AtEnd() && CelLexer.IsDigit(this.Peek())) {
+                        fracPart = fracPart + this.Advance()
+                    }
+                    let raw: string = intPart + fracPart
+                    let t: CelToken = new CelToken(CelTokKind.Float, raw, startCol)
+                    t.FloatVal = String_ToFloat(raw)
+                    toks.Add(t)
+                } else {
+                    // Detect i64 overflow at lex time.
+                    let n: int = String_Length(intPart)
+                    if (n > 19) {
+                        this.Fail("integer literal overflows i64 (max 19 digits)")
+                        return toks
+                    }
+                    let t: CelToken = new CelToken(CelTokKind.Int, intPart, startCol)
+                    t.IntVal = String_ToInt(intPart)
+                    toks.Add(t)
+                }
+                continue
+            }
+
+            // string literal — only \" \\ \n \t escapes
+            if (c == "\"") {
+                this.Advance()
+                var s: string = ""
+                var closed: bool = false
+                while (!this.AtEnd()) {
+                    let ch: string = this.Peek()
+                    if (ch == "\"") { this.Advance(); closed = true; break }
+                    if (ch == "\n") {
+                        this.Fail("newline inside string literal")
+                        return toks
+                    }
+                    if (ch == "\\") {
+                        this.Advance()
+                        if (this.AtEnd()) {
+                            this.Fail("unterminated escape in string literal")
+                            return toks
+                        }
+                        let esc: string = this.Advance()
+                        if      (esc == "\"") { s = s + "\"" }
+                        else if (esc == "\\") { s = s + "\\" }
+                        else if (esc == "n")  { s = s + "\n" }
+                        else if (esc == "t")  { s = s + "\t" }
+                        else {
+                            this.Fail("invalid escape '\\" + esc + "'")
+                            return toks
+                        }
+                        continue
+                    }
+                    s = s + this.Advance()
+                }
+                if (!closed) {
+                    this.Fail("unterminated string literal")
+                    return toks
+                }
+                let t: CelToken = new CelToken(CelTokKind.Str, "\"" + s + "\"", startCol)
+                t.StrVal = s
+                toks.Add(t)
+                continue
+            }
+
+            // two-char operators
+            if (c == "=" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Eq, "==", startCol))
+                continue
+            }
+            if (c == "!" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Neq, "!=", startCol))
+                continue
+            }
+            if (c == "<" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Le, "<=", startCol))
+                continue
+            }
+            if (c == ">" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Ge, ">=", startCol))
+                continue
+            }
+            if (c == "&" && this.PeekAt(1) == "&") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.And, "&&", startCol))
+                continue
+            }
+            if (c == "|" && this.PeekAt(1) == "|") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Or, "||", startCol))
+                continue
+            }
+
+            // single-char punctuation / operators
+            this.Advance()
+            if      (c == "(") { toks.Add(new CelToken(CelTokKind.LParen,   c, startCol)) }
+            else if (c == ")") { toks.Add(new CelToken(CelTokKind.RParen,   c, startCol)) }
+            else if (c == "[") { toks.Add(new CelToken(CelTokKind.LBrack,   c, startCol)) }
+            else if (c == "]") { toks.Add(new CelToken(CelTokKind.RBrack,   c, startCol)) }
+            else if (c == ",") { toks.Add(new CelToken(CelTokKind.Comma,    c, startCol)) }
+            else if (c == ".") { toks.Add(new CelToken(CelTokKind.Dot,      c, startCol)) }
+            else if (c == "?") { toks.Add(new CelToken(CelTokKind.Question, c, startCol)) }
+            else if (c == ":") { toks.Add(new CelToken(CelTokKind.Colon,    c, startCol)) }
+            else if (c == "+") { toks.Add(new CelToken(CelTokKind.Plus,     c, startCol)) }
+            else if (c == "-") { toks.Add(new CelToken(CelTokKind.Minus,    c, startCol)) }
+            else if (c == "*") { toks.Add(new CelToken(CelTokKind.Star,     c, startCol)) }
+            else if (c == "/") { toks.Add(new CelToken(CelTokKind.Slash,    c, startCol)) }
+            else if (c == "%") { toks.Add(new CelToken(CelTokKind.Percent,  c, startCol)) }
+            else if (c == "<") { toks.Add(new CelToken(CelTokKind.Lt,       c, startCol)) }
+            else if (c == ">") { toks.Add(new CelToken(CelTokKind.Gt,       c, startCol)) }
+            else if (c == "!") { toks.Add(new CelToken(CelTokKind.Not,      c, startCol)) }
+            else {
+                this.Fail("unexpected character '" + c + "'")
+                return toks
+            }
+        }
+
+        // POLLEN_MAX_CEL_TOKENS bound check.
+        if (toks.Count() > 256) {
+            this.Fail("expression exceeds POLLEN_MAX_CEL_TOKENS (256)")
+            return toks
+        }
+
+        toks.Add(new CelToken(CelTokKind.Eof, "", this.Pos))
+        return toks
+    }
+}
+
+// ── CelNode (AST) ────────────────────────────────────────────────
+//
+// Nodes live in an indexed pool (CelParser.Nodes). Children refer
+// to siblings by integer index, never by direct reference, so the
+// tree is array-of-struct friendly + cheap to walk.
+//
+// Fields used per Kind :
+//
+//   LitInt    IntVal
+//   LitFloat  FloatVal
+//   LitStr    StrVal
+//   LitBool   BoolVal
+//   LitNull   —
+//   Ident     StrVal=name
+//   Call      StrVal=name, Args=arg node idxs
+//   List_     Args=elem node idxs
+//   Unary     OpTok, Left=child
+//   Binary    OpTok, Left, Right
+//   Index     Left=collection, Right=index expr
+//   DotAccess Left=lhs,        StrVal=field name
+//   Ternary   Left=cond,       Mid=then, Right=else
+
+public class CelNode {
+    public Kind:     CelNodeKind
+    public IntVal:   int
+    public FloatVal: float
+    public StrVal:   string
+    public BoolVal:  bool
+    public OpTok:    CelTokKind   // operator for Unary / Binary
+    public Left:     int          // child index, -1 if absent
+    public Right:    int
+    public Mid:      int          // for Ternary
+    public Args:     List<int>
+    public Col:      int
+
+    public CelNode(CelNodeKind kind, int col) {
+        this.Kind     = kind
+        this.IntVal   = 0
+        this.FloatVal = 0.0
+        this.StrVal   = ""
+        this.BoolVal  = false
+        this.OpTok    = CelTokKind.Eof
+        this.Left     = -1
+        this.Right    = -1
+        this.Mid      = -1
+        this.Args     = new List<int>()
+        this.Col      = col
+    }
+}
+
+// ── CelParser (Pratt) ────────────────────────────────────────────
+//
+// One precedence table + one parse_expr(minPrec) routine drives all
+// binary ops. Unary / postfix / primary are dispatched explicitly.
+// AST nodes are allocated from a private List<CelNode>; the root
+// node index is returned by Parse(). Bound : POLLEN_MAX_CEL_AST_NODES
+// (128) — anything bigger rejects at parse time.
+
+public class CelParser {
+    private Tokens: List<CelToken>
+    private Pos:    int
+    public  Nodes:  List<CelNode>
+    private Failed: bool
+    private ErrMsg: string
+    private ErrCol: int
+
+    public CelParser(List<CelToken> tokens) {
+        this.Tokens = tokens
+        this.Pos    = 0
+        this.Nodes  = new List<CelNode>()
+        this.Failed = false
+        this.ErrMsg = ""
+        this.ErrCol = 0
+    }
+
+    public bool   HasFailed() { return this.Failed }
+    public string ErrorMsg()  { return this.ErrMsg }
+    public int    ErrorCol()  { return this.ErrCol }
+
+    private void Fail(string msg, int col) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.ErrMsg = msg
+        this.ErrCol = col
+    }
+
+    private CelToken Peek() {
+        return this.Tokens.Get(this.Pos)
+    }
+
+    private CelToken PeekAt(int off) {
+        let i: int = this.Pos + off
+        if (i < 0 || i >= this.Tokens.Count()) {
+            return this.Tokens.Get(this.Tokens.Count() - 1) // Eof
+        }
+        return this.Tokens.Get(i)
+    }
+
+    private CelToken Advance() {
+        let t: CelToken = this.Tokens.Get(this.Pos)
+        if (this.Pos < this.Tokens.Count() - 1) { this.Pos = this.Pos + 1 }
+        return t
+    }
+
+    private bool Accept(CelTokKind k) {
+        if (this.Peek().Kind == k) { this.Advance(); return true }
+        return false
+    }
+
+    private bool Expect(CelTokKind k, string what) {
+        let t: CelToken = this.Peek()
+        if (t.Kind != k) {
+            this.Fail("expected " + what + ", got '" + t.Text + "'", t.Col)
+            return false
+        }
+        this.Advance()
+        return true
+    }
+
+    private int AddNode(CelNode n) {
+        if (this.Nodes.Count() >= 128) {
+            this.Fail("expression exceeds POLLEN_MAX_CEL_AST_NODES (128)", n.Col)
+            return -1
+        }
+        this.Nodes.Add(n)
+        return this.Nodes.Count() - 1
+    }
+
+    // Map a binary operator token to its precedence (1 = lowest).
+    // 0 means "not a binary op at this position".
+    private static int OpPrec(CelTokKind k) {
+        if (k == CelTokKind.Or)                                 { return 2 }
+        if (k == CelTokKind.And)                                { return 3 }
+        if (k == CelTokKind.Eq || k == CelTokKind.Neq)          { return 4 }
+        if (k == CelTokKind.Lt || k == CelTokKind.Le ||
+            k == CelTokKind.Gt || k == CelTokKind.Ge ||
+            k == CelTokKind.In)                                 { return 5 }
+        if (k == CelTokKind.Plus  || k == CelTokKind.Minus)     { return 6 }
+        if (k == CelTokKind.Star  || k == CelTokKind.Slash ||
+            k == CelTokKind.Percent)                            { return 7 }
+        return 0
+    }
+
+    // Top-level entry. Returns root node index, or -1 on failure.
+    public int Parse() {
+        let root: int = this.ParseExpr(1)
+        if (this.Failed) { return -1 }
+        if (this.Peek().Kind != CelTokKind.Eof) {
+            let t: CelToken = this.Peek()
+            this.Fail("trailing tokens after expression: '" + t.Text + "'", t.Col)
+            return -1
+        }
+        return root
+    }
+
+    // Pratt loop : parse a unary, then fold binary ops with prec >= minPrec.
+    // Handles the ternary `? :` at the lowest precedence as a special case.
+    private int ParseExpr(int minPrec) {
+        if (this.Failed) { return -1 }
+        var lhs: int = this.ParseUnary()
+        if (this.Failed) { return -1 }
+        while (!this.Failed) {
+            let k: CelTokKind = this.Peek().Kind
+            let prec: int = CelParser.OpPrec(k)
+            if (prec == 0 || prec < minPrec) { break }
+            let opCol: int = this.Peek().Col
+            this.Advance()
+            let rhs: int = this.ParseExpr(prec + 1) // left-assoc
+            if (this.Failed) { return -1 }
+            let n: CelNode = new CelNode(CelNodeKind.Binary, opCol)
+            n.OpTok = k
+            n.Left  = lhs
+            n.Right = rhs
+            lhs = this.AddNode(n)
+            if (this.Failed) { return -1 }
+        }
+        // Ternary `cond ? then : else` — right-assoc, lowest prec.
+        if (minPrec <= 1 && this.Peek().Kind == CelTokKind.Question) {
+            let qCol: int = this.Peek().Col
+            this.Advance()
+            let thenIdx: int = this.ParseExpr(1)
+            if (this.Failed) { return -1 }
+            if (!this.Expect(CelTokKind.Colon, "':' in ternary")) { return -1 }
+            let elseIdx: int = this.ParseExpr(1)
+            if (this.Failed) { return -1 }
+            let n: CelNode = new CelNode(CelNodeKind.Ternary, qCol)
+            n.Left  = lhs
+            n.Mid   = thenIdx
+            n.Right = elseIdx
+            lhs = this.AddNode(n)
+        }
+        return lhs
+    }
+
+    private int ParseUnary() {
+        let t: CelToken = this.Peek()
+        if (t.Kind == CelTokKind.Not || t.Kind == CelTokKind.Minus) {
+            this.Advance()
+            let child: int = this.ParseUnary()
+            if (this.Failed) { return -1 }
+            let n: CelNode = new CelNode(CelNodeKind.Unary, t.Col)
+            n.OpTok = t.Kind
+            n.Left  = child
+            return this.AddNode(n)
+        }
+        return this.ParsePostfix()
+    }
+
+    private int ParsePostfix() {
+        var lhs: int = this.ParsePrimary()
+        if (this.Failed) { return -1 }
+        while (!this.Failed) {
+            let k: CelTokKind = this.Peek().Kind
+            if (k == CelTokKind.Dot) {
+                let dotCol: int = this.Peek().Col
+                this.Advance()
+                let id: CelToken = this.Peek()
+                if (id.Kind != CelTokKind.Ident) {
+                    this.Fail("expected identifier after '.'", id.Col)
+                    return -1
+                }
+                this.Advance()
+                let n: CelNode = new CelNode(CelNodeKind.DotAccess, dotCol)
+                n.Left   = lhs
+                n.StrVal = id.Text
+                lhs = this.AddNode(n)
+            } else if (k == CelTokKind.LBrack) {
+                let brCol: int = this.Peek().Col
+                this.Advance()
+                let idx: int = this.ParseExpr(1)
+                if (this.Failed) { return -1 }
+                if (!this.Expect(CelTokKind.RBrack, "']'")) { return -1 }
+                let n: CelNode = new CelNode(CelNodeKind.Index, brCol)
+                n.Left  = lhs
+                n.Right = idx
+                lhs = this.AddNode(n)
+            } else {
+                break
+            }
+        }
+        return lhs
+    }
+
+    private int ParsePrimary() {
+        let t: CelToken = this.Peek()
+        if (t.Kind == CelTokKind.Int) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitInt, t.Col)
+            n.IntVal = t.IntVal
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Float) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitFloat, t.Col)
+            n.FloatVal = t.FloatVal
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Str) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitStr, t.Col)
+            n.StrVal = t.StrVal
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Bool) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitBool, t.Col)
+            n.BoolVal = t.IntVal != 0
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Null) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitNull, t.Col)
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.LParen) {
+            this.Advance()
+            let inner: int = this.ParseExpr(1)
+            if (this.Failed) { return -1 }
+            if (!this.Expect(CelTokKind.RParen, "')'")) { return -1 }
+            return inner
+        }
+        if (t.Kind == CelTokKind.LBrack) {
+            let brCol: int = t.Col
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.List_, brCol)
+            if (this.Peek().Kind != CelTokKind.RBrack) {
+                while (true) {
+                    let it: int = this.ParseExpr(1)
+                    if (this.Failed) { return -1 }
+                    n.Args.Add(it)
+                    if (this.Peek().Kind == CelTokKind.Comma) { this.Advance(); continue }
+                    break
+                }
+            }
+            if (!this.Expect(CelTokKind.RBrack, "']' in list literal")) { return -1 }
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Ident) {
+            this.Advance()
+            // call vs bare ident
+            if (this.Peek().Kind == CelTokKind.LParen) {
+                this.Advance()
+                let n: CelNode = new CelNode(CelNodeKind.Call, t.Col)
+                n.StrVal = t.Text
+                if (this.Peek().Kind != CelTokKind.RParen) {
+                    while (true) {
+                        let a: int = this.ParseExpr(1)
+                        if (this.Failed) { return -1 }
+                        n.Args.Add(a)
+                        if (this.Peek().Kind == CelTokKind.Comma) { this.Advance(); continue }
+                        break
+                    }
+                }
+                if (!this.Expect(CelTokKind.RParen, "')' in call")) { return -1 }
+                return this.AddNode(n)
+            }
+            let n: CelNode = new CelNode(CelNodeKind.Ident, t.Col)
+            n.StrVal = t.Text
+            return this.AddNode(n)
+        }
+        this.Fail("unexpected token '" + t.Text + "' in expression", t.Col)
+        return -1
+    }
+}
+
+// ── CelValue (runtime tagged union) ──────────────────────────────
+//
+// Used by CelEval. Mirrors the type system in cel-lite.md §4.
+// List elements are themselves CelValue (so heterogeneous lists are
+// representable — the eval reports them as type errors per spec).
+
+public class CelValue {
+    public Kind:   CelValKind
+    public B:      bool
+    public I:      int
+    public F:      float
+    public S:      string
+    public Items:  List<CelValue>
+
+    public CelValue() {
+        this.Kind  = CelValKind.Null
+        this.B     = false
+        this.I     = 0
+        this.F     = 0.0
+        this.S     = ""
+        this.Items = new List<CelValue>()
+    }
+
+    public bool IsNull()  { return this.Kind == CelValKind.Null }
+    public bool IsBool()  { return this.Kind == CelValKind.Bool }
+    public bool IsInt()   { return this.Kind == CelValKind.Int }
+    public bool IsFloat() { return this.Kind == CelValKind.Float }
+    public bool IsStr()   { return this.Kind == CelValKind.Str }
+    public bool IsList()  { return this.Kind == CelValKind.List_ }
+
+    public static CelValue Null_() {
+        return new CelValue()
+    }
+    public static CelValue Bool_(bool b) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Bool
+        v.B    = b
+        return v
+    }
+    public static CelValue Int_(int n) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Int
+        v.I    = n
+        return v
+    }
+    public static CelValue Float_(float f) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Float
+        v.F    = f
+        return v
+    }
+    public static CelValue Str_(string s) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Str
+        v.S    = s
+        return v
+    }
+    public static CelValue List__(List<CelValue> xs) {
+        let v: CelValue = new CelValue()
+        v.Kind  = CelValKind.List_
+        v.Items = xs
+        return v
+    }
+}
+
+// ── CelEnv (resolver bridge for path roots) ──────────────────────
+//
+// The evaluator looks up `state.X`, `params.X`, `msg.data.X` and any
+// for-loop-bound name via this object. v0.2 ships a JSON-backed
+// implementation : roots are JsonValues, dot/index navigates the
+// JSON document. Loop bindings are pushed/popped as needed.
+//
+// Runtime (C-side dispatcher, Phase 3) supplies its own subclass.
+// Pure-AM unit tests build a JsonValue env and pass it in.
+
+public class CelEnv {
+    private RootNames: List<string>
+    private RootVals:  List<JsonValue>
+
+    public CelEnv() {
+        this.RootNames = new List<string>()
+        this.RootVals  = new List<JsonValue>()
+    }
+
+    public void Bind(string name, JsonValue v) {
+        // Latest binding wins ; supports loop shadowing.
+        this.RootNames.Add(name)
+        this.RootVals.Add(v)
+    }
+
+    public void Unbind(string name) {
+        // Remove the most recent binding of `name` (LIFO).
+        let n: int = this.RootNames.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (this.RootNames.Get(j) == name) {
+                this.RootNames.RemoveAt(j)
+                this.RootVals.RemoveAt(j)
+                return
+            }
+        }
+    }
+
+    public bool Has(string name) {
+        let n: int = this.RootNames.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (this.RootNames.Get(j) == name) { return true }
+        }
+        return false
+    }
+
+    public JsonValue Lookup(string name) {
+        let n: int = this.RootNames.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (this.RootNames.Get(j) == name) { return this.RootVals.Get(j) }
+        }
+        return new JsonValue() // Null
+    }
+}
+
+// ── CelEval (tree-walking evaluator) ─────────────────────────────
+//
+// One Eval(rootIdx, env) entry. Errors set Failed + ErrMsg/ErrCol,
+// short-circuit subsequent evals, and surface to the caller via
+// HasFailed() — the dispatcher's on_error policy picks from there.
+//
+// Coercion + builtins follow cel-lite.md §4-§5 exactly.
+
+public class CelEval {
+    private Nodes:  List<CelNode>
+    private Env:    CelEnv
+    private Failed: bool
+    private ErrMsg: string
+    private ErrCol: int
+
+    public CelEval(List<CelNode> nodes, CelEnv env) {
+        this.Nodes  = nodes
+        this.Env    = env
+        this.Failed = false
+        this.ErrMsg = ""
+        this.ErrCol = 0
+    }
+
+    public bool   HasFailed() { return this.Failed }
+    public string ErrorMsg()  { return this.ErrMsg }
+    public int    ErrorCol()  { return this.ErrCol }
+
+    private void Fail(string msg, int col) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.ErrMsg = msg
+        this.ErrCol = col
+    }
+
+    // Lexicographic byte compare. Returns -1 / 0 / +1.
+    public static int _StrCmp(string a, string b) {
+        var r: int = 0
+        @c { r = strcmp(a, b); }
+        if (r < 0) { return -1 }
+        if (r > 0) { return  1 }
+        return 0
+    }
+
+    // Truncate float to int (toward zero) for `int(floatVal)`.
+    public static int _FloatTrunc(float x) {
+        var r: int = 0
+        @c { r = (int64_t) x; }
+        return r
+    }
+
+    public CelValue Eval(int rootIdx) {
+        if (rootIdx < 0) {
+            this.Fail("empty AST", 0)
+            return CelValue.Null_()
+        }
+        return this.EvalNode(rootIdx)
+    }
+
+    // Convert a JsonValue (env-resolved) to a CelValue. Objects don't
+    // have a first-class CelValue kind ; we surface them as opaque
+    // Str of the JSON re-encoding so callers see something useful in
+    // error messages, while equality still degrades to false.
+    private static CelValue FromJson(JsonValue jv) {
+        if (jv.IsNull())   { return CelValue.Null_() }
+        if (jv.IsBool())   { return CelValue.Bool_(jv.AsBool()) }
+        if (jv.IsInt())    { return CelValue.Int_(jv.AsInt()) }
+        if (jv.IsFloat())  { return CelValue.Float_(jv.AsFloat()) }
+        if (jv.IsString()) { return CelValue.Str_(jv.AsString()) }
+        if (jv.IsArray()) {
+            let xs: List<CelValue> = new List<CelValue>()
+            let items: List<JsonValue> = jv.AsArray()
+            let n: int = items.Count()
+            for i in 0..n {
+                xs.Add(CelEval.FromJson(items.Get(i)))
+            }
+            return CelValue.List__(xs)
+        }
+        // Object — opaque ; expose as Null at the leaf, dot-walk
+        // happens inside EvalDotPath against the underlying JSON.
+        return CelValue.Null_()
+    }
+
+    private CelValue EvalNode(int idx) {
+        if (this.Failed || idx < 0) { return CelValue.Null_() }
+        let n: CelNode = this.Nodes.Get(idx)
+        let k: CelNodeKind = n.Kind
+
+        if (k == CelNodeKind.LitInt)   { return CelValue.Int_(n.IntVal) }
+        if (k == CelNodeKind.LitFloat) { return CelValue.Float_(n.FloatVal) }
+        if (k == CelNodeKind.LitStr)   { return CelValue.Str_(n.StrVal) }
+        if (k == CelNodeKind.LitBool)  { return CelValue.Bool_(n.BoolVal) }
+        if (k == CelNodeKind.LitNull)  { return CelValue.Null_() }
+
+        if (k == CelNodeKind.Ident) {
+            if (this.Env.Has(n.StrVal)) {
+                return CelEval.FromJson(this.Env.Lookup(n.StrVal))
+            }
+            // Per spec : unknown root evaluates to null silently.
+            return CelValue.Null_()
+        }
+
+        if (k == CelNodeKind.List_) {
+            let xs: List<CelValue> = new List<CelValue>()
+            let m: int = n.Args.Count()
+            for i in 0..m {
+                xs.Add(this.EvalNode(n.Args.Get(i)))
+                if (this.Failed) { return CelValue.Null_() }
+            }
+            return CelValue.List__(xs)
+        }
+
+        if (k == CelNodeKind.DotAccess) {
+            // Resolve a contiguous DotAccess + Ident chain against the
+            // env's JsonValue so we can walk into nested objects.
+            return this.EvalPath(idx)
+        }
+
+        if (k == CelNodeKind.Index) {
+            let coll: CelValue = this.EvalNode(n.Left)
+            if (this.Failed) { return CelValue.Null_() }
+            let key: CelValue = this.EvalNode(n.Right)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!coll.IsList()) {
+                this.Fail("index on non-list", n.Col)
+                return CelValue.Null_()
+            }
+            if (!key.IsInt()) {
+                this.Fail("non-int index", n.Col)
+                return CelValue.Null_()
+            }
+            if (key.I < 0) {
+                this.Fail("negative index", n.Col)
+                return CelValue.Null_()
+            }
+            if (key.I >= coll.Items.Count()) {
+                return CelValue.Null_() // out-of-range → null per spec
+            }
+            return coll.Items.Get(key.I)
+        }
+
+        if (k == CelNodeKind.Unary)   { return this.EvalUnary(n) }
+        if (k == CelNodeKind.Binary)  { return this.EvalBinary(n) }
+        if (k == CelNodeKind.Ternary) { return this.EvalTernary(n) }
+        if (k == CelNodeKind.Call)    { return this.EvalCall(n) }
+
+        this.Fail("unhandled node kind", n.Col)
+        return CelValue.Null_()
+    }
+
+    // Walk a DotAccess chain into the underlying JsonValue root.
+    // If any segment is missing → null (spec §4).
+    private CelValue EvalPath(int idx) {
+        // Collect segments from root to leaf.
+        let segs: List<string> = new List<string>()
+        var cur: int = idx
+        while (true) {
+            let nd: CelNode = this.Nodes.Get(cur)
+            if (nd.Kind != CelNodeKind.DotAccess) { break }
+            segs.Add(nd.StrVal)
+            cur = nd.Left
+        }
+        let head: CelNode = this.Nodes.Get(cur)
+        if (head.Kind != CelNodeKind.Ident) {
+            // Non-ident root — fall back to evaluating that subtree,
+            // then can't walk further as JSON. Type error.
+            this.Fail("path root must be an identifier", head.Col)
+            return CelValue.Null_()
+        }
+        if (!this.Env.Has(head.StrVal)) {
+            return CelValue.Null_() // unknown root → null (warn comes from validator)
+        }
+        var jv: JsonValue = this.Env.Lookup(head.StrVal)
+        // segs is leaf→root order ; walk right-to-left.
+        let m: int = segs.Count()
+        for i in 0..m {
+            let segName: string = segs.Get(m - 1 - i)
+            if (!jv.IsObject()) { return CelValue.Null_() }
+            if (!jv.Has(segName)) { return CelValue.Null_() }
+            jv = jv.Get(segName)
+        }
+        return CelEval.FromJson(jv)
+    }
+
+    private CelValue EvalUnary(CelNode n) {
+        let v: CelValue = this.EvalNode(n.Left)
+        if (this.Failed) { return CelValue.Null_() }
+        if (n.OpTok == CelTokKind.Not) {
+            if (!v.IsBool()) {
+                this.Fail("'!' requires bool operand", n.Col)
+                return CelValue.Null_()
+            }
+            return CelValue.Bool_(!v.B)
+        }
+        if (n.OpTok == CelTokKind.Minus) {
+            if (v.IsInt())   { return CelValue.Int_(-v.I) }
+            if (v.IsFloat()) { return CelValue.Float_(-v.F) }
+            this.Fail("unary '-' on non-numeric", n.Col)
+            return CelValue.Null_()
+        }
+        this.Fail("unknown unary op", n.Col)
+        return CelValue.Null_()
+    }
+
+    private CelValue EvalBinary(CelNode n) {
+        let op: CelTokKind = n.OpTok
+
+        // Short-circuit logical ops.
+        if (op == CelTokKind.And) {
+            let l: CelValue = this.EvalNode(n.Left)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!l.IsBool()) { this.Fail("'&&' requires bool", n.Col); return CelValue.Null_() }
+            if (!l.B) { return CelValue.Bool_(false) }
+            let r: CelValue = this.EvalNode(n.Right)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!r.IsBool()) { this.Fail("'&&' requires bool", n.Col); return CelValue.Null_() }
+            return CelValue.Bool_(r.B)
+        }
+        if (op == CelTokKind.Or) {
+            let l: CelValue = this.EvalNode(n.Left)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!l.IsBool()) { this.Fail("'||' requires bool", n.Col); return CelValue.Null_() }
+            if (l.B) { return CelValue.Bool_(true) }
+            let r: CelValue = this.EvalNode(n.Right)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!r.IsBool()) { this.Fail("'||' requires bool", n.Col); return CelValue.Null_() }
+            return CelValue.Bool_(r.B)
+        }
+
+        let l: CelValue = this.EvalNode(n.Left)
+        if (this.Failed) { return CelValue.Null_() }
+        let r: CelValue = this.EvalNode(n.Right)
+        if (this.Failed) { return CelValue.Null_() }
+
+        // Arithmetic.
+        if (op == CelTokKind.Plus) {
+            if (l.IsStr() && r.IsStr()) { return CelValue.Str_(l.S + r.S) }
+            return this.NumOp(l, r, op, n.Col)
+        }
+        if (op == CelTokKind.Minus || op == CelTokKind.Star ||
+            op == CelTokKind.Slash || op == CelTokKind.Percent) {
+            return this.NumOp(l, r, op, n.Col)
+        }
+
+        // Equality.
+        if (op == CelTokKind.Eq)  { return CelValue.Bool_(this.EqCmp(l, r, n.Col)) }
+        if (op == CelTokKind.Neq) { return CelValue.Bool_(!this.EqCmp(l, r, n.Col)) }
+
+        // Ordered comparison.
+        if (op == CelTokKind.Lt || op == CelTokKind.Le ||
+            op == CelTokKind.Gt || op == CelTokKind.Ge) {
+            return this.OrdCmp(l, r, op, n.Col)
+        }
+
+        // Membership.
+        if (op == CelTokKind.In) {
+            if (l.IsStr() && r.IsStr()) {
+                return CelValue.Bool_(String_IndexOf(r.S, l.S) >= 0)
+            }
+            if (r.IsList()) {
+                let m: int = r.Items.Count()
+                for i in 0..m {
+                    if (this.EqCmp(l, r.Items.Get(i), n.Col)) {
+                        return CelValue.Bool_(true)
+                    }
+                }
+                return CelValue.Bool_(false)
+            }
+            this.Fail("'in' requires (string,string) or (T,list<T>)", n.Col)
+            return CelValue.Null_()
+        }
+
+        this.Fail("unknown binary op", n.Col)
+        return CelValue.Null_()
+    }
+
+    // Arithmetic on numeric operands. int op int → int (wrap), any
+    // float operand → float. Anything else → type error.
+    private CelValue NumOp(CelValue l, CelValue r, CelTokKind op, int col) {
+        if (l.IsInt() && r.IsInt()) {
+            let a: int = l.I
+            let b: int = r.I
+            if (op == CelTokKind.Plus)    { return CelValue.Int_(a + b) }
+            if (op == CelTokKind.Minus)   { return CelValue.Int_(a - b) }
+            if (op == CelTokKind.Star)    { return CelValue.Int_(a * b) }
+            if (op == CelTokKind.Slash)   {
+                if (b == 0) { return CelValue.Null_() }
+                return CelValue.Int_(a / b)
+            }
+            if (op == CelTokKind.Percent) {
+                if (b == 0) { return CelValue.Null_() }
+                return CelValue.Int_(a % b)
+            }
+        }
+        if ((l.IsInt() || l.IsFloat()) && (r.IsInt() || r.IsFloat())) {
+            var af: float = 0.0
+            var bf: float = 0.0
+            if (l.IsInt()) { af = l.I + 0.0 } else { af = l.F }
+            if (r.IsInt()) { bf = r.I + 0.0 } else { bf = r.F }
+            if (op == CelTokKind.Plus)    { return CelValue.Float_(af + bf) }
+            if (op == CelTokKind.Minus)   { return CelValue.Float_(af - bf) }
+            if (op == CelTokKind.Star)    { return CelValue.Float_(af * bf) }
+            if (op == CelTokKind.Slash)   {
+                if (bf == 0.0) { return CelValue.Null_() }
+                return CelValue.Float_(af / bf)
+            }
+            // % undefined for float in cel-lite ; fall through to type err
+        }
+        this.Fail("arithmetic on non-numeric operands", col)
+        return CelValue.Null_()
+    }
+
+    private bool EqCmp(CelValue l, CelValue r, int col) {
+        if (l.IsNull() && r.IsNull()) { return true }
+        if (l.IsNull() || r.IsNull()) { return false }
+        if (l.IsBool() && r.IsBool()) { return l.B == r.B }
+        if (l.IsInt()  && r.IsInt())  { return l.I == r.I }
+        if (l.IsStr()  && r.IsStr())  { return l.S == r.S }
+        if ((l.IsInt() || l.IsFloat()) && (r.IsInt() || r.IsFloat())) {
+            var af: float = 0.0
+            var bf: float = 0.0
+            if (l.IsInt()) { af = l.I + 0.0 } else { af = l.F }
+            if (r.IsInt()) { bf = r.I + 0.0 } else { bf = r.F }
+            return af == bf
+        }
+        // Different kinds (e.g. int vs string) — strict false per CEL.
+        return false
+    }
+
+    private CelValue OrdCmp(CelValue l, CelValue r, CelTokKind op, int col) {
+        if (l.IsNull() || r.IsNull()) {
+            this.Fail("ordered compare with null", col)
+            return CelValue.Null_()
+        }
+        if (l.IsStr() && r.IsStr()) {
+            let cmp: int = CelEval._StrCmp(l.S, r.S)
+            if (op == CelTokKind.Lt) { return CelValue.Bool_(cmp <  0) }
+            if (op == CelTokKind.Le) { return CelValue.Bool_(cmp <= 0) }
+            if (op == CelTokKind.Gt) { return CelValue.Bool_(cmp >  0) }
+            if (op == CelTokKind.Ge) { return CelValue.Bool_(cmp >= 0) }
+        }
+        if ((l.IsInt() || l.IsFloat()) && (r.IsInt() || r.IsFloat())) {
+            var af: float = 0.0
+            var bf: float = 0.0
+            if (l.IsInt()) { af = l.I + 0.0 } else { af = l.F }
+            if (r.IsInt()) { bf = r.I + 0.0 } else { bf = r.F }
+            if (op == CelTokKind.Lt) { return CelValue.Bool_(af <  bf) }
+            if (op == CelTokKind.Le) { return CelValue.Bool_(af <= bf) }
+            if (op == CelTokKind.Gt) { return CelValue.Bool_(af >  bf) }
+            if (op == CelTokKind.Ge) { return CelValue.Bool_(af >= bf) }
+        }
+        this.Fail("ordered compare on incompatible types", col)
+        return CelValue.Null_()
+    }
+
+    private CelValue EvalTernary(CelNode n) {
+        let c: CelValue = this.EvalNode(n.Left)
+        if (this.Failed) { return CelValue.Null_() }
+        if (!c.IsBool()) {
+            this.Fail("ternary condition is not bool", n.Col)
+            return CelValue.Null_()
+        }
+        if (c.B) { return this.EvalNode(n.Mid) }
+        return this.EvalNode(n.Right)
+    }
+
+    private CelValue EvalCall(CelNode n) {
+        let name: string = n.StrVal
+        let argc: int = n.Args.Count()
+        // len(s|l)
+        if (name == "len") {
+            if (argc != 1) { this.Fail("len() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsStr())  { return CelValue.Int_(String_Length(v.S)) }
+            if (v.IsList()) { return CelValue.Int_(v.Items.Count()) }
+            this.Fail("len() arg must be string or list", n.Col)
+            return CelValue.Null_()
+        }
+        if (name == "int") {
+            if (argc != 1) { this.Fail("int() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsInt())   { return v }
+            if (v.IsFloat()) { return CelValue.Int_(CelEval._FloatTrunc(v.F)) }
+            if (v.IsBool())  { if (v.B) { return CelValue.Int_(1) } return CelValue.Int_(0) }
+            if (v.IsNull())  { return CelValue.Int_(0) }
+            if (v.IsStr())   { return CelValue.Int_(String_ToInt(v.S)) }
+            this.Fail("int() unsupported operand", n.Col); return CelValue.Null_()
+        }
+        if (name == "float") {
+            if (argc != 1) { this.Fail("float() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsFloat()) { return v }
+            if (v.IsInt())   { return CelValue.Float_(v.I + 0.0) }
+            if (v.IsStr())   { return CelValue.Float_(String_ToFloat(v.S)) }
+            this.Fail("float() unsupported operand", n.Col); return CelValue.Null_()
+        }
+        if (name == "string") {
+            if (argc != 1) { this.Fail("string() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsStr())   { return v }
+            if (v.IsNull())  { return CelValue.Str_("") }
+            if (v.IsBool())  { if (v.B) { return CelValue.Str_("true") } return CelValue.Str_("false") }
+            if (v.IsInt())   { return CelValue.Str_(String_FromInt(v.I)) }
+            if (v.IsFloat()) { return CelValue.Str_(String_FromFloat(v.F)) }
+            return CelValue.Str_("")
+        }
+        if (name == "bool") {
+            if (argc != 1) { this.Fail("bool() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsBool())  { return v }
+            if (v.IsNull())  { return CelValue.Bool_(false) }
+            if (v.IsStr())   { return CelValue.Bool_(String_Length(v.S) > 0) }
+            if (v.IsInt())   { return CelValue.Bool_(v.I != 0) }
+            if (v.IsFloat()) { return CelValue.Bool_(v.F != 0.0) }
+            return CelValue.Bool_(false)
+        }
+        if (name == "contains" || name == "startsWith" || name == "endsWith") {
+            if (argc != 2) {
+                this.Fail(name + "() expects 2 args", n.Col)
+                return CelValue.Null_()
+            }
+            let a: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            let b: CelValue = this.EvalNode(n.Args.Get(1))
+            if (this.Failed) { return CelValue.Null_() }
+            if (!a.IsStr() || !b.IsStr()) {
+                this.Fail(name + "() args must be strings", n.Col)
+                return CelValue.Null_()
+            }
+            if (name == "contains")   { return CelValue.Bool_(String_IndexOf(a.S, b.S) >= 0) }
+            if (name == "startsWith") { return CelValue.Bool_(String_StartsWith(a.S, b.S)) }
+            if (name == "endsWith")   { return CelValue.Bool_(String_EndsWith(a.S, b.S)) }
+        }
+        this.Fail("unknown function '" + name + "'", n.Col)
+        return CelValue.Null_()
+    }
+}
+
 public class Pollen {
     // Load a workflow.json file. `nodeName` overrides port-based
     // role lookup. Returns true on success.
@@ -3671,9 +4894,10 @@ public class Pollen {
             let hasReturns: bool = retV.IsString() && String_Length(retV.AsString()) > 0
             entryHasReturns.Add(hasReturns)
 
-            // Rule 8 stub — non-empty `returns` expr if declared.
-            if (e.Has("returns") && retV.IsString() && String_Length(retV.AsString()) == 0) {
-                diags.Add("[error rule8] " + path + ".returns: empty expression")
+            // Rule 8 — `returns` expression must lex+parse cleanly.
+            if (e.Has("returns") && retV.IsString()) {
+                Pollen._v3CheckExpr(retV.AsString(), "returns",
+                                     path + ".returns", diags)
             }
 
             entryDo.Add(e.Get("do"))
@@ -3977,6 +5201,42 @@ public class Pollen {
 
     // ───────── private v3 validator helpers ─────────
 
+    // Rule 8 — run the CEL-lite lexer + parser against a single
+    // expression string. Emits diagnostics for empty / lex-failed /
+    // parse-failed / over-budget expressions. The runtime evaluator
+    // isn't invoked here (no env at validation time).
+    private static void _v3CheckExpr(string expr, string ctx,
+                                      string path, List<string> diags) {
+        if (String_Length(expr) == 0) {
+            diags.Add("[error rule8] " + path + ": empty expression")
+            return
+        }
+        let lex: CelLexer = new CelLexer(expr)
+        let toks: List<CelToken> = lex.Lex()
+        if (lex.HasFailed()) {
+            let col: int = lex.ErrorCol()
+            let m: string = lex.ErrorMsg()
+            diags.Add("[error rule8] " + path + ": lex error at col " +
+                       String_FromInt(col) + ": " + m)
+            return
+        }
+        let par: CelParser = new CelParser(toks)
+        let root: int = par.Parse()
+        if (par.HasFailed()) {
+            let col: int = par.ErrorCol()
+            let m: string = par.ErrorMsg()
+            diags.Add("[error rule8] " + path + ": parse error at col " +
+                       String_FromInt(col) + ": " + m)
+            return
+        }
+        // Note: cel-lite.md §4 calls for a warn on unknown path roots
+        // (typo signal: `stat.X` for `state.X`). We don't emit it yet
+        // because the validator can't tell a typo from a legit for-loop
+        // var without threading scope through the whole walker. The
+        // runtime resolver (Phase 2) has full scope info and will fire
+        // the warning instead.
+    }
+
     // Walk a step (or step-array) collecting `anchor` declarations.
     // Anchors live anywhere in the entry's do-tree ; the validator
     // resolves goto targets against the flat global anchor namespace.
@@ -4096,8 +5356,8 @@ public class Pollen {
             let valV: JsonValue = stepV.Get("value")
             if (!valV.IsString()) {
                 diags.Add("[error shape] " + path + ".value: must be a CEL-lite expression string")
-            } else if (String_Length(valV.AsString()) == 0) {
-                diags.Add("[error rule8] " + path + ".value: empty expression")
+            } else {
+                Pollen._v3CheckExpr(valV.AsString(), "value", path + ".value", diags)
             }
             return
         }
@@ -4129,8 +5389,8 @@ public class Pollen {
                     let whenV: JsonValue = cVal.Get("when")
                     if (!whenV.IsString()) {
                         diags.Add("[error shape] " + cPath + ".when: must be a CEL-lite expression string")
-                    } else if (String_Length(whenV.AsString()) == 0) {
-                        diags.Add("[error rule8] " + cPath + ".when: empty expression")
+                    } else {
+                        Pollen._v3CheckExpr(whenV.AsString(), "when", cPath + ".when", diags)
                     }
                 }
                 Pollen._v3WalkBody(cVal.Get("do"), entryIdx, cPath + ".do",
@@ -4147,8 +5407,8 @@ public class Pollen {
             let inV: JsonValue = stepV.Get("in")
             if (!inV.IsString()) {
                 diags.Add("[error shape] " + path + ".in: must be a CEL-lite expression string")
-            } else if (String_Length(inV.AsString()) == 0) {
-                diags.Add("[error rule8] " + path + ".in: empty expression")
+            } else {
+                Pollen._v3CheckExpr(inV.AsString(), "in", path + ".in", diags)
             }
             Pollen._v3WalkBody(stepV.Get("do"), entryIdx, path + ".do",
                                 actionNames, gotoFromEntry, gotoTarget, diags)
@@ -4159,8 +5419,8 @@ public class Pollen {
             let condV: JsonValue = stepV.Get("cond")
             if (!condV.IsString()) {
                 diags.Add("[error shape] " + path + ".cond: must be a CEL-lite expression string")
-            } else if (String_Length(condV.AsString()) == 0) {
-                diags.Add("[error rule8] " + path + ".cond: empty expression")
+            } else {
+                Pollen._v3CheckExpr(condV.AsString(), "cond", path + ".cond", diags)
             }
             if (stepV.Has("maxIter")) {
                 let mi: JsonValue = stepV.Get("maxIter")
@@ -4195,9 +5455,10 @@ public class Pollen {
                         if (!aV.IsString()) {
                             diags.Add("[error shape] " + path + ".args[" + String_FromInt(i) +
                                        "]: must be a CEL-lite expression string")
-                        } else if (String_Length(aV.AsString()) == 0) {
-                            diags.Add("[error rule8] " + path + ".args[" + String_FromInt(i) +
-                                       "]: empty expression")
+                        } else {
+                            Pollen._v3CheckExpr(aV.AsString(), "arg",
+                                                 path + ".args[" + String_FromInt(i) + "]",
+                                                 diags)
                         }
                     }
                 }
