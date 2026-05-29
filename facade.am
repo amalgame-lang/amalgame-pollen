@@ -3587,6 +3587,43 @@ import Amalgame.String
         if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
         return _pollen_v3_ast[idx].goto_idx;
     }
+    static int _pollen_v3_node_mode(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].mode;
+    }
+    static int _pollen_v3_node_on_error(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].on_error;
+    }
+    static int _pollen_v3_node_max_iter(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].max_iter;
+    }
+    static int _pollen_v3_node_has_else(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].has_else;
+    }
+    static int _pollen_v3_node_args_count(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].args_count;
+    }
+    static code_string _pollen_v3_node_arg(int idx, int i) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        PollenAstNode* n = &_pollen_v3_ast[idx];
+        if (i < 0 || i >= n->args_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        const char* s = _pollen_v3_args_pool[n->args_first + i];
+        if (!s) s = "";
+        size_t L = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(L + 1);
+        if (out) { memcpy(out, s, L); out[L] = 0; }
+        return (code_string) out;
+    }
     static code_string _pollen_v3_node_name(int idx) {
         const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
                           ? _pollen_v3_ast[idx].name : "";
@@ -3595,6 +3632,66 @@ import Amalgame.String
         char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
         if (out) { memcpy(out, s, n); out[n] = 0; }
         return (code_string) out;
+    }
+    static code_string _pollen_v3_node_expr(int idx) {
+        const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
+                          ? _pollen_v3_ast[idx].expr : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static code_string _pollen_v3_node_bind(int idx) {
+        const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
+                          ? _pollen_v3_ast[idx].bind_key : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static int _pollen_v3_entry_has_returns(int eidx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return 0;
+        return _pollen_v3_entries[eidx].has_returns;
+    }
+    static code_string _pollen_v3_entry_returns(int eidx) {
+        const char* s = (eidx >= 0 && eidx < _pollen_v3_entry_count)
+                          ? _pollen_v3_entries[eidx].returns_expr : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static int _pollen_v3_entry_param_count(int eidx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return 0;
+        return _pollen_v3_entries[eidx].params_count;
+    }
+    static code_string _pollen_v3_entry_param(int eidx, int i) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        PollenEntry* e = &_pollen_v3_entries[eidx];
+        if (i < 0 || i >= e->params_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        const char* s = e->params[i];
+        if (!s) s = "";
+        size_t L = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(L + 1);
+        if (out) { memcpy(out, s, L); out[L] = 0; }
+        return (code_string) out;
+    }
+    static int _pollen_v3_anchor_node_idx_c(int aidx) {
+        if (aidx < 0 || aidx >= _pollen_v3_anchor_count) return -1;
+        return _pollen_v3_anchors[aidx].node_idx;
+    }
+    static int _pollen_v3_anchor_entry_idx_c(int aidx) {
+        if (aidx < 0 || aidx >= _pollen_v3_anchor_count) return -1;
+        return _pollen_v3_anchors[aidx].entry_idx;
     }
 
     /* === Introspection ======================================== */
@@ -6279,5 +6376,678 @@ public class Pollen {
         var s: string = ""
         @c { s = _pollen_v3_node_name(idx); }
         return s
+    }
+    public static string WorkflowV3NodeExpr(idx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_expr(idx); }
+        return s
+    }
+    public static string WorkflowV3NodeBind(idx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_bind(idx); }
+        return s
+    }
+    public static int WorkflowV3NodeMode(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_mode(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeOnError(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_on_error(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeMaxIter(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_max_iter(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeHasElse(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_has_else(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeArgsCount(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_args_count(idx); }
+        return r
+    }
+    public static string WorkflowV3NodeArg(idx: int, i: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_arg(idx, i); }
+        return s
+    }
+    public static bool WorkflowV3EntryHasReturns(eidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_entry_has_returns(eidx); }
+        return r != 0
+    }
+    public static string WorkflowV3EntryReturns(eidx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_entry_returns(eidx); }
+        return s
+    }
+    public static int WorkflowV3EntryParamCount(eidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_entry_param_count(eidx); }
+        return r
+    }
+    public static string WorkflowV3EntryParam(eidx: int, i: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_entry_param(eidx, i); }
+        return s
+    }
+    public static int WorkflowV3AnchorEntryIdx(aidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_anchor_entry_idx_c(aidx); }
+        return r
+    }
+    public static int WorkflowV3AnchorNodeIdx(aidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_anchor_node_idx_c(aidx); }
+        return r
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Pollen v3 — tree-walker dispatcher (Phase 3)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Runs an entry's body against a fresh state blackboard, returns
+    // the resulting state as a JsonValue object. AM-side ; reads the
+    // AST via the WorkflowV3* accessors, evaluates expressions via
+    // CelLexer/CelParser/CelEval (Phase 1).
+    //
+    // Scope this slice :
+    //   ✅ sequence (next_sibling chains)
+    //   ✅ set    — eval value, write to state
+    //   ✅ goto   — push frame, jump to entry/anchor target
+    //   ✅ anchor — fall-through no-op
+    //   ✅ if     — eval each case.when, dispatch first match
+    //   ✅ for    — eval `in`, iterate, bind loop var, dispatch body
+    //   ✅ while  — eval cond, dispatch body, cap by maxIter
+    //   ⏳ call   — STUB this session, no network (logs name only)
+    //
+    // Phase 3b ships `call` LB via the capability registry + bus
+    // forwarding + listener-thread integration. Phase 4 retires the
+    // v2 dispatcher.
+
+    public static int WorkflowV3DispatchEntry(eidx: int,
+                                                msgEnvelopeJson: string) {
+        let disp: PollenDispatcher = new PollenDispatcher()
+        return disp.Run(eidx, msgEnvelopeJson)
+    }
+
+    // Same as WorkflowV3DispatchEntry but returns the final state
+    // blackboard as a JSON-stringifiable JsonValue, for tests.
+    public static JsonValue WorkflowV3DispatchEntryState(eidx: int,
+                                                          msgEnvelopeJson: string) {
+        let disp: PollenDispatcher = new PollenDispatcher()
+        let rc: int = disp.Run(eidx, msgEnvelopeJson)
+        if (rc < 0) {
+            return new JsonValue()
+        }
+        return disp.GetState()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PollenFrame — one call-stack frame (entry invocation context)
+// ─────────────────────────────────────────────────────────────────
+
+public class PollenFrame {
+    public EntryIdx:   int
+    public ParamKeys:  List<string>
+    public ParamVals:  List<CelValue>
+    public BindKey:    string   // where to write our `returns` on pop ; "" if none
+    public CallerIdx:  int      // frame idx in stack of the caller, -1 if root
+
+    public PollenFrame(eidx: int) {
+        this.EntryIdx   = eidx
+        this.ParamKeys  = new List<string>()
+        this.ParamVals  = new List<CelValue>()
+        this.BindKey    = ""
+        this.CallerIdx  = -1
+    }
+
+    public bool HasParam(name: string) {
+        let n: int = this.ParamKeys.Count()
+        for i in 0..n {
+            if (this.ParamKeys.Get(i) == name) { return true }
+        }
+        return false
+    }
+
+    public CelValue GetParam(name: string) {
+        let n: int = this.ParamKeys.Count()
+        for i in 0..n {
+            if (this.ParamKeys.Get(i) == name) { return this.ParamVals.Get(i) }
+        }
+        return CelValue.Null_()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PollenDispatcher — tree-walking interpreter
+// ─────────────────────────────────────────────────────────────────
+
+public class PollenDispatcher {
+
+    // Status codes returned by Run() / DispatchSeq() / DispatchStep().
+    public static int OK()        { return  0 }   // step completed normally
+    public static int RETURN()    { return  1 }   // entry returned (goto pop)
+    public static int ERROR_()    { return -1 }   // fatal — abort dispatch
+
+    // Goto kind constants matching POLLEN_GOTO_*.
+    public static int GOTO_ENTRY()  { return 1 }
+    public static int GOTO_ANCHOR() { return 2 }
+
+    // AST kind constants matching POLLEN_AST_*.
+    public static int K_CALL()   { return 1 }
+    public static int K_IF()     { return 2 }
+    public static int K_FOR()    { return 3 }
+    public static int K_WHILE()  { return 4 }
+    public static int K_SET()    { return 5 }
+    public static int K_GOTO()   { return 6 }
+    public static int K_ANCHOR() { return 7 }
+    public static int K_CASE()   { return 8 }
+
+    public static int MAX_FRAMES() { return 64 }
+
+    private Frames:      List<PollenFrame>
+    private State:       JsonValue       // object — the shared bus-msg blackboard
+    private MsgEnvelope: JsonValue       // bus envelope (parsed once)
+    private Failed:      bool
+    private FailMsg:     string
+
+    public PollenDispatcher() {
+        this.Frames      = new List<PollenFrame>()
+        this.State       = new JsonValue()
+        let k: List<string> = new List<string>()
+        let v: List<JsonValue> = new List<JsonValue>()
+        this.State.SetObject(k, v)
+        this.MsgEnvelope = new JsonValue()
+        this.Failed      = false
+        this.FailMsg     = ""
+    }
+
+    public bool HasFailed()    { return this.Failed }
+    public string ErrorMsg()   { return this.FailMsg }
+    public JsonValue GetState() { return this.State }
+
+    private void Fail(msg: string) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.FailMsg = msg
+    }
+
+    // Run an entry's body. Returns 0 on success, -1 on fatal error.
+    // Caller supplies a JSON-encoded bus envelope (or "" for a synthetic
+    // dispatch). State + frame stack live for one invocation only.
+    public int Run(eidx: int, envelopeJson: string) {
+        if (eidx < 0 || eidx >= Pollen.WorkflowV3EntryCount()) {
+            this.Fail("invalid entry idx")
+            return -1
+        }
+        if (String_Length(envelopeJson) > 0) {
+            let p: JsonParser = new JsonParser(envelopeJson)
+            this.MsgEnvelope = p.ParseTopLevel()
+            if (p.HasFailed()) {
+                let pe: string = p.ErrorMsg()
+                this.Fail("envelope parse: " + pe)
+                return -1
+            }
+        }
+        let frame: PollenFrame = new PollenFrame(eidx)
+        this.Frames.Add(frame)
+        let root: int = Pollen.WorkflowV3EntryDoRoot(eidx)
+        let rc: int = this.DispatchSeq(root)
+        // Pop the root frame.
+        let popped: int = this.Frames.Count() - 1
+        if (popped >= 0) { this.Frames.RemoveAt(popped) }
+        if (rc < 0) { return -1 }
+        return 0
+    }
+
+    // Walk a sibling-chained sequence starting at head_idx.
+    private int DispatchSeq(headIdx: int) {
+        var cur: int = headIdx
+        while (cur >= 0 && !this.Failed) {
+            let rc: int = this.DispatchStep(cur)
+            if (rc < 0)           { return -1 }
+            if (rc == 1) { return 1 }   // RETURN — bubble up to caller
+            cur = Pollen.WorkflowV3NodeNext(cur)
+        }
+        return 0
+    }
+
+    private int DispatchStep(nodeIdx: int) {
+        if (nodeIdx < 0) { return 0 }
+        let kind: int = Pollen.WorkflowV3NodeKind(nodeIdx)
+        if (kind == PollenDispatcher.K_SET())    { return this.StepSet(nodeIdx) }
+        if (kind == PollenDispatcher.K_GOTO())   { return this.StepGoto(nodeIdx) }
+        if (kind == PollenDispatcher.K_ANCHOR()) { return 0 }    // fall-through
+        if (kind == PollenDispatcher.K_IF())     { return this.StepIf(nodeIdx) }
+        if (kind == PollenDispatcher.K_FOR())    { return this.StepFor(nodeIdx) }
+        if (kind == PollenDispatcher.K_WHILE())  { return this.StepWhile(nodeIdx) }
+        if (kind == PollenDispatcher.K_CALL())   { return this.StepCall(nodeIdx) }
+        // CASE nodes are walked by StepIf directly ; reaching one here
+        // means a malformed AST. Fail loudly so the test catches it.
+        this.Fail("dispatcher: unexpected node kind " + String_FromInt(kind))
+        return -1
+    }
+
+    // ── Step handlers ────────────────────────────────────────────
+
+    private int StepSet(nodeIdx: int) {
+        let key: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let expr: string = Pollen.WorkflowV3NodeExpr(nodeIdx)
+        if (String_Length(key) == 0) {
+            this.Fail("set: empty key")
+            return -1
+        }
+        let v: CelValue = this.EvalExpr(expr)
+        if (this.Failed) { return -1 }
+        this.StateSet(key, v)
+        return 0
+    }
+
+    private int StepGoto(nodeIdx: int) {
+        let gKind: int = Pollen.WorkflowV3NodeGotoKind(nodeIdx)
+        let gIdx:  int = Pollen.WorkflowV3NodeGotoIdx(nodeIdx)
+        if (gKind == 0 || gIdx < 0) {
+            let tgt: string = Pollen.WorkflowV3NodeName(nodeIdx)
+            this.Fail("goto: unresolved target '" + tgt + "'")
+            return -1
+        }
+        if (this.Frames.Count() >= PollenDispatcher.MAX_FRAMES()) {
+            this.Fail("call-stack overflow (POLLEN_CALL_STACK_MAX=64)")
+            return -1
+        }
+
+        var targetEntry: int = -1
+        var targetNode:  int = -1
+        if (gKind == PollenDispatcher.GOTO_ENTRY()) {
+            targetEntry = gIdx
+            targetNode  = Pollen.WorkflowV3EntryDoRoot(gIdx)
+        } else if (gKind == PollenDispatcher.GOTO_ANCHOR()) {
+            targetEntry = Pollen.WorkflowV3AnchorEntryIdx(gIdx)
+            targetNode  = Pollen.WorkflowV3AnchorNodeIdx(gIdx)
+        } else {
+            this.Fail("goto: unknown goto_kind " + String_FromInt(gKind))
+            return -1
+        }
+
+        // Build a new frame, bind params from args[].
+        let frame: PollenFrame = new PollenFrame(targetEntry)
+        frame.CallerIdx = this.Frames.Count() - 1
+        let bind: string = Pollen.WorkflowV3NodeBind(nodeIdx)
+        frame.BindKey = bind
+        let argc: int = Pollen.WorkflowV3NodeArgsCount(nodeIdx)
+        let paramCount: int = Pollen.WorkflowV3EntryParamCount(targetEntry)
+        for i in 0..paramCount {
+            let pn: string = Pollen.WorkflowV3EntryParam(targetEntry, i)
+            var val: CelValue = CelValue.Null_()
+            if (i < argc) {
+                let ae: string = Pollen.WorkflowV3NodeArg(nodeIdx, i)
+                val = this.EvalExpr(ae)
+                if (this.Failed) { return -1 }
+            }
+            frame.ParamKeys.Add(pn)
+            frame.ParamVals.Add(val)
+        }
+        this.Frames.Add(frame)
+
+        let rc: int = this.DispatchSeq(targetNode)
+        // Compute the entry's `returns` value before popping.
+        var retVal: CelValue = CelValue.Null_()
+        if (Pollen.WorkflowV3EntryHasReturns(targetEntry)) {
+            let re: string = Pollen.WorkflowV3EntryReturns(targetEntry)
+            retVal = this.EvalExpr(re)
+            if (this.Failed) { return -1 }
+        }
+        // Pop the callee frame.
+        let last: int = this.Frames.Count() - 1
+        if (last >= 0) { this.Frames.RemoveAt(last) }
+        // Bind into the caller's state if requested.
+        if (String_Length(bind) > 0) {
+            this.StateSet(bind, retVal)
+        }
+        if (rc < 0) { return -1 }
+        return 0
+    }
+
+    private int StepIf(nodeIdx: int) {
+        let firstCase: int = Pollen.WorkflowV3NodeChild0(nodeIdx)
+        var cur: int = firstCase
+        while (cur >= 0 && !this.Failed) {
+            if (Pollen.WorkflowV3NodeKind(cur) != PollenDispatcher.K_CASE()) {
+                this.Fail("if: non-case child")
+                return -1
+            }
+            let isElse: int = Pollen.WorkflowV3NodeHasElse(cur)
+            var fire: bool = false
+            if (isElse != 0) {
+                fire = true
+            } else {
+                let expr: string = Pollen.WorkflowV3NodeExpr(cur)
+                let v: CelValue = this.EvalExpr(expr)
+                if (this.Failed) { return -1 }
+                if (!v.IsBool()) {
+                    this.Fail("if.when: not bool")
+                    return -1
+                }
+                fire = v.B
+            }
+            if (fire) {
+                let body: int = Pollen.WorkflowV3NodeChild0(cur)
+                return this.DispatchSeq(body)
+            }
+            cur = Pollen.WorkflowV3NodeNext(cur)
+        }
+        return 0
+    }
+
+    private int StepFor(nodeIdx: int) {
+        let varName: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let inExpr:  string = Pollen.WorkflowV3NodeExpr(nodeIdx)
+        let body:    int    = Pollen.WorkflowV3NodeChild0(nodeIdx)
+        if (String_Length(varName) == 0) {
+            this.Fail("for: empty var")
+            return -1
+        }
+        let items: CelValue = this.EvalExpr(inExpr)
+        if (this.Failed) { return -1 }
+        if (!items.IsList()) {
+            this.Fail("for.in: not a list")
+            return -1
+        }
+        let n: int = items.Items.Count()
+        let frame: PollenFrame = this.CurrentFrame()
+        for i in 0..n {
+            let v: CelValue = items.Items.Get(i)
+            // Bind/rebind the loop var on the current frame's params.
+            this.FrameSetParam(frame, varName, v)
+            let rc: int = this.DispatchSeq(body)
+            if (rc < 0) { return -1 }
+            if (rc == 1) { return 1 }
+        }
+        // Unbind loop var so subsequent steps don't see it leak.
+        this.FrameUnsetParam(frame, varName)
+        return 0
+    }
+
+    private int StepWhile(nodeIdx: int) {
+        let condExpr: string = Pollen.WorkflowV3NodeExpr(nodeIdx)
+        let body:     int    = Pollen.WorkflowV3NodeChild0(nodeIdx)
+        let maxIter:  int    = Pollen.WorkflowV3NodeMaxIter(nodeIdx)
+        var iter: int = 0
+        // Hard safety cap when no maxIter declared, so a runaway
+        // condition can't lock the dispatcher thread.
+        var cap: int = 100000
+        if (maxIter > 0) { cap = maxIter }
+        while (iter < cap && !this.Failed) {
+            let c: CelValue = this.EvalExpr(condExpr)
+            if (this.Failed) { return -1 }
+            if (!c.IsBool()) {
+                this.Fail("while.cond: not bool")
+                return -1
+            }
+            if (!c.B) { return 0 }
+            let rc: int = this.DispatchSeq(body)
+            if (rc < 0) { return -1 }
+            if (rc == 1) { return 1 }
+            iter = iter + 1
+        }
+        if (iter >= cap && maxIter > 0) {
+            this.Fail("while: maxIter (" + String_FromInt(maxIter) + ") exhausted")
+            return -1
+        }
+        return 0
+    }
+
+    // STUB this slice. Logs the action name so a test can verify the
+    // dispatcher walked the node, but does no network. Full LB +
+    // capability-registry resolution lands in Phase 3b.
+    private int StepCall(nodeIdx: int) {
+        let action: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let onErr:  int    = Pollen.WorkflowV3NodeOnError(nodeIdx)
+        // Append to a state.__calls audit list for tests.
+        let auditKey: string = "__calls"
+        var auditList: CelValue = this.StateGet(auditKey)
+        if (!auditList.IsList()) {
+            let fresh: List<CelValue> = new List<CelValue>()
+            auditList = CelValue.List__(fresh)
+        }
+        auditList.Items.Add(CelValue.Str_(action))
+        this.StateSet(auditKey, auditList)
+        if (onErr == 1) {
+            // "fail" policy with 0 providers — but since we stub the
+            // resolution as "no providers", a fail-policy call aborts.
+            // Comment out until Phase 3b wires real resolution.
+            // this.Fail("call '" + action + "': on_error=fail (stub)")
+            // return -1
+        }
+        return 0
+    }
+
+    // ── State + frame helpers ────────────────────────────────────
+
+    private PollenFrame CurrentFrame() {
+        let n: int = this.Frames.Count()
+        if (n == 0) {
+            this.Fail("no current frame")
+            return new PollenFrame(-1)
+        }
+        return this.Frames.Get(n - 1)
+    }
+
+    private void FrameSetParam(frame: PollenFrame, name: string, v: CelValue) {
+        let n: int = frame.ParamKeys.Count()
+        for i in 0..n {
+            if (frame.ParamKeys.Get(i) == name) {
+                frame.ParamVals.Set(i, v)
+                return
+            }
+        }
+        frame.ParamKeys.Add(name)
+        frame.ParamVals.Add(v)
+    }
+
+    private void FrameUnsetParam(frame: PollenFrame, name: string) {
+        let n: int = frame.ParamKeys.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (frame.ParamKeys.Get(j) == name) {
+                frame.ParamKeys.RemoveAt(j)
+                frame.ParamVals.RemoveAt(j)
+                return
+            }
+        }
+    }
+
+    // Write a (possibly dotted) key into the state blackboard. The
+    // path is treated as a flat key when there's no dot ; with a dot
+    // we walk into nested objects, creating them on demand.
+    private void StateSet(key: string, v: CelValue) {
+        let parts: List<string> = this.SplitDot(key)
+        let n: int = parts.Count()
+        if (n == 0) { return }
+        if (n == 1) {
+            this.StateRootSet(parts.Get(0), v)
+            return
+        }
+        // Walk/create nested objects, set the leaf.
+        var cur: JsonValue = this.State
+        for i in 0..(n - 1) {
+            let seg: string = parts.Get(i)
+            if (!cur.IsObject()) { return }
+            if (!cur.Has(seg) || !cur.Get(seg).IsObject()) {
+                let fresh: JsonValue = new JsonValue()
+                let k2: List<string> = new List<string>()
+                let v2: List<JsonValue> = new List<JsonValue>()
+                fresh.SetObject(k2, v2)
+                this.JsonObjectSet(cur, seg, fresh)
+            }
+            cur = cur.Get(seg)
+        }
+        let leaf: string = parts.Get(n - 1)
+        this.JsonObjectSet(cur, leaf, this.CelToJson(v))
+    }
+
+    private CelValue StateGet(key: string) {
+        let parts: List<string> = this.SplitDot(key)
+        let n: int = parts.Count()
+        if (n == 0) { return CelValue.Null_() }
+        var cur: JsonValue = this.State
+        for i in 0..n {
+            let seg: string = parts.Get(i)
+            if (!cur.IsObject()) { return CelValue.Null_() }
+            if (!cur.Has(seg)) { return CelValue.Null_() }
+            cur = cur.Get(seg)
+        }
+        return this.JsonToCel(cur)
+    }
+
+    private void StateRootSet(key: string, v: CelValue) {
+        this.JsonObjectSet(this.State, key, this.CelToJson(v))
+    }
+
+    private void JsonObjectSet(obj: JsonValue, key: string, val: JsonValue) {
+        if (!obj.IsObject()) { return }
+        let ks: List<string> = obj.Keys()
+        let n: int = ks.Count()
+        for i in 0..n {
+            if (ks.Get(i) == key) {
+                // Remove old and re-append to preserve key order — JsonValue
+                // doesn't expose a Set, so we round-trip via Append/Remove.
+                // Cheap : object size in workflow state is small.
+                let keys: List<string> = new List<string>()
+                let vals: List<JsonValue> = new List<JsonValue>()
+                for j in 0..n {
+                    let kj: string = ks.Get(j)
+                    if (kj == key) {
+                        keys.Add(kj); vals.Add(val)
+                    } else {
+                        keys.Add(kj); vals.Add(obj.Get(kj))
+                    }
+                }
+                obj.SetObject(keys, vals)
+                return
+            }
+        }
+        obj.AppendEntry(key, val)
+    }
+
+    private List<string> SplitDot(s: string) {
+        let out: List<string> = new List<string>()
+        let n: int = String_Length(s)
+        var cur: string = ""
+        for i in 0..n {
+            let c: string = String_CharAt1(s, i)
+            if (c == ".") {
+                if (String_Length(cur) > 0) { out.Add(cur) }
+                cur = ""
+            } else {
+                cur = cur + c
+            }
+        }
+        if (String_Length(cur) > 0) { out.Add(cur) }
+        return out
+    }
+
+    private JsonValue CelToJson(v: CelValue) {
+        let jv: JsonValue = new JsonValue()
+        if (v.IsNull())  { jv.SetNull();     return jv }
+        if (v.IsBool())  { jv.SetBool(v.B);  return jv }
+        if (v.IsInt())   { jv.SetInt(v.I);   return jv }
+        if (v.IsFloat()) { jv.SetFloat(v.F); return jv }
+        if (v.IsStr())   { jv.SetString(v.S); return jv }
+        if (v.IsList()) {
+            let xs: List<JsonValue> = new List<JsonValue>()
+            let m: int = v.Items.Count()
+            for i in 0..m {
+                xs.Add(this.CelToJson(v.Items.Get(i)))
+            }
+            jv.SetArray(xs)
+            return jv
+        }
+        jv.SetNull()
+        return jv
+    }
+
+    private CelValue JsonToCel(jv: JsonValue) {
+        if (jv.IsNull())   { return CelValue.Null_() }
+        if (jv.IsBool())   { return CelValue.Bool_(jv.AsBool()) }
+        if (jv.IsInt())    { return CelValue.Int_(jv.AsInt()) }
+        if (jv.IsFloat())  { return CelValue.Float_(jv.AsFloat()) }
+        if (jv.IsString()) { return CelValue.Str_(jv.AsString()) }
+        if (jv.IsArray()) {
+            let items: List<JsonValue> = jv.AsArray()
+            let xs: List<CelValue> = new List<CelValue>()
+            let m: int = items.Count()
+            for i in 0..m {
+                xs.Add(this.JsonToCel(items.Get(i)))
+            }
+            return CelValue.List__(xs)
+        }
+        // Objects don't round-trip into CelValue ; expose as Null.
+        return CelValue.Null_()
+    }
+
+    // Build a CelEnv with state / params / msg bound. Includes the
+    // current frame's params + every loop var bound on that frame.
+    private CelEnv BuildEnv() {
+        let env: CelEnv = new CelEnv()
+        env.Bind("state", this.State)
+        // params — pseudo-root: pack the current frame's params into a
+        // synthetic JsonValue object so dotted access works (params.X).
+        let frame: PollenFrame = this.CurrentFrame()
+        let pObj: JsonValue = new JsonValue()
+        let pKeys: List<string> = new List<string>()
+        let pVals: List<JsonValue> = new List<JsonValue>()
+        pObj.SetObject(pKeys, pVals)
+        let np: int = frame.ParamKeys.Count()
+        for i in 0..np {
+            let k: string = frame.ParamKeys.Get(i)
+            let v: CelValue = frame.ParamVals.Get(i)
+            this.JsonObjectSet(pObj, k, this.CelToJson(v))
+        }
+        env.Bind("params", pObj)
+        // Loop vars — also expose each frame param at the top level so
+        // bare `item.X` works (cel-lite.md §4 loop-bound roots).
+        for i in 0..np {
+            let k: string = frame.ParamKeys.Get(i)
+            env.Bind(k, this.CelToJson(frame.ParamVals.Get(i)))
+        }
+        // msg.data — bind the bus envelope if present.
+        if (this.MsgEnvelope.IsObject()) {
+            env.Bind("msg", this.MsgEnvelope)
+        }
+        return env
+    }
+
+    // Lex+parse+eval a single expression against the current env.
+    private CelValue EvalExpr(src: string) {
+        if (String_Length(src) == 0) { return CelValue.Null_() }
+        let lex: CelLexer = new CelLexer(src)
+        let toks: List<CelToken> = lex.Lex()
+        if (lex.HasFailed()) {
+            this.Fail("lex: " + lex.ErrorMsg() + " in '" + src + "'")
+            return CelValue.Null_()
+        }
+        let par: CelParser = new CelParser(toks)
+        let root: int = par.Parse()
+        if (par.HasFailed()) {
+            this.Fail("parse: " + par.ErrorMsg() + " in '" + src + "'")
+            return CelValue.Null_()
+        }
+        let env: CelEnv = this.BuildEnv()
+        let ev: CelEval = new CelEval(par.Nodes, env)
+        let v: CelValue = ev.Eval(root)
+        if (ev.HasFailed()) {
+            this.Fail("eval: " + ev.ErrorMsg() + " in '" + src + "'")
+            return CelValue.Null_()
+        }
+        return v
     }
 }

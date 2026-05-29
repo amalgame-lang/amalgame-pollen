@@ -2,6 +2,64 @@
 
 ## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
 
+### Added — Pollen v3 tree-walker dispatcher (Phase 3a, AM-side)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher".
+
+Choice : AM-side dispatcher (not C). Reuses the Phase 1 CelEval verbatim
+for every expression — no parallel C-side eval implementation. Reads
+the AST through the Phase 2 C-side accessors.
+
+- `PollenFrame` — one call-stack frame : entry idx, param bindings,
+  bind-key (where to write the entry's `returns` on pop), caller-idx.
+- `PollenDispatcher` — owns the frame stack (cap 64,
+  `POLLEN_CALL_STACK_MAX`), the per-message state blackboard
+  (`JsonValue` object), and the bus envelope. Public entry points :
+  - `Pollen.WorkflowV3DispatchEntry(eidx, envelopeJson) → int`
+  - `Pollen.WorkflowV3DispatchEntryState(eidx, envelopeJson) → JsonValue`
+  - dotted-key state Set/Get walking nested objects, creating leaves
+    on demand.
+- Step handlers implemented :
+  - `set`    — eval value, write to dotted state key
+  - `goto`   — push frame, bind params from `args[]`, dispatch target
+    body, eval `returns`, pop, bind into caller's state via `bind`
+  - `anchor` — fall-through no-op
+  - `if`     — first-match-wins over `cases[].when` + `else: true`
+  - `for`    — eval `in`, iterate the list, bind loop var on the
+    current frame's params (also exposed at the env root so bare
+    `item.X` works per cel-lite §4)
+  - `while`  — eval `cond`, dispatch body, bounded by `maxIter` or
+    a 100k hard cap
+  - `call`   — STUB this slice : records the action name into
+    `state.__calls[]` so tests can verify the dispatcher walked it.
+    Full LB via capability registry + bus forwarding ships in
+    Phase 3b.
+- Eval bridges : `BuildEnv()` exposes `state` / `params` / `msg` plus
+  each frame param as a top-level root ; `CelToJson` / `JsonToCel`
+  bridge the two value types.
+- 16 additional C-side accessors needed by the dispatcher exposed via
+  AM wrappers (NodeExpr / NodeBind / NodeMode / NodeOnError /
+  NodeMaxIter / NodeHasElse / NodeArgsCount / NodeArg /
+  EntryHasReturns / EntryReturns / EntryParamCount / EntryParam /
+  AnchorEntryIdx / AnchorNodeIdx).
+
+### Tests
+
+- `tests/v3_dispatch_smoke.am` (+ `build-v3-dispatch-smoke.sh`) +
+  `examples/workflow-v3-dispatch-fixture.json` — 21 assertions
+  covering every implemented step (linear sequence, arithmetic, if
+  branching, for iteration + sum, while + maxIter, goto with params /
+  returns / bind, call stub audit). All green.
+
+### Notes
+
+- v2 dispatcher / routing tables remain alive. This phase adds a
+  parallel v3 dispatch entry point ; no wiring into the bus listener
+  yet (Phase 3b).
+- `call` is intentionally a stub here — once the listener fork lands
+  it'll dispatch through the capability registry with mode=one (P2C
+  LB) / mode=all (broadcast) per the spec.
+
 ### Added — Pollen v3 runtime loader + AST + name resolver (Phase 2, C-side)
 
 Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher", §"Memory bounds".

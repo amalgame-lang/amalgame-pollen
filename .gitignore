@@ -13,3 +13,6 @@
 
 # v3 loader smoke test binary (built by tests/build-v3-loader-smoke.sh)
 /tests/v3_loader_smoke
+
+# v3 dispatcher smoke test binary (built by tests/build-v3-dispatch-smoke.sh)
+/tests/v3_dispatch_smoke
