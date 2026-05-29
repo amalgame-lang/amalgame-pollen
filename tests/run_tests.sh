@@ -16,14 +16,25 @@ if [ ! -x "$AMC" ]; then
 fi
 
 AMC_DIR="$(dirname "$(readlink -f "$AMC")")"
-# amc tarball layout : <prefix>/bin/amc + <prefix>/share/amalgame/runtime/
+# amc tarball layout : <prefix>/bin/amc + <prefix>/share/amalgame/{runtime,lib}/
 RUNTIME_DIR="$AMC_DIR/../share/amalgame/runtime"
+LIBAMALGAME="$AMC_DIR/../share/amalgame/lib/libamalgame.a"
 if [ ! -d "$RUNTIME_DIR" ]; then
     # local dev layout : <amc-source>/amc + <amc-source>/runtime/
     RUNTIME_DIR="$AMC_DIR/runtime"
+    LIBAMALGAME="$AMC_DIR/lib/libamalgame.a"
 fi
 if [ ! -d "$RUNTIME_DIR" ]; then
     echo "couldn't locate amc runtime headers (looked under $AMC_DIR)" >&2
+    exit 1
+fi
+if [ ! -f "$LIBAMALGAME" ]; then
+    # v3 validator code references JsonValue/JsonParser symbols from
+    # libamalgame.a (the AM stdlib archive shipped alongside amc). The
+    # link will fail without it. Without --start-group/--end-group the
+    # symbol resolution is order-sensitive : pkg → libamalgame in a
+    # group so circular refs (pkg ↔ stdlib facade) resolve cleanly.
+    echo "couldn't locate libamalgame.a (looked under $AMC_DIR)" >&2
     exit 1
 fi
 
@@ -39,8 +50,9 @@ for c in tests/*.c; do
     name="$(basename "$c" .c)"
     out="/tmp/amalgame-pollen-test-$name"
     echo "== compiling $c"
-    gcc -O2 -I"$RUNTIME_DIR" -I./runtime "$c" "$ARCHIVE" \
-        -lgc -lpthread -o "$out"
+    gcc -O2 -I"$RUNTIME_DIR" -I./runtime "$c" \
+        -Wl,--start-group "$ARCHIVE" "$LIBAMALGAME" -Wl,--end-group \
+        -lgc -lm -lpthread -o "$out"
     echo "== running $name"
     if ! "$out"; then
         echo "FAIL $name"
