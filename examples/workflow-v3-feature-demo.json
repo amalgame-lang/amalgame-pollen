@@ -49,6 +49,7 @@
     },
     {
       "name": "retry-from-cache",
+      "on":      "data.retry",
       "params":  ["dataset"],
       "returns": "state.summary",
       "do":      { "type": "goto", "target": "after-fetch" }
