@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
+
+### Added — Pollen v3 CEL-lite expression engine (Phase 1, AM-side)
+
+Spec : `docs/proposals/pollen-v3-cel-lite.md`. Lives in `facade.am`.
+
+- `CelLexer`  — char-by-char tokenizer, every literal/op from the spec
+  (ints, floats, strings with `\" \\ \n \t` escapes, bools, null,
+  idents, all single/two-char operators). Bound : 256 tokens.
+- `CelParser` — Pratt parser with a precedence table for binary ops,
+  explicit dispatch for unary/postfix/ternary/primary, list literals
+  and calls. Bound : 128 AST nodes. Produces an indexed node pool
+  consumed by the evaluator.
+- `CelValue` — tagged-union runtime value (`Null/Bool/Int/Float/Str/List_`).
+- `CelEnv`   — path-root resolver bridge, JSON-backed. Caller pushes
+  the well-known roots (`state`, `params`, `msg`) plus any for-loop
+  var binding before eval ; missing path → `null` per spec.
+- `CelEval`  — tree-walking evaluator implementing every coercion +
+  builtin (`len`, `int`, `float`, `string`, `bool`, `contains`,
+  `startsWith`, `endsWith`), short-circuit `&&` / `||`, ternary,
+  `in` for `string in string` and `T in list<T>`, list indexing,
+  div/mod-by-zero → null, ordered compare against null → type error.
+
+### Validator rule 8 now fully enforced
+
+- New private helper `Pollen._v3CheckExpr(expr, ctx, path, diags)` runs
+  Lex + Parse on every expression string and emits `[error rule8]`
+  diagnostics with lex/parse error messages + column numbers.
+- All previous "non-empty" stub checks for `set.value`, `if.cases[].when`,
+  `for.in`, `while.cond`, `goto.args[]`, `entry.returns` replaced by
+  the new helper. The 9 shipped v3 example workflows still validate
+  with zero errors.
+
+### Tests
+
+- `tests/cel_lite_smoke.am` (+ `build-cel-lite-smoke.sh`) — 83 assertions
+  covering parse happy / error path, arithmetic, comparison, logical
+  ops, string concat + builtins, `in` operator, list indexing, and
+  env-backed path resolution. All green.
+- Existing `tests/v3_validator_smoke.am` — still 9/9 clean.
+
+### Notes
+- The unknown-path-root warn from cel-lite.md §4 is **deferred**. The
+  validator can't distinguish a typo from a legit for-loop var without
+  threading scope info ; the Phase 2 runtime resolver will fire the
+  warning instead.
+- Locked-out v0.4+ features (comprehensions, macros, regex, map
+  literals, string slicing, bitwise ops) reject cleanly at parse time.
+
+
 ## v0.1.23 — 2026-05-28
 
 ### Added — explicit `while.body` (uniform schema with `for.do` / `if.then`)
