@@ -1,0 +1,21 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-for-demo",
+  "version": 1,
+  "actions": {
+    "ingest":  { "topic": "order.in" },
+    "process": { "topic": "order.process" }
+  },
+  "entries": [
+    {
+      "name": "main",
+      "on":   "order.in",
+      "do":   [
+        { "type": "call", "action": "ingest" },
+        { "type": "for", "var": "line",
+          "in":   "msg.data.lines",
+          "do":   { "type": "call", "action": "process" } }
+      ]
+    }
+  ]
+}

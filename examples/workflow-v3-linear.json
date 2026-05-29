@@ -1,0 +1,21 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-linear-demo",
+  "version": 1,
+  "actions": {
+    "ingest":  { "topic": "order.in" },
+    "enrich":  { "topic": "order.enrich" },
+    "persist": { "topic": "order.persist" }
+  },
+  "entries": [
+    {
+      "name": "main",
+      "on":   "order.in",
+      "do":   [
+        { "type": "call", "action": "ingest" },
+        { "type": "call", "action": "enrich" },
+        { "type": "call", "action": "persist" }
+      ]
+    }
+  ]
+}

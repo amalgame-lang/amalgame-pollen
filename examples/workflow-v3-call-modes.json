@@ -1,0 +1,36 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-call-modes-demo",
+  "version": 1,
+  "actions": {
+    "ingest":   { "topic": "event.in" },
+    "store":    { "topic": "event.store" },
+    "broadcast":{ "topic": "event.broadcast" },
+    "audit":    { "topic": "event.audit" },
+    "cache":    { "topic": "event.cache" }
+  },
+  "entries": [
+    {
+      "name": "main",
+      "on":   "event.in",
+      "do":   [
+        { "type": "call", "action": "ingest" },
+
+        { "type": "call", "action": "store",
+          "mode": "one",
+          "on_error": "fail" },
+
+        { "type": "call", "action": "broadcast",
+          "mode": "all" },
+
+        { "type": "call", "action": "audit",
+          "mode": "all",
+          "on_error": "log" },
+
+        { "type": "call", "action": "cache",
+          "mode": "one",
+          "on_error": "drop" }
+      ]
+    }
+  ]
+}
