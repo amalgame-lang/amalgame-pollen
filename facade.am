@@ -3160,6 +3160,443 @@ import Amalgame.String
         return (code_string) out;
     }
 
+    /* === Pollen v3 — runtime AST + name resolver =============
+     *
+     * Phase 2 of the v3 roadmap (docs/proposals/pollen-v3.md §"v3
+     * dispatcher"). Storage only — no dispatch yet (Phase 3).
+     *
+     * Layout :
+     *   - one flat AST pool indexed by int32. Each node carries a
+     *     `kind`, up to two child indices, and a `next_sibling`
+     *     index that chains array-of-steps sequences. Container
+     *     types (`for`, `while`, `if`, `entry.do`) point `child0`
+     *     at the head of the body chain.
+     *   - one entries[] pool, one anchors[] pool, one actions[] pool.
+     *     entries[i].do_root indexes into the AST pool ; anchors[i]
+     *     and goto-target resolution carry int idx into entries[] /
+     *     anchors[] (see `goto_kind`).
+     *   - GC-allocated `const char*` strings for names / exprs /
+     *     params / bind_key, so an entry name like "shared-pipeline"
+     *     isn't capped at a fixed buffer length.
+     *
+     * Setters are called from AM-side `Pollen.WorkflowLoadV3` between
+     * `_pollen_v3_reload_begin` and `_pollen_v3_reload_commit`. The
+     * commit step runs `_pollen_v3_resolve_gotos` so post-load each
+     * goto node knows whether its target is an entry or an anchor.
+     */
+
+    #define POLLEN_MAX_ENTRIES             256
+    #define POLLEN_MAX_AST_NODES          4096
+    #define POLLEN_MAX_ANCHORS_TOTAL      4096
+    #define POLLEN_MAX_ACTIONS             256
+    #define POLLEN_MAX_ENTRY_PARAMS          8
+
+    /* PollenAstKind — must match enum CelNodeKind / AM-side AstKind
+     * indices used by the walker (see WorkflowLoadV3). */
+    #define POLLEN_AST_CALL    1
+    #define POLLEN_AST_IF      2
+    #define POLLEN_AST_FOR     3
+    #define POLLEN_AST_WHILE   4
+    #define POLLEN_AST_SET     5
+    #define POLLEN_AST_GOTO    6
+    #define POLLEN_AST_ANCHOR  7
+    #define POLLEN_AST_CASE    8   /* synthetic — one per if.cases[i] */
+
+    /* goto_kind values stored on POLLEN_AST_GOTO nodes after resolve. */
+    #define POLLEN_GOTO_UNRESOLVED  0
+    #define POLLEN_GOTO_ENTRY       1
+    #define POLLEN_GOTO_ANCHOR      2
+
+    typedef struct {
+        uint8_t  kind;
+        uint8_t  mode;          /* call.mode : 0=one  1=all */
+        uint8_t  on_error;      /* call.on_error : 0=log 1=fail 2=drop */
+        uint8_t  has_else;      /* CASE node : 1 if `else: true` */
+        int32_t  child0;        /* container body head ; CASE → body head */
+        int32_t  child1;        /* reserved for future use */
+        int32_t  next_sibling;  /* chain element of sequence / case list */
+        int32_t  max_iter;      /* while.maxIter (0 = no cap declared) */
+        int32_t  args_first;    /* goto.args[] — flat pool offset */
+        int32_t  args_count;
+        int32_t  goto_kind;     /* POLLEN_GOTO_* */
+        int32_t  goto_idx;      /* entries[]/anchors[] idx post-resolve */
+        const char* name;       /* call.action / set.key / goto.target /
+                                  * anchor.name / for.var */
+        const char* expr;       /* when / cond / in / value / arg /
+                                  * returns / goto target name before resolve */
+        const char* bind_key;   /* goto.bind */
+    } PollenAstNode;
+
+    typedef struct {
+        const char* name;
+        const char* on_topic;        /* NULL if no `on:` */
+        int32_t     do_root;          /* AST idx of body head, -1 if empty */
+        int32_t     has_returns;
+        const char* returns_expr;
+        int32_t     params_count;
+        const char* params[POLLEN_MAX_ENTRY_PARAMS];
+    } PollenEntry;
+
+    typedef struct {
+        const char* name;
+        int32_t     entry_idx;
+        int32_t     node_idx;
+    } PollenAnchor;
+
+    typedef struct {
+        const char* name;
+        const char* topic;
+    } PollenAction;
+
+    static PollenAstNode _pollen_v3_ast[POLLEN_MAX_AST_NODES];
+    static int           _pollen_v3_ast_count;
+
+    static PollenEntry   _pollen_v3_entries[POLLEN_MAX_ENTRIES];
+    static int           _pollen_v3_entry_count;
+
+    static PollenAnchor  _pollen_v3_anchors[POLLEN_MAX_ANCHORS_TOTAL];
+    static int           _pollen_v3_anchor_count;
+
+    static PollenAction  _pollen_v3_actions[POLLEN_MAX_ACTIONS];
+    static int           _pollen_v3_action_count;
+
+    /* Args pool — every goto.args[] expression slots a (char*) here ;
+     * the goto node carries (args_first, args_count) into this pool. */
+    #define POLLEN_MAX_ARG_STRINGS  1024
+    static const char* _pollen_v3_args_pool[POLLEN_MAX_ARG_STRINGS];
+    static int         _pollen_v3_args_pool_count;
+
+    /* Load-time error trail. The AM walker bubbles a clear message up
+     * to the caller without using exceptions ; we leave it accessible
+     * to AM via Pollen.WorkflowLoadErrorMsg(). */
+    static char _pollen_v3_load_err[512];
+    static int  _pollen_v3_has_load_err;
+
+    static int _pollen_v3_active;   /* 1 once a v3 workflow has been
+                                      * committed ; flipped off only by
+                                      * a v2 load or another v3 reload */
+
+    static void _pollen_v3_set_err(const char* msg) {
+        if (_pollen_v3_has_load_err) return;   /* keep first error */
+        strncpy(_pollen_v3_load_err, msg, sizeof(_pollen_v3_load_err) - 1);
+        _pollen_v3_load_err[sizeof(_pollen_v3_load_err) - 1] = 0;
+        _pollen_v3_has_load_err = 1;
+    }
+
+    /* GC-backed strdup so AM-supplied `code_string`s survive past the
+     * setter call (the AM side may reuse its own buffers). */
+    static const char* _pollen_v3_dup(const char* s) {
+        if (!s) return 0;
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (!out) return 0;
+        memcpy(out, s, n);
+        out[n] = 0;
+        return out;
+    }
+
+    static void _pollen_v3_reload_begin(void) {
+        pthread_mutex_lock(&_pollen_wf_mutex);
+        _pollen_v3_ast_count    = 0;
+        _pollen_v3_entry_count  = 0;
+        _pollen_v3_anchor_count = 0;
+        _pollen_v3_action_count = 0;
+        _pollen_v3_args_pool_count = 0;
+        _pollen_v3_load_err[0]  = 0;
+        _pollen_v3_has_load_err = 0;
+    }
+
+    /* Allocate a fresh node, return its index. -1 on overflow. */
+    static int _pollen_v3_alloc_node(int kind) {
+        if (_pollen_v3_ast_count >= POLLEN_MAX_AST_NODES) {
+            _pollen_v3_set_err("AST node pool exhausted (POLLEN_MAX_AST_NODES=4096)");
+            return -1;
+        }
+        int i = _pollen_v3_ast_count++;
+        PollenAstNode* n = &_pollen_v3_ast[i];
+        memset(n, 0, sizeof(*n));
+        n->kind         = (uint8_t) kind;
+        n->child0       = -1;
+        n->child1       = -1;
+        n->next_sibling = -1;
+        n->args_first   = -1;
+        n->args_count   = 0;
+        n->goto_kind    = POLLEN_GOTO_UNRESOLVED;
+        n->goto_idx     = -1;
+        return i;
+    }
+
+    static int _pollen_v3_node_set_name(int idx, const char* name) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].name = _pollen_v3_dup(name);
+        return 0;
+    }
+    static int _pollen_v3_node_set_expr(int idx, const char* e) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].expr = _pollen_v3_dup(e);
+        return 0;
+    }
+    static int _pollen_v3_node_set_bind(int idx, const char* b) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].bind_key = _pollen_v3_dup(b);
+        return 0;
+    }
+    static int _pollen_v3_node_set_child0(int idx, int child) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].child0 = child;
+        return 0;
+    }
+    static int _pollen_v3_node_set_next(int idx, int next) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].next_sibling = next;
+        return 0;
+    }
+    static int _pollen_v3_node_set_mode(int idx, int mode) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].mode = (uint8_t) mode;
+        return 0;
+    }
+    static int _pollen_v3_node_set_on_error(int idx, int oe) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].on_error = (uint8_t) oe;
+        return 0;
+    }
+    static int _pollen_v3_node_set_max_iter(int idx, int mi) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].max_iter = mi;
+        return 0;
+    }
+    static int _pollen_v3_node_set_has_else(int idx, int he) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].has_else = (uint8_t) (he ? 1 : 0);
+        return 0;
+    }
+
+    /* Append a goto-arg expression to the flat pool, return its idx. */
+    static int _pollen_v3_push_arg(const char* expr) {
+        if (_pollen_v3_args_pool_count >= POLLEN_MAX_ARG_STRINGS) {
+            _pollen_v3_set_err("goto.args pool exhausted (POLLEN_MAX_ARG_STRINGS=1024)");
+            return -1;
+        }
+        int i = _pollen_v3_args_pool_count++;
+        _pollen_v3_args_pool[i] = _pollen_v3_dup(expr);
+        return i;
+    }
+
+    static int _pollen_v3_node_set_args(int idx, int first, int count) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].args_first = first;
+        _pollen_v3_ast[idx].args_count = count;
+        return 0;
+    }
+
+    /* === Entries ============================================ */
+
+    static int _pollen_v3_add_entry(const char* name, const char* on_topic) {
+        if (_pollen_v3_entry_count >= POLLEN_MAX_ENTRIES) {
+            _pollen_v3_set_err("entries[] full (POLLEN_MAX_ENTRIES=256)");
+            return -1;
+        }
+        int i = _pollen_v3_entry_count++;
+        PollenEntry* e = &_pollen_v3_entries[i];
+        memset(e, 0, sizeof(*e));
+        e->name     = _pollen_v3_dup(name);
+        e->on_topic = (on_topic && on_topic[0]) ? _pollen_v3_dup(on_topic) : 0;
+        e->do_root  = -1;
+        return i;
+    }
+
+    static int _pollen_v3_entry_set_do_root(int eidx, int node_idx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        _pollen_v3_entries[eidx].do_root = node_idx;
+        return 0;
+    }
+    static int _pollen_v3_entry_set_returns(int eidx, const char* expr) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        _pollen_v3_entries[eidx].has_returns  = 1;
+        _pollen_v3_entries[eidx].returns_expr = _pollen_v3_dup(expr);
+        return 0;
+    }
+    static int _pollen_v3_entry_add_param(int eidx, const char* name) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        PollenEntry* e = &_pollen_v3_entries[eidx];
+        if (e->params_count >= POLLEN_MAX_ENTRY_PARAMS) {
+            _pollen_v3_set_err("entry params overflow (POLLEN_MAX_ENTRY_PARAMS=8)");
+            return -1;
+        }
+        e->params[e->params_count++] = _pollen_v3_dup(name);
+        return 0;
+    }
+
+    /* === Anchors ============================================ */
+
+    static int _pollen_v3_add_anchor(int entry_idx, const char* name,
+                                       int node_idx) {
+        if (_pollen_v3_anchor_count >= POLLEN_MAX_ANCHORS_TOTAL) {
+            _pollen_v3_set_err("anchors[] full (POLLEN_MAX_ANCHORS_TOTAL=4096)");
+            return -1;
+        }
+        int i = _pollen_v3_anchor_count++;
+        PollenAnchor* a = &_pollen_v3_anchors[i];
+        a->name      = _pollen_v3_dup(name);
+        a->entry_idx = entry_idx;
+        a->node_idx  = node_idx;
+        return i;
+    }
+
+    /* === Actions ============================================ */
+
+    static int _pollen_v3_add_action(const char* name, const char* topic) {
+        if (_pollen_v3_action_count >= POLLEN_MAX_ACTIONS) {
+            _pollen_v3_set_err("actions[] full (POLLEN_MAX_ACTIONS=256)");
+            return -1;
+        }
+        int i = _pollen_v3_action_count++;
+        _pollen_v3_actions[i].name  = _pollen_v3_dup(name);
+        _pollen_v3_actions[i].topic = _pollen_v3_dup(topic);
+        return i;
+    }
+
+    /* === Lookups ============================================ */
+
+    static int _pollen_v3_lookup_entry(const char* name) {
+        if (!name) return -1;
+        for (int i = 0; i < _pollen_v3_entry_count; i++) {
+            if (_pollen_v3_entries[i].name &&
+                strcmp(_pollen_v3_entries[i].name, name) == 0) return i;
+        }
+        return -1;
+    }
+    static int _pollen_v3_lookup_anchor(const char* name) {
+        if (!name) return -1;
+        for (int i = 0; i < _pollen_v3_anchor_count; i++) {
+            if (_pollen_v3_anchors[i].name &&
+                strcmp(_pollen_v3_anchors[i].name, name) == 0) return i;
+        }
+        return -1;
+    }
+    static int _pollen_v3_lookup_action(const char* name) {
+        if (!name) return -1;
+        for (int i = 0; i < _pollen_v3_action_count; i++) {
+            if (_pollen_v3_actions[i].name &&
+                strcmp(_pollen_v3_actions[i].name, name) == 0) return i;
+        }
+        return -1;
+    }
+
+    /* === Goto resolver ====================================== */
+    /*
+     * Walks the AST pool ; for each POLLEN_AST_GOTO node, looks the
+     * target name up against entries first, then anchors. Unresolved
+     * targets stay flagged so the dispatcher can fail-fast at run
+     * time (the validator already rejects them at load time, but the
+     * runtime double-check is cheap insurance).
+     */
+    static int _pollen_v3_resolve_gotos(void) {
+        int unresolved = 0;
+        for (int i = 0; i < _pollen_v3_ast_count; i++) {
+            PollenAstNode* n = &_pollen_v3_ast[i];
+            if (n->kind != POLLEN_AST_GOTO) continue;
+            int eidx = _pollen_v3_lookup_entry(n->name);
+            if (eidx >= 0) {
+                n->goto_kind = POLLEN_GOTO_ENTRY;
+                n->goto_idx  = eidx;
+                continue;
+            }
+            int aidx = _pollen_v3_lookup_anchor(n->name);
+            if (aidx >= 0) {
+                n->goto_kind = POLLEN_GOTO_ANCHOR;
+                n->goto_idx  = aidx;
+                continue;
+            }
+            unresolved++;
+        }
+        if (unresolved > 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "goto resolver: %d unresolved target(s)", unresolved);
+            _pollen_v3_set_err(buf);
+        }
+        return unresolved;
+    }
+
+    static int _pollen_v3_reload_commit(void) {
+        int unres = _pollen_v3_resolve_gotos();
+        if (_pollen_v3_has_load_err) {
+            pthread_mutex_unlock(&_pollen_wf_mutex);
+            return -1;
+        }
+        _pollen_v3_active = 1;
+        _pollen_wf_version++;
+        pthread_mutex_unlock(&_pollen_wf_mutex);
+        (void) unres;
+        return 0;
+    }
+
+    /* === Introspection (for tests + dispatcher debug) ========= */
+
+    static int _pollen_v3_count_entries(void) { return _pollen_v3_entry_count; }
+    static int _pollen_v3_count_anchors(void) { return _pollen_v3_anchor_count; }
+    static int _pollen_v3_count_actions(void) { return _pollen_v3_action_count; }
+    static int _pollen_v3_count_nodes(void)   { return _pollen_v3_ast_count; }
+    static int _pollen_v3_is_active(void)     { return _pollen_v3_active; }
+
+    static code_string _pollen_v3_get_load_err(void) {
+        if (!_pollen_v3_has_load_err) {
+            char* out = (char*) GC_MALLOC_ATOMIC(1);
+            if (out) out[0] = 0;
+            return (code_string) out;
+        }
+        size_t n = strlen(_pollen_v3_load_err);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, _pollen_v3_load_err, n); out[n] = 0; }
+        return (code_string) out;
+    }
+
+    static code_string _pollen_v3_entry_name(int eidx) {
+        const char* s = (eidx >= 0 && eidx < _pollen_v3_entry_count)
+                          ? _pollen_v3_entries[eidx].name : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+
+    static int _pollen_v3_entry_do_root(int eidx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        return _pollen_v3_entries[eidx].do_root;
+    }
+    static int _pollen_v3_node_kind(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return (int) _pollen_v3_ast[idx].kind;
+    }
+    static int _pollen_v3_node_child0(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        return _pollen_v3_ast[idx].child0;
+    }
+    static int _pollen_v3_node_next(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        return _pollen_v3_ast[idx].next_sibling;
+    }
+    static int _pollen_v3_node_goto_kind(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].goto_kind;
+    }
+    static int _pollen_v3_node_goto_idx(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        return _pollen_v3_ast[idx].goto_idx;
+    }
+    static code_string _pollen_v3_node_name(int idx) {
+        const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
+                          ? _pollen_v3_ast[idx].name : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+
     /* === Introspection ======================================== */
     static int64_t
     Amalgame_Pollen_Pollen_WorkflowVersion_c(void) {
@@ -5478,5 +5915,369 @@ public class Pollen {
         }
 
         diags.Add("[error shape] " + path + ": unknown step type '" + kind + "'")
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Pollen v3 — runtime loader (Phase 2)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Parses a v3 workflow.json into the C-side AST + name maps
+    // (see docs/proposals/pollen-v3.md §"v3 dispatcher"). All storage
+    // lives in static C buffers ; this AM layer is purely a JSON
+    // walker that calls the `_pollen_v3_*` setters.
+    //
+    // Returns true on success. On failure, WorkflowV3LoadErrorMsg()
+    // returns the first error message ; caller should not consult
+    // the C-side buffers.
+    //
+    // Run Pollen.WorkflowValidateV3() first for full shape diagnostics
+    // — WorkflowLoadV3 assumes a well-formed v3 document.
+
+    public static bool WorkflowLoadV3(workflowPath: string) {
+        if (!File_Exists(workflowPath)) {
+            @c { _pollen_v3_set_err("workflow file not found"); }
+            return false
+        }
+        let body: string = File_ReadAll(workflowPath)
+        let parser: JsonParser = new JsonParser(body)
+        let root: JsonValue = parser.ParseTopLevel()
+        if (parser.HasFailed()) {
+            @c { _pollen_v3_set_err("workflow JSON parse error"); }
+            return false
+        }
+        if (!root.IsObject()) {
+            @c { _pollen_v3_set_err("top-level must be a JSON object"); }
+            return false
+        }
+        if (root.Get("schema").AsString() != "pollen/v3") {
+            @c { _pollen_v3_set_err("expected schema = pollen/v3"); }
+            return false
+        }
+
+        @c { _pollen_v3_reload_begin(); }
+
+        let actionsV: JsonValue = root.Get("actions")
+        if (actionsV.IsObject()) {
+            let aks: List<string> = actionsV.Keys()
+            let nA: int = aks.Count()
+            for ai in 0..nA {
+                let an: string = aks.Get(ai)
+                let topic: string = actionsV.Get(an).Get("topic").AsString()
+                var rc: int = 0
+                @c { rc = _pollen_v3_add_action(an, topic); }
+                if (rc < 0) {
+                    var dummy: int = 0
+                    @c { dummy = _pollen_v3_reload_commit(); }
+                    return false
+                }
+            }
+        }
+
+        let entriesV: JsonValue = root.Get("entries")
+        if (!entriesV.IsArray()) {
+            @c { _pollen_v3_set_err("entries[] missing or not an array"); }
+            return false
+        }
+        let entries: List<JsonValue> = entriesV.AsArray()
+        let nE: int = entries.Count()
+        for i in 0..nE {
+            let e: JsonValue = entries.Get(i)
+            if (!e.IsObject()) { continue }
+            let name: string = e.Get("name").AsString()
+            let onTopic: string = e.Get("on").AsString()
+            var eidx: int = -1
+            @c { eidx = _pollen_v3_add_entry(name, onTopic); }
+            if (eidx < 0) {
+                var dummy: int = 0
+                @c { dummy = _pollen_v3_reload_commit(); }
+                return false
+            }
+            let paramsV: JsonValue = e.Get("params")
+            if (paramsV.IsArray()) {
+                let pl: List<JsonValue> = paramsV.AsArray()
+                let nP: int = pl.Count()
+                for pi in 0..nP {
+                    let pn: string = pl.Get(pi).AsString()
+                    var prc: int = 0
+                    @c { prc = _pollen_v3_entry_add_param(eidx, pn); }
+                    if (prc < 0) {
+                        var dummy: int = 0
+                        @c { dummy = _pollen_v3_reload_commit(); }
+                        return false
+                    }
+                }
+            }
+            if (e.Has("returns") && e.Get("returns").IsString()) {
+                let r: string = e.Get("returns").AsString()
+                @c { _pollen_v3_entry_set_returns(eidx, r); }
+            }
+            let doV: JsonValue = e.Get("do")
+            let bodyHead: int = Pollen._v3LoadDoTree(doV, eidx)
+            if (Pollen._v3LoadHadError()) {
+                var dummy: int = 0
+                @c { dummy = _pollen_v3_reload_commit(); }
+                return false
+            }
+            @c { _pollen_v3_entry_set_do_root(eidx, bodyHead); }
+        }
+
+        var ok: int = 0
+        @c { ok = _pollen_v3_reload_commit(); }
+        return ok == 0
+    }
+
+    // Walk a `do` value (single step OR array of steps), produce a
+    // sibling-chained run, return the head AST index. -1 = empty body.
+    private static int _v3LoadDoTree(doV: JsonValue, entryIdx: int) {
+        if (doV.IsNull()) { return -1 }
+        if (doV.IsObject()) {
+            return Pollen._v3LoadStep(doV, entryIdx)
+        }
+        if (!doV.IsArray()) { return -1 }
+        let arr: List<JsonValue> = doV.AsArray()
+        let n: int = arr.Count()
+        if (n == 0) { return -1 }
+        var head: int = -1
+        var prev: int = -1
+        for i in 0..n {
+            let stepV: JsonValue = arr.Get(i)
+            if (!stepV.IsObject()) { continue }
+            let nidx: int = Pollen._v3LoadStep(stepV, entryIdx)
+            if (nidx < 0) {
+                if (Pollen._v3LoadHadError()) { return -1 }
+                continue
+            }
+            if (head < 0) { head = nidx }
+            if (prev >= 0) {
+                @c { _pollen_v3_node_set_next(prev, nidx); }
+            }
+            prev = nidx
+        }
+        return head
+    }
+
+    // Allocate + populate one AST node from a step object.
+    private static int _v3LoadStep(stepV: JsonValue, entryIdx: int) {
+        let kind: string = stepV.Get("type").AsString()
+
+        if (kind == "call") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_CALL); }
+            if (idx < 0) { return -1 }
+            let action: string = stepV.Get("action").AsString()
+            @c { _pollen_v3_node_set_name(idx, action); }
+            if (stepV.Has("mode")) {
+                let m: string = stepV.Get("mode").AsString()
+                var mi: int = 0
+                if (m == "all") { mi = 1 }
+                @c { _pollen_v3_node_set_mode(idx, mi); }
+            }
+            if (stepV.Has("on_error")) {
+                let oe: string = stepV.Get("on_error").AsString()
+                var oi: int = 0
+                if (oe == "fail") { oi = 1 }
+                else if (oe == "drop") { oi = 2 }
+                @c { _pollen_v3_node_set_on_error(idx, oi); }
+            }
+            return idx
+        }
+
+        if (kind == "set") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_SET); }
+            if (idx < 0) { return -1 }
+            let key: string = stepV.Get("key").AsString()
+            let val: string = stepV.Get("value").AsString()
+            @c { _pollen_v3_node_set_name(idx, key); }
+            @c { _pollen_v3_node_set_expr(idx, val); }
+            return idx
+        }
+
+        if (kind == "if") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_IF); }
+            if (idx < 0) { return -1 }
+            let casesV: JsonValue = stepV.Get("cases")
+            if (casesV.IsArray()) {
+                let cs: List<JsonValue> = casesV.AsArray()
+                let nC: int = cs.Count()
+                var caseHead: int = -1
+                var casePrev: int = -1
+                for ci in 0..nC {
+                    let cVal: JsonValue = cs.Get(ci)
+                    if (!cVal.IsObject()) { continue }
+                    var cnode: int = -1
+                    @c { cnode = _pollen_v3_alloc_node(POLLEN_AST_CASE); }
+                    if (cnode < 0) { return -1 }
+                    let isElse: bool = cVal.Has("else") && cVal.Get("else").AsBool()
+                    if (isElse) {
+                        @c { _pollen_v3_node_set_has_else(cnode, 1); }
+                    } else if (cVal.Has("when")) {
+                        let w: string = cVal.Get("when").AsString()
+                        @c { _pollen_v3_node_set_expr(cnode, w); }
+                    }
+                    let cbody: int = Pollen._v3LoadDoTree(cVal.Get("do"), entryIdx)
+                    @c { _pollen_v3_node_set_child0(cnode, cbody); }
+                    if (caseHead < 0) { caseHead = cnode }
+                    if (casePrev >= 0) {
+                        @c { _pollen_v3_node_set_next(casePrev, cnode); }
+                    }
+                    casePrev = cnode
+                }
+                @c { _pollen_v3_node_set_child0(idx, caseHead); }
+            }
+            return idx
+        }
+
+        if (kind == "for") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_FOR); }
+            if (idx < 0) { return -1 }
+            let v: string = stepV.Get("var").AsString()
+            let inE: string = stepV.Get("in").AsString()
+            @c { _pollen_v3_node_set_name(idx, v); }
+            @c { _pollen_v3_node_set_expr(idx, inE); }
+            let body: int = Pollen._v3LoadDoTree(stepV.Get("do"), entryIdx)
+            @c { _pollen_v3_node_set_child0(idx, body); }
+            return idx
+        }
+
+        if (kind == "while") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_WHILE); }
+            if (idx < 0) { return -1 }
+            let cond: string = stepV.Get("cond").AsString()
+            @c { _pollen_v3_node_set_expr(idx, cond); }
+            if (stepV.Has("maxIter") && stepV.Get("maxIter").IsNumber()) {
+                let mi: int = stepV.Get("maxIter").AsInt()
+                @c { _pollen_v3_node_set_max_iter(idx, mi); }
+            }
+            let body: int = Pollen._v3LoadDoTree(stepV.Get("do"), entryIdx)
+            @c { _pollen_v3_node_set_child0(idx, body); }
+            return idx
+        }
+
+        if (kind == "goto") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_GOTO); }
+            if (idx < 0) { return -1 }
+            let tgt: string = stepV.Get("target").AsString()
+            @c { _pollen_v3_node_set_name(idx, tgt); }
+            if (stepV.Has("args") && stepV.Get("args").IsArray()) {
+                let aa: List<JsonValue> = stepV.Get("args").AsArray()
+                let nA: int = aa.Count()
+                var first: int = -1
+                var count: int = 0
+                for ai in 0..nA {
+                    let aV: JsonValue = aa.Get(ai)
+                    if (!aV.IsString()) { continue }
+                    let ae: string = aV.AsString()
+                    var p: int = -1
+                    @c { p = _pollen_v3_push_arg(ae); }
+                    if (p < 0) { return -1 }
+                    if (first < 0) { first = p }
+                    count = count + 1
+                }
+                @c { _pollen_v3_node_set_args(idx, first, count); }
+            }
+            if (stepV.Has("bind")) {
+                let b: string = stepV.Get("bind").AsString()
+                @c { _pollen_v3_node_set_bind(idx, b); }
+            }
+            return idx
+        }
+
+        if (kind == "anchor") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_ANCHOR); }
+            if (idx < 0) { return -1 }
+            let nm: string = stepV.Get("name").AsString()
+            @c { _pollen_v3_node_set_name(idx, nm); }
+            var ar: int = -1
+            @c { ar = _pollen_v3_add_anchor(entryIdx, nm, idx); }
+            if (ar < 0) { return -1 }
+            return idx
+        }
+
+        return -1
+    }
+
+    private static bool _v3LoadHadError() {
+        var rc: int = 0
+        @c { rc = _pollen_v3_has_load_err; }
+        return rc != 0
+    }
+
+    // ── Introspection helpers (tests + dispatcher debug) ─────────
+
+    public static bool WorkflowV3IsActive() {
+        var r: int = 0
+        @c { r = _pollen_v3_is_active(); }
+        return r != 0
+    }
+    public static int WorkflowV3EntryCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_entries(); }
+        return r
+    }
+    public static int WorkflowV3AnchorCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_anchors(); }
+        return r
+    }
+    public static int WorkflowV3ActionCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_actions(); }
+        return r
+    }
+    public static int WorkflowV3NodeCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_nodes(); }
+        return r
+    }
+    public static string WorkflowV3LoadErrorMsg() {
+        var s: string = ""
+        @c { s = _pollen_v3_get_load_err(); }
+        return s
+    }
+    public static string WorkflowV3EntryName(eidx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_entry_name(eidx); }
+        return s
+    }
+    public static int WorkflowV3EntryDoRoot(eidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_entry_do_root(eidx); }
+        return r
+    }
+    public static int WorkflowV3NodeKind(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_kind(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeChild0(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_child0(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeNext(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_next(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeGotoKind(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_goto_kind(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeGotoIdx(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_goto_idx(idx); }
+        return r
+    }
+    public static string WorkflowV3NodeName(idx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_name(idx); }
+        return s
     }
 }
