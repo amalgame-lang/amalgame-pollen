@@ -1,6 +1,8 @@
 # CEL-lite — Pollen v3 expression language spec
 
-**Status**: draft for review (2026-05-29). Locked once Bastien signs off.
+**Status**: implemented (2026-05-30) — pure-AM lexer + Pratt parser +
+tree-walking evaluator shipped in `facade.am` and wired into the v3
+validator (rule 8). Smoke test : `tests/cel_lite_smoke.am` (83 green).
 Parent: [pollen-v3.md](./pollen-v3.md), Q4 decision.
 
 CEL-lite is the expression language used in every `cond` / `value` /

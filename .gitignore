@@ -7,3 +7,6 @@
 
 # v3 validator smoke test binary (built by tests/build-v3-validator-smoke.sh)
 /tests/v3_validator_smoke
+
+# CEL-lite smoke test binary (built by tests/build-cel-lite-smoke.sh)
+/tests/cel_lite_smoke
