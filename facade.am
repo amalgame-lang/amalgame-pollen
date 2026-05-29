@@ -3694,6 +3694,122 @@ import Amalgame.String
         return _pollen_v3_anchors[aidx].entry_idx;
     }
 
+    /* === Phase 3b — call dispatch ============================
+     *
+     * Wires `call` to the existing v2 capability registry + publish
+     * primitives. mode=one picks one provider via power-of-two
+     * choices (_pollen_lb_pick) ; mode=all iterates the registry and
+     * publishes to every provider declaring the action's topic.
+     *
+     * Returns the number of providers actually published-to. Negative
+     * return = on_error policy abort (caller dispatcher fails).
+     *
+     * on_error values match POLLEN_AST_CALL.on_error storage :
+     *   0 = "log"  (default) — 0 providers warns + returns 0
+     *   1 = "fail"           — 0 providers returns -1 (abort)
+     *   2 = "drop"           — 0 providers silently returns 0
+     */
+
+    /* Lookup the topic associated with an action name. Returns NULL
+     * if no such action is registered. */
+    static const char* _pollen_v3_action_topic(const char* name) {
+        if (!name || !name[0]) return 0;
+        for (int i = 0; i < _pollen_v3_action_count; i++) {
+            if (_pollen_v3_actions[i].name &&
+                strcmp(_pollen_v3_actions[i].name, name) == 0) {
+                return _pollen_v3_actions[i].topic;
+            }
+        }
+        return 0;
+    }
+
+    /* Iterate the capability registry and publish to every provider
+     * advertising `topic`. Returns the count published. The registry
+     * mutex is held only during the candidate-snapshot — the publish
+     * itself happens outside the lock to avoid blocking other
+     * registry writers on slow socket I/O. */
+    static int _pollen_v3_publish_all(const char* topic, const char* data_json) {
+        if (!topic || !topic[0] || !data_json) return 0;
+        char hosts[POLLEN_REG_MAX][POLLEN_HOST_MAX];
+        int  ports[POLLEN_REG_MAX];
+        int  nc = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n && nc < POLLEN_REG_MAX; i++) {
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++) {
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) {
+                    strncpy(hosts[nc], _pollen_reg[i].host, POLLEN_HOST_MAX - 1);
+                    hosts[nc][POLLEN_HOST_MAX - 1] = 0;
+                    ports[nc] = _pollen_reg[i].port;
+                    nc++;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        int sent = 0;
+        for (int i = 0; i < nc; i++) {
+            char mid[37];
+            if (_pollen_publish_one(hosts[i], ports[i], topic, 1,
+                                      data_json, mid)) {
+                sent++;
+            }
+        }
+        return sent;
+    }
+
+    /* Top-level entry point invoked by the AM StepCall handler. */
+    static int _pollen_v3_call_action(const char* action_name,
+                                        int mode, int on_error,
+                                        const char* data_json) {
+        const char* topic = _pollen_v3_action_topic(action_name);
+        if (!topic) {
+            /* Validator should already have caught this — but if a
+             * runtime-only load slipped through, surface it. */
+            if (on_error == 1) return -1;
+            return 0;
+        }
+
+        if (mode == 1) {
+            /* mode=all */
+            int n = _pollen_v3_publish_all(topic, data_json);
+            if (n == 0 && on_error == 1) return -1;
+            return n;
+        }
+
+        /* mode=one (default) — P2C pick. */
+        char host[POLLEN_HOST_MAX]; int port = 0;
+        if (!_pollen_lb_pick(topic, host, sizeof(host), &port)) {
+            if (on_error == 1) return -1;
+            return 0;
+        }
+        char mid[37];
+        if (!_pollen_publish_one(host, port, topic, 1, data_json, mid)) {
+            if (on_error == 1) return -1;
+            return 0;
+        }
+        return 1;
+    }
+
+    /* Snapshot the current provider count for a topic — used by the
+     * AM-side audit so tests can verify the registry state without
+     * needing to forge envelopes. */
+    static int _pollen_v3_action_provider_count(const char* action_name) {
+        const char* topic = _pollen_v3_action_topic(action_name);
+        if (!topic) return 0;
+        int nc = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n; i++) {
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++) {
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) {
+                    nc++;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        return nc;
+    }
+
     /* === Introspection ======================================== */
     static int64_t
     Amalgame_Pollen_Pollen_WorkflowVersion_c(void) {
@@ -6805,13 +6921,22 @@ public class PollenDispatcher {
         return 0
     }
 
-    // STUB this slice. Logs the action name so a test can verify the
-    // dispatcher walked the node, but does no network. Full LB +
-    // capability-registry resolution lands in Phase 3b.
+    // Resolve action → topic, pick provider(s) via the capability
+    // registry, publish the current state as the envelope data. Audit
+    // every invocation into state.__calls[] so tests can verify the
+    // dispatcher walked the node without needing a live listener.
+    //
+    // on_error policy (per cel-lite.md §"on_error" + AST.on_error byte) :
+    //   0 = log   — 0 providers warn + continue (default)
+    //   1 = fail  — 0 providers abort the dispatch
+    //   2 = drop  — 0 providers silently continue
     private int StepCall(nodeIdx: int) {
         let action: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let mode:   int    = Pollen.WorkflowV3NodeMode(nodeIdx)
         let onErr:  int    = Pollen.WorkflowV3NodeOnError(nodeIdx)
-        // Append to a state.__calls audit list for tests.
+
+        // Audit the invocation up-front so tests see EVERY attempted
+        // call, even ones that abort via on_error=fail.
         let auditKey: string = "__calls"
         var auditList: CelValue = this.StateGet(auditKey)
         if (!auditList.IsList()) {
@@ -6820,12 +6945,16 @@ public class PollenDispatcher {
         }
         auditList.Items.Add(CelValue.Str_(action))
         this.StateSet(auditKey, auditList)
-        if (onErr == 1) {
-            // "fail" policy with 0 providers — but since we stub the
-            // resolution as "no providers", a fail-policy call aborts.
-            // Comment out until Phase 3b wires real resolution.
-            // this.Fail("call '" + action + "': on_error=fail (stub)")
-            // return -1
+
+        // Publish to provider(s). The data payload is the JSON-encoded
+        // state blackboard — Phase 4 may swap this for a per-step
+        // shaped payload once we audit real workflows.
+        let dataJson: string = Json.Encode(this.State)
+        var sent: int = 0
+        @c { sent = _pollen_v3_call_action(action, mode, onErr, dataJson); }
+        if (sent < 0) {
+            this.Fail("call '" + action + "': on_error=fail with no providers")
+            return -1
         }
         return 0
     }

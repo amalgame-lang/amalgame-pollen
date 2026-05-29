@@ -80,7 +80,7 @@ public class Program {
             return
         }
         p.AssertTrue("v3 active", Pollen.WorkflowV3IsActive())
-        p.AssertInt("entries", Pollen.WorkflowV3EntryCount(), 8)
+        p.AssertInt("entries", Pollen.WorkflowV3EntryCount(), 11)
 
         Console.WriteLine("-- linear (sequence + set + arithmetic)")
         let s1: JsonValue = p.Dispatch("linear")
@@ -120,7 +120,7 @@ public class Program {
         // shared per dispatch invocation (cel-lite spec §"state scoping").
         p.AssertInt("callee_seen = 7", s5.Get("callee_seen").AsInt(), 7)
 
-        Console.WriteLine("-- with-call (stub — state.__calls audit)")
+        Console.WriteLine("-- with-call (on_error=log default, 0 providers in registry)")
         let s6: JsonValue = p.Dispatch("with-call")
         let calls: JsonValue = s6.Get("__calls")
         p.AssertTrue("calls is array", calls.IsArray())
@@ -131,6 +131,33 @@ public class Program {
                 p.AssertStr("calls[0]=store", cl.Get(0).AsString(), "store")
                 p.AssertStr("calls[1]=alert", cl.Get(1).AsString(), "alert")
             }
+        }
+
+        Console.WriteLine("-- with-call-fail (on_error=fail with 0 providers → abort)")
+        let efIdx: int = p.LookupEntry("with-call-fail")
+        let disp:  PollenDispatcher = new PollenDispatcher()
+        let rc:    int = disp.Run(efIdx, "")
+        p.AssertInt("rc = -1 (abort)", rc, -1)
+        let sf: JsonValue = disp.GetState()
+        // Audit lists the attempted call even on abort.
+        p.AssertTrue("__calls captured", sf.Get("__calls").IsArray())
+        p.AssertInt("before set",        sf.Get("before").AsInt(), 1)
+        // The trailing `set` after the failing call must NOT have run.
+        p.AssertTrue("after NOT set", !sf.Has("after"))
+
+        Console.WriteLine("-- with-call-drop (on_error=drop with 0 providers → silent)")
+        let s7: JsonValue = p.Dispatch("with-call-drop")
+        p.AssertInt("before = 1", s7.Get("before").AsInt(), 1)
+        // drop continues the chain.
+        p.AssertInt("after = 1",  s7.Get("after").AsInt(),  1)
+
+        Console.WriteLine("-- with-call-all (mode=all, 0 providers → 0 published)")
+        let s8: JsonValue = p.Dispatch("with-call-all")
+        // mode=all default on_error=log → 0 providers warns + continues.
+        let c8: JsonValue = s8.Get("__calls")
+        p.AssertTrue("calls audit exists", c8.IsArray())
+        if (c8.IsArray()) {
+            p.AssertInt("calls.length = 1", c8.AsArray().Count(), 1)
         }
 
         Console.WriteLine("")

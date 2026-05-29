@@ -83,6 +83,28 @@
         { "type": "call", "action": "store" },
         { "type": "call", "action": "alert" }
       ]
+    },
+    {
+      "name": "with-call-fail",
+      "do": [
+        { "type": "set",  "key": "before", "value": "1" },
+        { "type": "call", "action": "store", "on_error": "fail" },
+        { "type": "set",  "key": "after",  "value": "1" }
+      ]
+    },
+    {
+      "name": "with-call-drop",
+      "do": [
+        { "type": "set",  "key": "before", "value": "1" },
+        { "type": "call", "action": "store", "on_error": "drop" },
+        { "type": "set",  "key": "after",  "value": "1" }
+      ]
+    },
+    {
+      "name": "with-call-all",
+      "do": [
+        { "type": "call", "action": "store", "mode": "all" }
+      ]
     }
   ]
 }
