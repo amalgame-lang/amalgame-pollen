@@ -2,6 +2,49 @@
 
 ## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
 
+### Added — Pollen v3 `call` step wired to the capability registry (Phase 3b)
+
+Spec : `docs/proposals/pollen-v3.md` §"`call` resolution".
+
+The Phase 3a `call` stub is replaced by real capability-registry
+dispatch reusing the v2 LB + publish primitives.
+
+- New C helpers in the top `@c` block :
+  - `_pollen_v3_action_topic(name)` — action → topic lookup
+  - `_pollen_v3_publish_all(topic, data)` — registry-iterate +
+    `_pollen_publish_one` per provider declaring the topic
+  - `_pollen_v3_call_action(action, mode, on_error, data)` —
+    top-level entry. mode=0 (one) → `_pollen_lb_pick` P2C ; mode=1
+    (all) → broadcast. Returns providers-published-to, or -1 when
+    `on_error="fail"` finds 0 providers.
+- `PollenDispatcher.StepCall` rewritten : audits the call into
+  `state.__calls[]` (audit list stays for tests), JSON-encodes the
+  state via `Json.Encode`, calls the C helper. -1 return → `Fail()`
+  aborts the dispatch.
+- `on_error` policies fully enforced :
+  - `"log"`  *(default)* — 0 providers warns + chain continues
+  - `"fail"` — 0 providers aborts (the trailing step does NOT run)
+  - `"drop"` — 0 providers silently continues
+
+### Tests
+
+`tests/v3_dispatch_smoke.am` extended with three new entries in
+`workflow-v3-dispatch-fixture.json` (`with-call-fail`,
+`with-call-drop`, `with-call-all`). 30 assertions total ; verifies :
+- fail policy : `rc=-1`, `before` ran, `after` did NOT, audit captures
+  the attempted call
+- drop policy : full chain runs silently
+- mode=all : audit records the call ; 0-provider case returns 0 sent
+
+### Notes
+
+- The listener-thread wiring (incoming bus message → dispatch via
+  v3 when `_pollen_v3_active`) is deferred to Phase 3c. Today the v3
+  dispatcher is only callable via `Pollen.WorkflowV3DispatchEntry`.
+- The C-side `_pollen_v3_publish_all` snapshots the registry under
+  the mutex, then sends outside the lock — same pattern as the v2
+  fan-out forwarder, keeps slow socket I/O off the registry hot path.
+
 ### Added — Pollen v3 tree-walker dispatcher (Phase 3a, AM-side)
 
 Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher".
