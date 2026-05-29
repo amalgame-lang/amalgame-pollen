@@ -1,0 +1,88 @@
+{
+  "schema": "pollen/v3",
+  "name": "dispatch-fixture",
+  "version": 1,
+  "actions": {
+    "store":  { "topic": "data.store" },
+    "alert":  { "topic": "ops.alert" }
+  },
+  "entries": [
+    {
+      "name": "linear",
+      "do": [
+        { "type": "set", "key": "answer", "value": "42" },
+        { "type": "set", "key": "greeting", "value": "\"hi-\" + \"bob\"" },
+        { "type": "set", "key": "computed", "value": "1 + 2 * 3" }
+      ]
+    },
+    {
+      "name": "with-if",
+      "do": [
+        { "type": "set", "key": "x", "value": "5" },
+        {
+          "type": "if",
+          "cases": [
+            { "when": "state.x > 10",
+              "do":   { "type": "set", "key": "branch", "value": "\"high\"" } },
+            { "when": "state.x > 3",
+              "do":   { "type": "set", "key": "branch", "value": "\"mid\"" } },
+            { "else": true,
+              "do":   { "type": "set", "key": "branch", "value": "\"low\"" } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "with-for",
+      "do": [
+        { "type": "set", "key": "items", "value": "[10, 20, 30]" },
+        { "type": "set", "key": "sum",   "value": "0" },
+        { "type": "for", "var": "item", "in": "state.items",
+          "do": { "type": "set", "key": "sum", "value": "state.sum + item" } }
+      ]
+    },
+    {
+      "name": "with-while",
+      "do": [
+        { "type": "set", "key": "i", "value": "0" },
+        { "type": "while", "cond": "state.i < 5", "maxIter": 100,
+          "do": { "type": "set", "key": "i", "value": "state.i + 1" } }
+      ]
+    },
+    {
+      "name": "with-anchor",
+      "params": ["start"],
+      "do": [
+        { "type": "set", "key": "x", "value": "params.start" },
+        { "type": "anchor", "name": "after-set" },
+        { "type": "set", "key": "x", "value": "state.x * 2" }
+      ]
+    },
+    {
+      "name": "with-goto",
+      "do": [
+        { "type": "set", "key": "before", "value": "1" },
+        {
+          "type": "goto",
+          "target": "callee",
+          "args":   ["7"],
+          "bind":   "result"
+        },
+        { "type": "set", "key": "after", "value": "1" }
+      ]
+    },
+    {
+      "name": "callee",
+      "params": ["x"],
+      "returns": "params.x * 10",
+      "do": { "type": "set", "key": "callee_seen", "value": "params.x" }
+    },
+    {
+      "name": "with-call",
+      "do": [
+        { "type": "call", "action": "store" },
+        { "type": "call", "action": "alert" }
+      ]
+    }
+  ]
+}
