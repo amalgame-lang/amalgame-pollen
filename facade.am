@@ -26,6 +26,10 @@
 
 namespace Amalgame.Pollen
 
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+
 @c {
     #include <stdio.h>
     #include <stdint.h>
@@ -3538,5 +3542,680 @@ public class Pollen {
         var r: string = ""
         @c { r = Amalgame_Pollen_Pollen_WorkflowActiveRole_c(); }
         return r
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Pollen v3 — workflow.json validator (Phase 1, pure AM)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Loads workflowPath, parses as JSON, enforces the v3 schema
+    // rules 1-7 from docs/proposals/pollen-v3.md ; rule 8 is stubbed
+    // to a non-empty check pending the CEL-lite lexer/parser session.
+    //
+    // Returns a List<string> of diagnostics, each formatted as
+    //   "[severity ruleN] path: message"
+    // Severity is "error" or "warn". An empty list means clean v3.
+    //
+    // Sole entry point ; everything else in this block is a private
+    // static helper invoked via Pollen._v3xxx().
+
+    public static List<string> WorkflowValidateV3(workflowPath: string) {
+        let diags: List<string> = new List<string>()
+
+        if (!File_Exists(workflowPath)) {
+            diags.Add("[error file] {workflowPath}: file not found")
+            return diags
+        }
+        let body: string = File_ReadAll(workflowPath)
+        let parser: JsonParser = new JsonParser(body)
+        let root: JsonValue = parser.ParseTopLevel()
+        if (parser.HasFailed()) {
+            let e: string = parser.ErrorMsg()
+            diags.Add("[error parse] {workflowPath}: {e}")
+            return diags
+        }
+        if (!root.IsObject()) {
+            diags.Add("[error shape] $: top-level must be an object")
+            return diags
+        }
+
+        let schema: string = root.Get("schema").AsString()
+        if (schema != "pollen/v3") {
+            diags.Add("[error schema] $.schema: expected \"pollen/v3\", got \"" + schema + "\"")
+            return diags
+        }
+
+        let entriesV: JsonValue = root.Get("entries")
+        if (!entriesV.IsArray()) {
+            diags.Add("[error shape] $.entries: must be an array")
+            return diags
+        }
+        let entries: List<JsonValue> = entriesV.AsArray()
+        let nEntries: int = entries.Count()
+        if (nEntries == 0) {
+            diags.Add("[error shape] $.entries: at least one entry required")
+            return diags
+        }
+
+        // actions{}: every {name → {topic}} must be a non-empty string.
+        let actionsV: JsonValue = root.Get("actions")
+        let actionNames: List<string> = new List<string>()
+        if (actionsV.IsObject()) {
+            let aks: List<string> = actionsV.Keys()
+            let aN: int = aks.Count()
+            for ai in 0..aN {
+                let an: string = aks.Get(ai)
+                actionNames.Add(an)
+                let aE: JsonValue = actionsV.Get(an)
+                if (!aE.IsObject()) {
+                    diags.Add("[error shape] $.actions." + an + ": must be an object")
+                    continue
+                }
+                let t: string = aE.Get("topic").AsString()
+                if (String_Length(t) == 0) {
+                    diags.Add("[error shape] $.actions." + an + ".topic: required non-empty string")
+                }
+            }
+        } else if (actionsV.IsNull() || !root.Has("actions")) {
+            // tolerate missing actions table (workflows with goto-only chains
+            // may legitimately have none) — but warn so the typo case surfaces.
+            diags.Add("[warn shape] $.actions: missing — workflow has no call() steps?")
+        } else {
+            diags.Add("[error shape] $.actions: must be an object")
+        }
+
+        // ── Pass 1 — collect entry shape + anchor names.
+
+        let entryNames: List<string> = new List<string>()
+        let entryHasOn: List<bool> = new List<bool>()
+        let entryOn: List<string> = new List<string>()
+        let entryHasReturns: List<bool> = new List<bool>()
+        let entryDo: List<JsonValue> = new List<JsonValue>()
+
+        let anchorNames: List<string> = new List<string>()
+        let anchorEntryIdx: List<int> = new List<int>()
+
+        for i in 0..nEntries {
+            let e: JsonValue = entries.Get(i)
+            let path: string = "$.entries[" + String_FromInt(i) + "]"
+            if (!e.IsObject()) {
+                diags.Add("[error shape] " + path + ": must be an object")
+                continue
+            }
+            let name: string = e.Get("name").AsString()
+            if (String_Length(name) == 0) {
+                diags.Add("[error rule1] " + path + ": missing or empty 'name'")
+                continue
+            }
+
+            // Rule 1 — entry-name uniqueness.
+            var dup: bool = false
+            let priorCount: int = entryNames.Count()
+            for p in 0..priorCount {
+                if (entryNames.Get(p) == name) {
+                    diags.Add("[error rule1] " + path + ": duplicate entry name '" + name + "'")
+                    dup = true
+                    break
+                }
+            }
+            if (dup) { continue }
+
+            entryNames.Add(name)
+            let onV: JsonValue = e.Get("on")
+            let onStr: string = onV.AsString()
+            let hasOn: bool = onV.IsString() && String_Length(onStr) > 0
+            entryHasOn.Add(hasOn)
+            entryOn.Add(onStr)
+
+            let retV: JsonValue = e.Get("returns")
+            let hasReturns: bool = retV.IsString() && String_Length(retV.AsString()) > 0
+            entryHasReturns.Add(hasReturns)
+
+            // Rule 8 stub — non-empty `returns` expr if declared.
+            if (e.Has("returns") && retV.IsString() && String_Length(retV.AsString()) == 0) {
+                diags.Add("[error rule8] " + path + ".returns: empty expression")
+            }
+
+            entryDo.Add(e.Get("do"))
+
+            // Anchor collection — recurse into the entry's do tree.
+            let entryOwnerIdx: int = entryNames.Count() - 1
+            Pollen._v3CollectAnchors(e.Get("do"), entryOwnerIdx, anchorNames,
+                                      anchorEntryIdx, entryNames.Get(entryOwnerIdx),
+                                      path + ".do", diags)
+        }
+
+        let nEntriesKept: int = entryNames.Count()
+
+        // Rule 1 — anchor name uniqueness across the whole workflow + no
+        // collision with entry names (flat goto namespace).
+        let nAnchors: int = anchorNames.Count()
+        for i in 0..nAnchors {
+            let an: string = anchorNames.Get(i)
+            for j in 0..i {
+                if (anchorNames.Get(j) == an) {
+                    diags.Add("[error rule1] $.entries[" +
+                               String_FromInt(anchorEntryIdx.Get(i)) +
+                               "]: duplicate anchor name '" + an + "'")
+                    break
+                }
+            }
+            for k in 0..nEntriesKept {
+                if (entryNames.Get(k) == an) {
+                    diags.Add("[error rule1] $.entries[" +
+                               String_FromInt(anchorEntryIdx.Get(i)) +
+                               "]: anchor '" + an + "' collides with an entry name")
+                    break
+                }
+            }
+        }
+
+        // ── Pass 2 — walk every entry body, recording goto edges,
+        // shape errors, depth tracking + rule 8 non-empty expr stub.
+
+        let gotoFromEntry: List<int> = new List<int>()
+        let gotoTarget: List<string> = new List<string>()
+        let gotoToEntry: List<int> = new List<int>()  // -1 if unresolved
+
+        // Hash-able? No — small N. Plain scan for resolution.
+        for i in 0..nEntriesKept {
+            let entryPath: string = "$.entries[" + String_FromInt(i) + "].do"
+            Pollen._v3WalkBody(entryDo.Get(i), i, entryPath, actionNames,
+                                gotoFromEntry, gotoTarget, diags)
+        }
+
+        // Resolve goto targets against entryNames + anchorNames.
+        let nGotos: int = gotoTarget.Count()
+        for gi in 0..nGotos {
+            let tgt: string = gotoTarget.Get(gi)
+            var resolved: int = -1
+            for k in 0..nEntriesKept {
+                if (entryNames.Get(k) == tgt) { resolved = k; break }
+            }
+            if (resolved < 0) {
+                for k in 0..nAnchors {
+                    if (anchorNames.Get(k) == tgt) {
+                        resolved = anchorEntryIdx.Get(k)
+                        break
+                    }
+                }
+            }
+            gotoToEntry.Add(resolved)
+            if (resolved < 0) {
+                diags.Add("[error rule1] $.entries[" +
+                           String_FromInt(gotoFromEntry.Get(gi)) +
+                           "]: goto target '" + tgt + "' resolves to no entry or anchor")
+            }
+        }
+
+        // ── Rules 2-5.
+
+        // Build a "referenced by goto" bitmap keyed by entry index.
+        let refByGoto: List<bool> = new List<bool>()
+        for i in 0..nEntriesKept { refByGoto.Add(false) }
+        // And one for anchor names — to check rule 3 (orphan anchor).
+        let anchorReferenced: List<bool> = new List<bool>()
+        for i in 0..nAnchors { anchorReferenced.Add(false) }
+
+        for gi in 0..nGotos {
+            let tgt: string = gotoTarget.Get(gi)
+            for k in 0..nEntriesKept {
+                if (entryNames.Get(k) == tgt) {
+                    refByGoto.Set(k, true)
+                    break
+                }
+            }
+            for k in 0..nAnchors {
+                if (anchorNames.Get(k) == tgt) {
+                    anchorReferenced.Set(k, true)
+                    break
+                }
+            }
+        }
+
+        for i in 0..nEntriesKept {
+            let path: string = "$.entries[" + String_FromInt(i) + "]"
+            let hasOn: bool = entryHasOn.Get(i)
+            let referenced: bool = refByGoto.Get(i)
+            let hasReturns: bool = entryHasReturns.Get(i)
+            // Rule 2 — entry reachability.
+            if (!hasOn && !referenced) {
+                diags.Add("[error rule2] " + path + ": unreachable entry '" +
+                           entryNames.Get(i) + "' (no 'on:' and no goto targets it)")
+            }
+            // Rule 4 — dual-mode warn.
+            if (hasOn && referenced) {
+                diags.Add("[warn rule4] " + path + ": dual-mode entry '" +
+                           entryNames.Get(i) +
+                           "' — ensure params binding is intentional (bus envelope vs goto args)")
+            }
+            // Rule 5 — return discard.
+            if (hasReturns && hasOn && !referenced) {
+                diags.Add("[warn rule5] " + path + ": entry '" + entryNames.Get(i) +
+                           "' declares 'returns' but is bus-only — value will be discarded")
+            }
+        }
+
+        // Rule 3 — orphan anchors.
+        for i in 0..nAnchors {
+            if (!anchorReferenced.Get(i)) {
+                diags.Add("[warn rule3] $.entries[" +
+                           String_FromInt(anchorEntryIdx.Get(i)) +
+                           "]: orphan anchor '" + anchorNames.Get(i) +
+                           "' (no goto targets it)")
+            }
+        }
+
+        // ── Rule 6 — DFS color-based cycle detection on the entry
+        // goto-call graph. Edge u→v exists if some goto inside entry u
+        // resolves to entry v (or an anchor owned by entry v).
+        // Iterative DFS, three colors: 0=white, 1=gray (on stack), 2=black.
+        let color: List<int> = new List<int>()
+        for i in 0..nEntriesKept { color.Add(0) }
+
+        // Cap to avoid runaway in pathological inputs.
+        var cycleBudget: int = 256
+
+        for s in 0..nEntriesKept {
+            if (color.Get(s) != 0) { continue }
+            let stackNode: List<int> = new List<int>()
+            let stackEdgeCursor: List<int> = new List<int>()
+            stackNode.Add(s)
+            stackEdgeCursor.Add(0)
+            color.Set(s, 1)
+
+            while (stackNode.Count() > 0 && cycleBudget > 0) {
+                cycleBudget = cycleBudget - 1
+                let top: int = stackNode.Count() - 1
+                let cur: int = stackNode.Get(top)
+                let startEi: int = stackEdgeCursor.Get(top)
+
+                var foundNext: int = -1
+                var foundEi: int = startEi
+                for k in startEi..nGotos {
+                    if (gotoFromEntry.Get(k) == cur) {
+                        let tgtIdx: int = gotoToEntry.Get(k)
+                        if (tgtIdx >= 0) {
+                            foundNext = tgtIdx
+                            foundEi = k + 1
+                            break
+                        }
+                    }
+                }
+
+                if (foundNext < 0) {
+                    color.Set(cur, 2)
+                    stackNode.RemoveAt(top)
+                    stackEdgeCursor.RemoveAt(top)
+                    continue
+                }
+
+                stackEdgeCursor.Set(top, foundEi)
+                let c: int = color.Get(foundNext)
+                if (c == 1) {
+                    // Back-edge → cycle. Build chain from the gray stack.
+                    var chain: string = entryNames.Get(foundNext)
+                    var emit: bool = false
+                    let sc: int = stackNode.Count()
+                    for sj in 0..sc {
+                        let v: int = stackNode.Get(sj)
+                        if (v == foundNext) { emit = true }
+                        if (emit) {
+                            chain = chain + " → " + entryNames.Get(v)
+                        }
+                    }
+                    // chain currently starts with the back-edge target and
+                    // ends at the current `cur` ; close the loop visually.
+                    chain = chain + " → " + entryNames.Get(foundNext)
+                    diags.Add("[error rule6] $.entries: goto cycle detected: " + chain)
+                    // Don't push : continue scanning sibling edges.
+                } else if (c == 0) {
+                    color.Set(foundNext, 1)
+                    stackNode.Add(foundNext)
+                    stackEdgeCursor.Add(0)
+                }
+                // c == 2 : already explored, skip silently.
+            }
+        }
+        if (cycleBudget <= 0) {
+            diags.Add("[error rule6] $.entries: cycle-DFS budget exhausted (workflow too tangled — split into files)")
+        }
+
+        // ── Rule 7 — static call-chain depth warn (>32).
+        // Longest path in the goto DAG (only valid if rule 6 found no
+        // cycles ; if it did, skip rule 7 — chain is already broken).
+        var anyCycle: bool = false
+        let dN: int = diags.Count()
+        for di in 0..dN {
+            let d: string = diags.Get(di)
+            // crude substring check via String_Contains if available — fall
+            // back to length+startsWith pattern. Use String_Contains here
+            // (Amalgame.String).
+            if (String_Contains(d, "rule6")) { anyCycle = true; break }
+        }
+        if (!anyCycle) {
+            // Memoized longest-path via post-order DFS. depth[v] = 1 if v
+            // has no outgoing edges, else 1 + max(depth[u] for u in succ(v)).
+            // -1 means not yet computed.
+            let depth: List<int> = new List<int>()
+            for i in 0..nEntriesKept { depth.Add(-1) }
+
+            for s in 0..nEntriesKept {
+                if (depth.Get(s) >= 0) { continue }
+                // iterative post-order
+                let stk: List<int> = new List<int>()
+                let cur: List<int> = new List<int>()  // edge cursor
+                stk.Add(s)
+                cur.Add(0)
+                var depthBudget: int = 4096
+                while (stk.Count() > 0 && depthBudget > 0) {
+                    depthBudget = depthBudget - 1
+                    let top: int = stk.Count() - 1
+                    let v: int = stk.Get(top)
+                    let ei: int = cur.Get(top)
+
+                    var nextV: int = -1
+                    var nextEi: int = ei
+                    for k in ei..nGotos {
+                        if (gotoFromEntry.Get(k) == v) {
+                            let tgtIdx: int = gotoToEntry.Get(k)
+                            if (tgtIdx >= 0) {
+                                nextV = tgtIdx
+                                nextEi = k + 1
+                                break
+                            }
+                        }
+                    }
+                    if (nextV < 0) {
+                        // No more out-edges : compute depth[v] = 1 + max child depth.
+                        var maxChild: int = 0
+                        for k in 0..nGotos {
+                            if (gotoFromEntry.Get(k) == v) {
+                                let tgtIdx: int = gotoToEntry.Get(k)
+                                if (tgtIdx >= 0) {
+                                    let cd: int = depth.Get(tgtIdx)
+                                    if (cd > maxChild) { maxChild = cd }
+                                }
+                            }
+                        }
+                        depth.Set(v, 1 + maxChild)
+                        stk.RemoveAt(top)
+                        cur.RemoveAt(top)
+                        continue
+                    }
+                    cur.Set(top, nextEi)
+                    if (depth.Get(nextV) < 0) {
+                        // push child — but watch for an "already on stack" case
+                        // (shouldn't happen, no cycles assumed) ; cheap guard.
+                        var onStack: bool = false
+                        let sc: int = stk.Count()
+                        for sj in 0..sc {
+                            if (stk.Get(sj) == nextV) { onStack = true; break }
+                        }
+                        if (!onStack) {
+                            stk.Add(nextV)
+                            cur.Add(0)
+                        }
+                    }
+                }
+            }
+
+            var maxDepth: int = 0
+            for i in 0..nEntriesKept {
+                let d: int = depth.Get(i)
+                if (d > maxDepth) { maxDepth = d }
+            }
+            if (maxDepth > 32) {
+                diags.Add("[warn rule7] $.entries: longest goto call-chain depth is " +
+                           String_FromInt(maxDepth) +
+                           " (>32) — runtime cap is 64 frames, consider refactor")
+            }
+        }
+
+        return diags
+    }
+
+    // ───────── private v3 validator helpers ─────────
+
+    // Walk a step (or step-array) collecting `anchor` declarations.
+    // Anchors live anywhere in the entry's do-tree ; the validator
+    // resolves goto targets against the flat global anchor namespace.
+    private static void _v3CollectAnchors(stepV: JsonValue, entryIdx: int,
+            anchorNames: List<string>, anchorEntryIdx: List<int>,
+            entryName: string, path: string, diags: List<string>) {
+
+        if (stepV.IsArray()) {
+            let arr: List<JsonValue> = stepV.AsArray()
+            let n: int = arr.Count()
+            for i in 0..n {
+                Pollen._v3CollectAnchors(arr.Get(i), entryIdx, anchorNames,
+                                          anchorEntryIdx, entryName,
+                                          path + "[" + String_FromInt(i) + "]", diags)
+            }
+            return
+        }
+        if (!stepV.IsObject()) { return }
+        let kind: string = stepV.Get("type").AsString()
+        if (kind == "anchor") {
+            let an: string = stepV.Get("name").AsString()
+            if (String_Length(an) == 0) {
+                diags.Add("[error shape] " + path + ": 'anchor' missing 'name'")
+                return
+            }
+            anchorNames.Add(an)
+            anchorEntryIdx.Add(entryIdx)
+            return
+        }
+        if (kind == "if") {
+            let casesV: JsonValue = stepV.Get("cases")
+            if (!casesV.IsArray()) { return }
+            let cs: List<JsonValue> = casesV.AsArray()
+            let n: int = cs.Count()
+            for i in 0..n {
+                let cVal: JsonValue = cs.Get(i)
+                if (!cVal.IsObject()) { continue }
+                Pollen._v3CollectAnchors(cVal.Get("do"), entryIdx, anchorNames,
+                                          anchorEntryIdx, entryName,
+                                          path + ".cases[" + String_FromInt(i) + "].do", diags)
+            }
+            return
+        }
+        if (kind == "for" || kind == "while") {
+            Pollen._v3CollectAnchors(stepV.Get("do"), entryIdx, anchorNames,
+                                      anchorEntryIdx, entryName,
+                                      path + ".do", diags)
+            return
+        }
+        // call / set / goto : no nested do.
+    }
+
+    // Walk a step-tree collecting goto edges + shape errors. Also
+    // enforces rule 8 stub (every expression field non-empty).
+    private static void _v3WalkBody(stepV: JsonValue, entryIdx: int, path: string,
+            actionNames: List<string>,
+            gotoFromEntry: List<int>, gotoTarget: List<string>,
+            diags: List<string>) {
+
+        if (stepV.IsArray()) {
+            let arr: List<JsonValue> = stepV.AsArray()
+            let n: int = arr.Count()
+            if (n == 0) {
+                diags.Add("[warn shape] " + path + ": empty step array")
+            }
+            for i in 0..n {
+                Pollen._v3WalkBody(arr.Get(i), entryIdx,
+                                    path + "[" + String_FromInt(i) + "]",
+                                    actionNames, gotoFromEntry, gotoTarget, diags)
+            }
+            return
+        }
+        if (!stepV.IsObject()) {
+            diags.Add("[error shape] " + path + ": step must be an object or array")
+            return
+        }
+        let kind: string = stepV.Get("type").AsString()
+        if (String_Length(kind) == 0) {
+            diags.Add("[error shape] " + path + ": step missing 'type'")
+            return
+        }
+
+        if (kind == "call") {
+            let act: string = stepV.Get("action").AsString()
+            if (String_Length(act) == 0) {
+                diags.Add("[error shape] " + path + ": 'call' missing 'action'")
+            } else {
+                var found: bool = false
+                let aN: int = actionNames.Count()
+                for k in 0..aN {
+                    if (actionNames.Get(k) == act) { found = true; break }
+                }
+                if (!found) {
+                    diags.Add("[error shape] " + path + ": 'call' references unknown action '" + act + "'")
+                }
+            }
+            if (stepV.Has("mode")) {
+                let mode: string = stepV.Get("mode").AsString()
+                if (mode != "one" && mode != "all") {
+                    diags.Add("[error shape] " + path + ".mode: must be \"one\" or \"all\", got \"" + mode + "\"")
+                }
+            }
+            if (stepV.Has("on_error")) {
+                let oe: string = stepV.Get("on_error").AsString()
+                if (oe != "log" && oe != "fail" && oe != "drop") {
+                    diags.Add("[error shape] " + path + ".on_error: must be \"log\"/\"fail\"/\"drop\", got \"" + oe + "\"")
+                }
+            }
+            return
+        }
+
+        if (kind == "set") {
+            let key: string = stepV.Get("key").AsString()
+            if (String_Length(key) == 0) {
+                diags.Add("[error shape] " + path + ": 'set' missing 'key'")
+            }
+            let valV: JsonValue = stepV.Get("value")
+            if (!valV.IsString()) {
+                diags.Add("[error shape] " + path + ".value: must be a CEL-lite expression string")
+            } else if (String_Length(valV.AsString()) == 0) {
+                diags.Add("[error rule8] " + path + ".value: empty expression")
+            }
+            return
+        }
+
+        if (kind == "if") {
+            let casesV: JsonValue = stepV.Get("cases")
+            if (!casesV.IsArray()) {
+                diags.Add("[error shape] " + path + ".cases: must be an array")
+                return
+            }
+            let cs: List<JsonValue> = casesV.AsArray()
+            let n: int = cs.Count()
+            if (n == 0) {
+                diags.Add("[error shape] " + path + ".cases: must have at least one case")
+            }
+            for i in 0..n {
+                let cVal: JsonValue = cs.Get(i)
+                let cPath: string = path + ".cases[" + String_FromInt(i) + "]"
+                if (!cVal.IsObject()) {
+                    diags.Add("[error shape] " + cPath + ": case must be an object")
+                    continue
+                }
+                let isElse: bool = cVal.Has("else") && cVal.Get("else").AsBool()
+                if (isElse) {
+                    if (i != n - 1) {
+                        diags.Add("[error shape] " + cPath + ": 'else' case must be terminal")
+                    }
+                } else {
+                    let whenV: JsonValue = cVal.Get("when")
+                    if (!whenV.IsString()) {
+                        diags.Add("[error shape] " + cPath + ".when: must be a CEL-lite expression string")
+                    } else if (String_Length(whenV.AsString()) == 0) {
+                        diags.Add("[error rule8] " + cPath + ".when: empty expression")
+                    }
+                }
+                Pollen._v3WalkBody(cVal.Get("do"), entryIdx, cPath + ".do",
+                                    actionNames, gotoFromEntry, gotoTarget, diags)
+            }
+            return
+        }
+
+        if (kind == "for") {
+            let v: string = stepV.Get("var").AsString()
+            if (String_Length(v) == 0) {
+                diags.Add("[error shape] " + path + ": 'for' missing 'var'")
+            }
+            let inV: JsonValue = stepV.Get("in")
+            if (!inV.IsString()) {
+                diags.Add("[error shape] " + path + ".in: must be a CEL-lite expression string")
+            } else if (String_Length(inV.AsString()) == 0) {
+                diags.Add("[error rule8] " + path + ".in: empty expression")
+            }
+            Pollen._v3WalkBody(stepV.Get("do"), entryIdx, path + ".do",
+                                actionNames, gotoFromEntry, gotoTarget, diags)
+            return
+        }
+
+        if (kind == "while") {
+            let condV: JsonValue = stepV.Get("cond")
+            if (!condV.IsString()) {
+                diags.Add("[error shape] " + path + ".cond: must be a CEL-lite expression string")
+            } else if (String_Length(condV.AsString()) == 0) {
+                diags.Add("[error rule8] " + path + ".cond: empty expression")
+            }
+            if (stepV.Has("maxIter")) {
+                let mi: JsonValue = stepV.Get("maxIter")
+                if (!mi.IsNumber()) {
+                    diags.Add("[error shape] " + path + ".maxIter: must be a number")
+                } else if (mi.AsInt() <= 0) {
+                    diags.Add("[error shape] " + path + ".maxIter: must be > 0")
+                }
+            }
+            Pollen._v3WalkBody(stepV.Get("do"), entryIdx, path + ".do",
+                                actionNames, gotoFromEntry, gotoTarget, diags)
+            return
+        }
+
+        if (kind == "goto") {
+            let tgt: string = stepV.Get("target").AsString()
+            if (String_Length(tgt) == 0) {
+                diags.Add("[error shape] " + path + ": 'goto' missing 'target'")
+                return
+            }
+            gotoFromEntry.Add(entryIdx)
+            gotoTarget.Add(tgt)
+            if (stepV.Has("args")) {
+                let argsV: JsonValue = stepV.Get("args")
+                if (!argsV.IsArray()) {
+                    diags.Add("[error shape] " + path + ".args: must be an array of expressions")
+                } else {
+                    let aa: List<JsonValue> = argsV.AsArray()
+                    let an: int = aa.Count()
+                    for i in 0..an {
+                        let aV: JsonValue = aa.Get(i)
+                        if (!aV.IsString()) {
+                            diags.Add("[error shape] " + path + ".args[" + String_FromInt(i) +
+                                       "]: must be a CEL-lite expression string")
+                        } else if (String_Length(aV.AsString()) == 0) {
+                            diags.Add("[error rule8] " + path + ".args[" + String_FromInt(i) +
+                                       "]: empty expression")
+                        }
+                    }
+                }
+            }
+            if (stepV.Has("bind")) {
+                let b: string = stepV.Get("bind").AsString()
+                if (String_Length(b) == 0) {
+                    diags.Add("[error shape] " + path + ".bind: empty bind key")
+                }
+            }
+            return
+        }
+
+        if (kind == "anchor") {
+            // Already collected in pass 1 ; nothing to walk.
+            return
+        }
+
+        diags.Add("[error shape] " + path + ": unknown step type '" + kind + "'")
     }
 }
