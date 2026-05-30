@@ -2240,22 +2240,11 @@ import Amalgame.String
                 if (!nl) break;
                 size_t line_len = (size_t)(nl - rbuf);
 
-                /* Decide ACK + forward policy under the wf mutex :
-                 *   wf active + topic ∈ consumes : ACK + forward
-                 *   wf active + topic ∉ consumes : drop, no ACK
-                 *   wf inactive                  : ACK (free-form fallback) */
+                /* Decide ACK policy under the wf mutex :
+                 *   v3 active + topic matches an entry's `on:` : ACK + dispatch
+                 *   v3 active + topic doesn't match           : drop, no ACK
+                 *   v3 inactive (no workflow loaded)           : ACK (free-form fallback) */
                 int do_ack = 1;
-                int do_forward = 0;
-                /* M2.4b — capture topic_in extent for the executions
-                 * recorder (set in the matched block below). */
-                const char* topic_in = NULL;
-                size_t topic_in_len = 0;
-                /* Phase 3d — v3 takes precedence over the v2 routing
-                 * tables. If a v3 entry's `on:` matches this topic, we
-                 * mark v3_handled, ACK as if v2 had matched, skip the
-                 * v2 dispatch block, and invoke the AM dispatcher AFTER
-                 * releasing the wf mutex (the dispatcher may call
-                 * Pollen.Publish which would otherwise deadlock). */
                 int v3_handled = 0;
                 const char* v3_topic_gc = 0;
                 const char* v3_env_gc   = 0;
@@ -2263,6 +2252,7 @@ import Amalgame.String
                 if (_pollen_v3_active && _pollen_v3_entry_count > 0) {
                     const char* tp3 = _pollen_find(rbuf, line_len,
                                                      TOPIC_KEY, TOPIC_KEY_LEN);
+                    int matched3 = 0;
                     if (tp3) {
                         tp3 += TOPIC_KEY_LEN;
                         const char* tq3 = memchr(tp3, '"',
@@ -2284,32 +2274,16 @@ import Amalgame.String
                                         v3_topic_gc = td;
                                         v3_env_gc   = ed;
                                         v3_handled  = 1;
-                                        topic_in     = tp3;
-                                        topic_in_len = tlen3;
+                                        matched3    = 1;
                                     }
                                 }
                             }
                         }
                     }
-                }
-                if (!v3_handled && _pollen_wf_active && _pollen_wf_n_consumes > 0) {
-                    const char* tp = _pollen_find(rbuf, line_len,
-                                                    TOPIC_KEY, TOPIC_KEY_LEN);
-                    int matched = 0;
-                    if (tp) {
-                        tp += TOPIC_KEY_LEN;
-                        const char* tq = memchr(tp, '"',
-                                                  line_len - (size_t)(tp - rbuf));
-                        if (tq && _pollen_wf_topic_consumed(
-                                tp, (size_t)(tq - tp))) {
-                            matched = 1;
-                            topic_in = tp;
-                            topic_in_len = (size_t)(tq - tp);
-                        }
-                    }
-                    if (matched) {
-                        do_forward = 1;
-                    } else {
+                    /* v3 is loaded but this topic isn't consumed by any
+                     * entry → drop silently (no ACK), same shape as the
+                     * v2 dispatcher's "topic not in consumes" branch. */
+                    if (!matched3) {
                         do_ack = 0;
                     }
                 }
@@ -2343,138 +2317,6 @@ import Amalgame.String
                                     goto worker_done;
                                 }
                             }
-                        }
-                    }
-                    if (do_forward) {
-                        /* M2.4 — debug bridge. If the envelope carries
-                         * a debug session + this role should pause,
-                         * phone home to the manager + act on the reply.
-                         * Produces the (possibly mutated / mode-rewritten)
-                         * envelope to dispatch. proceed==0 → operator hit
-                         * Cancel (or manager unreachable) → drop. */
-                        char dbg_env[16384];
-                        size_t dbg_len = 0;
-                        int proceed = _pollen_debug_process(rbuf, line_len,
-                            dbg_env, sizeof(dbg_env), &dbg_len);
-                        if (proceed) {
-                            /* Phase 6.2 — load metrics : count this hop +
-                             * mark in-flight for the duration of dispatch. */
-                            atomic_fetch_add(&_pollen_msgs_handled, 1);
-                            atomic_fetch_add(&_pollen_inflight, 1);
-                            const char* fenv = (dbg_len > 0) ? dbg_env : rbuf;
-                            size_t flen = (dbg_len > 0) ? dbg_len : line_len;
-                            /* v0.1.17 — Mosaic bridge transform. If an
-                             * OnMessage handler is registered, hand it the
-                             * consumed envelope ; it returns the new data
-                             * JSON to forward ("" → drop the message). Runs
-                             * on this worker thread (GC-registered) under
-                             * the wf mutex, so the handler must NOT call
-                             * Pollen.Forward (would re-lock + deadlock) —
-                             * return data / use Publish instead. */
-                            char hbuf[16384];
-                            int do_dispatch = 1;
-                            if (_pollen_on_message) {
-                                char* env_gc = (char*) GC_MALLOC_ATOMIC(flen + 1);
-                                if (env_gc) {
-                                    memcpy(env_gc, fenv, flen);
-                                    env_gc[flen] = 0;
-                                    char* nd = (char*) AmalgameClosure_call1(
-                                        _pollen_on_message, (void*) env_gc);
-                                    if (nd && nd[0]) {
-                                        size_t hn = _pollen_replace_data(
-                                            fenv, flen, nd, hbuf, sizeof(hbuf));
-                                        if (hn > 0) { fenv = hbuf; flen = hn; }
-                                    } else if (nd) {
-                                        do_dispatch = 0;  /* "" → drop */
-                                    }
-                                }
-                            }
-                            /* M2.3c.2 dispatch sequence :
-                             *   1. apply pending set ops (mutates state.X
-                             *      before the cond eval sees it),
-                             *   2. dispatch priority :
-                             *        while > for > cond > forward_all
-                             * These route flags are mutually exclusive per
-                             * node in the workflow-tree schema, but priority
-                             * is safer than asserting exclusion. */
-                            if (do_dispatch && _pollen_n_set_ops > 0) {
-                                _pollen_set_ops_apply(fenv, flen);
-                            }
-                            char fwd_new_mid[37] = {0};
-                            int n_nexts = _pollen_wf_n_nexts;
-                            if (do_dispatch) {
-                                if (_pollen_while_active) {
-                                    _pollen_while_forward(fenv, flen, fwd_new_mid);
-                                    n_nexts = 1;
-                                } else if (_pollen_for_active) {
-                                    _pollen_for_forward(fenv, flen, fwd_new_mid);
-                                    n_nexts = _pollen_for_route.n_targets;
-                                } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
-                                    _pollen_cond_forward(fenv, flen, fwd_new_mid);
-                                    n_nexts = 1;
-                                } else {
-                                    _pollen_wf_forward_all(fenv, flen, fwd_new_mid);
-                                }
-                            }
-                            /* M2.4b — record this hop for the manager's
-                             * Live executions panel. Best-effort. */
-                            if (fwd_new_mid[0] && _pollen_shared_dir[0]) {
-                                /* incoming mid = parent of this hop */
-                                const char* pmp = _pollen_find(fenv, flen,
-                                                                 MID_KEY, MID_KEY_LEN);
-                                const char* parent = NULL; size_t parent_len = 0;
-                                if (pmp) {
-                                    /* the incoming mid is the ORIGINAL
-                                     * envelope's mid, but fenv may have
-                                     * been rewritten (debug). use rbuf for
-                                     * the true incoming mid. */
-                                    const char* imp = _pollen_find(rbuf, line_len,
-                                                                     MID_KEY, MID_KEY_LEN);
-                                    if (imp) {
-                                        imp += MID_KEY_LEN;
-                                        const char* imq = memchr(imp, '"',
-                                            line_len - (size_t)(imp - rbuf));
-                                        if (imq) { parent = imp; parent_len = (size_t)(imq - imp); }
-                                    }
-                                }
-                                /* debug session (optional) */
-                                const char* dseg = _pollen_find(rbuf, line_len,
-                                    "\"debug\":{\"session\":\"", 20);
-                                const char* dsess = NULL; size_t dsess_len = 0;
-                                if (dseg) {
-                                    dsess = dseg + 20;
-                                    const char* dq = memchr(dsess, '"',
-                                        line_len - (size_t)(dsess - rbuf));
-                                    if (dq) dsess_len = (size_t)(dq - dsess);
-                                }
-                                const char* tout = _pollen_wf_emit_topic[0]
-                                                     ? _pollen_wf_emit_topic : NULL;
-                                _pollen_wf_record_step(fwd_new_mid, 36,
-                                    parent, parent_len,
-                                    topic_in, topic_in_len,
-                                    tout, n_nexts,
-                                    dsess, dsess_len);
-                            }
-                            /* v0.1.17 — terminal node : this role has no
-                             * downstream (leaf in the tree), so the
-                             * execution ends here. If an OnComplete handler
-                             * is set, hand it the final envelope (for an
-                             * ingress node to resolve a pending HTTP reply
-                             * by rootMessageId). */
-                            if (do_dispatch && _pollen_on_complete
-                                && _pollen_wf_n_nexts == 0
-                                && !_pollen_cond_active
-                                && !_pollen_for_active
-                                && !_pollen_while_active) {
-                                char* env_gc = (char*) GC_MALLOC_ATOMIC(flen + 1);
-                                if (env_gc) {
-                                    memcpy(env_gc, fenv, flen);
-                                    env_gc[flen] = 0;
-                                    AmalgameClosure_call1(_pollen_on_complete,
-                                                          (void*) env_gc);
-                                }
-                            }
-                            atomic_fetch_sub(&_pollen_inflight, 1);  /* Phase 6.2 */
                         }
                     }
                 }
@@ -5199,17 +5041,6 @@ public class CelEval {
 }
 
 public class Pollen {
-    // Load a workflow.json file. `nodeName` overrides port-based
-    // role lookup. Returns true on success.
-    // STATUS : stub (M2). Returns false + stderr warning.
-    public static bool WorkflowLoad(workflowPath: string, nodeName: string,
-                                     actualPort: int) {
-        var ok: int = 0
-        @c { ok = Amalgame_Pollen_Pollen_WorkflowLoad_c(workflowPath, nodeName,
-                                                          (int64_t) actualPort); }
-        return ok != 0
-    }
-
     // Configure sharedDir/state/ + sharedDir/executions/ location.
     // STATUS : stores the path ; full effect lands with M2 state
     // persist migration.
@@ -5298,68 +5129,6 @@ public class Pollen {
         return mid
     }
 
-    // M4 — debug-aware publish. Same as Publish but attaches a
-    // `debug` field so a stepping run can phone home from each
-    // paused hop. `mode` is "step" (pause every hop) or
-    // "breakpoint" (pause only at roles in breakpointsJson).
-    // breakpointsJson is a JSON array spliced verbatim, e.g.
-    // [{"role":"vip","when":"data.amount>5000"}]. managerAddr is
-    // the host:port where paused nodes phone home (the manager's
-    // :3001 bridge). Returns the minted mid, "" on failure.
-    // Centralises the envelope the pollen-manager hand-rolled.
-    public static string PublishDebug(host: string, port: int,
-                                        topicUuid: string, topicVersion: int,
-                                        dataJson: string,
-                                        session: string, mode: string,
-                                        breakpointsJson: string,
-                                        managerAddr: string) {
-        var mid: string = ""
-        @c { mid = Amalgame_Pollen_Pollen_PublishDebug_c(host, (int64_t) port,
-                                                           topicUuid, (int64_t) topicVersion,
-                                                           dataJson, session, mode,
-                                                           breakpointsJson, managerAddr); }
-        return mid
-    }
-
-    // v0.1.17 — Mosaic bridge hook. Register an AM transform invoked
-    // for every message this node consumes, BEFORE it is forwarded.
-    // The handler receives the full envelope JSON and returns the new
-    // `data` JSON to forward (return "" to drop the message). Runs on
-    // the listener worker thread (GC-registered) under the routing
-    // lock, so the handler must NOT call Pollen.Forward — return the
-    // data, or use Pollen.Publish, instead. This is how a Mosaic app
-    // embedding Pollen bridges to the outside world (HTTP, …) : the
-    // handler does the egress call (net-http) and returns the
-    // response as the new data. Set once at wiring time.
-    public static void OnMessage(handler: Closure<string, string>) {
-        @c { Amalgame_Pollen_Pollen_OnMessage_c(handler); }
-    }
-
-    // v0.1.17 — fires when a message this node consumes terminates
-    // here (a leaf : no nexts / cond / for / while wired). The
-    // handler receives the final envelope JSON ; its return value is
-    // ignored. Use it on an ingress node to resolve a pending HTTP
-    // response, correlating by the envelope's rootMessageId. Same
-    // threading contract as OnMessage (no Forward from inside).
-    public static void OnComplete(handler: Closure<string, string>) {
-        @c { Amalgame_Pollen_Pollen_OnComplete_c(handler); }
-    }
-
-    // v0.1.17 — re-emit a message into the workflow out-of-band,
-    // preserving the chain : mints a fresh messageId with
-    // parentMessageId = the incoming envelope's mid, keeps
-    // rootMessageId, swaps `data` to newDataJson (pass "" to keep the
-    // original), rewrites the topic to the configured emit topic, and
-    // forwards to all wired nexts. Returns the minted mid ("" on
-    // failure). For deferred / out-of-band re-emission from a Mosaic
-    // HTTP handler thread — do NOT call from an OnMessage/OnComplete
-    // handler (same routing lock → deadlock).
-    public static string Forward(envelopeJson: string, newDataJson: string) {
-        var mid: string = ""
-        @c { mid = Amalgame_Pollen_Pollen_Forward_c(envelopeJson, newDataJson); }
-        return mid
-    }
-
     // Fire-and-forget : send a MESSAGE envelope. Returns the
     // newly-minted messageId (which becomes the rootMessageId
     // for the execution chain) — empty string on socket/connect
@@ -5374,191 +5143,6 @@ public class Pollen {
                                                       topicUuid, (int64_t) topicVersion,
                                                       dataJson); }
         return mid
-    }
-
-    // Phase 5.3 — read a top-level key from the per-execution state
-    // file at sharedDir/state/<rootMid>.json. Returns the raw JSON
-    // literal (e.g. "1", "\"foo\"", "true") or "" if the key isn't
-    // present / the file doesn't exist. `path` accepts a leading
-    // "state." prefix for symmetry with cond eval ("state.counter").
-    public static string StateGet(rootMid: string, path: string) {
-        var s: string = ""
-        @c { s = Amalgame_Pollen_Pollen_StateGet_c(rootMid, path); }
-        return s
-    }
-
-    // Phase 5.3 — replace-or-append a top-level key in the per-execution
-    // state file (atomic tmp+rename). `jsonLiteral` is inserted verbatim
-    // so callers are responsible for quoting strings.
-    public static bool StateSet(rootMid: string, path: string,
-                                  jsonLiteral: string) {
-        var ok: int = 0
-        @c { ok = Amalgame_Pollen_Pollen_StateSet_c(rootMid, path,
-                                                      jsonLiteral); }
-        return ok != 0
-    }
-
-    // M2.2 — evaluate a set.value expression against an envelope.
-    // Returns the literal form ("42", "\"foo\"", "3.14") or "" on
-    // failure. Expressions follow {"const":<lit>} | {"var":"<path>"} |
-    // {"op":"+|-|*|/", "left":<E>, "right":<E>}. `state.X` paths
-    // resolve through the per-execution state file.
-    public static string EvalExpr(envelopeJson: string, exprJson: string) {
-        var s: string = ""
-        @c { s = Amalgame_Pollen_Pollen_EvalExpr_c(envelopeJson, exprJson); }
-        return s
-    }
-
-    // M2.2 — evaluate a cond expression against an envelope.
-    // Empty cond → true (else-branch semantics). Supports leaf ops
-    // (==, !=, <, >, <=, >=), composite (and / or / not), and
-    // membership (in / not_in).
-    public static bool EvalCond(envelopeJson: string, condJson: string) {
-        var ok: int = 0
-        @c { ok = Amalgame_Pollen_Pollen_EvalCond_c(envelopeJson, condJson); }
-        return ok != 0
-    }
-
-    // M2.3c.1 — workflow configuration setters. The package keeps
-    // the parser out of scope (each consumer's workflow.json schema
-    // can differ) but exposes the underlying setters so any consumer
-    // can walk their own JSON and call these to wire the runtime.
-    //
-    // Usage shape :
-    //   Pollen.WorkflowReloadBegin()
-    //   for each topic in this node's consumes:
-    //     Pollen.WorkflowAddConsume(topic)
-    //   for each downstream peer:
-    //     Pollen.WorkflowAddNext(host, port)
-    //   Pollen.WorkflowSetEmitTopic(emitTopic)   // optional rewrite
-    //   Pollen.WorkflowReloadCommit()
-    //
-    // The Reload pair brackets a mutex window — readers (listener
-    // dispatch) take the same mutex for their snapshot.
-    public static void WorkflowReloadBegin() {
-        @c { Amalgame_Pollen_Pollen_WorkflowReloadBegin_c(); }
-    }
-
-    public static void WorkflowReloadCommit() {
-        @c { Amalgame_Pollen_Pollen_WorkflowReloadCommit_c(); }
-    }
-
-    public static void WorkflowAddConsume(topic: string) {
-        @c { Amalgame_Pollen_Pollen_WorkflowAddConsume_c(topic); }
-    }
-
-    public static void WorkflowAddNext(host: string, port: int) {
-        @c { Amalgame_Pollen_Pollen_WorkflowAddNext_c(host, (int64_t) port); }
-    }
-
-    public static void WorkflowSetEmitTopic(topic: string) {
-        @c { Amalgame_Pollen_Pollen_WorkflowSetEmitTopic_c(topic); }
-    }
-
-    // M2.3c.2 — conditional routing. Sandwiched between
-    // WorkflowReloadBegin / WorkflowReloadCommit alongside the
-    // call/fan_out setters. CondBranchOpen starts a new branch ;
-    // subsequent CondBranchAddTarget calls populate its targets
-    // until the next CondBranchOpen (or ReloadCommit). condJson
-    // accepts the same grammar as Pollen.EvalCond (and / or / not /
-    // in / not_in + leaf ops). Empty cond_json = else branch.
-    public static void CondBranchOpen(condJson: string) {
-        @c { Amalgame_Pollen_Pollen_CondBranchOpen_c(condJson); }
-    }
-
-    public static void CondBranchAddTarget(host: string, port: int) {
-        @c { Amalgame_Pollen_Pollen_CondBranchAddTarget_c(host, (int64_t) port); }
-    }
-
-    // v0.1.20 — v2 routing : set the current branch's emit topic. When
-    // set (and load balancing is on), the matched branch rebuilds the
-    // envelope with this topic and forwards to a live provider resolved
-    // by the power-of-two LB — no static host:port needed. Each branch
-    // targets a distinct action, so each carries its own topic. Leave
-    // it unset for v1 (static CondBranchAddTarget) routing.
-    public static void CondBranchSetTopic(topic: string) {
-        @c { Amalgame_Pollen_Pollen_CondBranchSetTopic_c(topic); }
-    }
-
-    // M2.3c.2 — set state.X ops. Each Add registers (path, valueExpr).
-    // At message time the dispatch evaluates valueExpr against the
-    // envelope (same evaluator as Pollen.EvalExpr) and writes the
-    // resulting literal under sharedDir/state/<rootMid>.json before
-    // the cond / forward pass.
-    public static void SetOpAdd(path: string, valueExprJson: string) {
-        @c { Amalgame_Pollen_Pollen_SetOpAdd_c(path, valueExprJson); }
-    }
-
-    // M2.3c.2b — for loop. ForSetup arms the route ; subsequent
-    // ForAddTarget calls populate the downstream peer set ;
-    // ForAddItem calls populate the iteration items list.
-    // Dispatch fans out n_items × n_targets messages, writing
-    // state.<itemVar> = items[i] before each iter's forward.
-    public static void ForSetup(itemVar: string) {
-        @c { Amalgame_Pollen_Pollen_ForSetup_c(itemVar); }
-    }
-
-    public static void ForAddTarget(host: string, port: int) {
-        @c { Amalgame_Pollen_Pollen_ForAddTarget_c(host, (int64_t) port); }
-    }
-
-    public static void ForAddItem(itemLit: string) {
-        @c { Amalgame_Pollen_Pollen_ForAddItem_c(itemLit); }
-    }
-
-    // v0.1.21 — v2 routing : set the for route's emit topic. When
-    // set (+ LB on), each iteration rebuilds with this topic and
-    // forwards to a live provider resolved by the power-of-two LB —
-    // no static targets needed. Each item triggers one resolution
-    // (items spread across replicas of the do-action). Leave it
-    // unset for v1 (static ForAddTarget) routing.
-    public static void ForSetTopic(topic: string) {
-        @c { Amalgame_Pollen_Pollen_ForSetTopic_c(topic); }
-    }
-
-    // M2.3c.2b — while loop. Self-loop bounded by maxIter, with
-    // a user-supplied condJson (same grammar as Pollen.EvalCond)
-    // evaluated each iteration. The iterKey is the state.X path
-    // amc auto-bumps each loop iteration (defaults to "_wf_iter"
-    // if empty). selfHost/selfPort is where the loop forwards
-    // back to (typically the same listener that's dispatching).
-    // Exit targets are wired via WhileAddExit.
-    public static void WhileSetup(condJson: string, iterKey: string,
-                                    maxIter: int,
-                                    selfHost: string, selfPort: int) {
-        @c { Amalgame_Pollen_Pollen_WhileSetup_c(condJson, iterKey,
-                                                   (int64_t) maxIter,
-                                                   selfHost, (int64_t) selfPort); }
-    }
-
-    public static void WhileAddExit(host: string, port: int) {
-        @c { Amalgame_Pollen_Pollen_WhileAddExit_c(host, (int64_t) port); }
-    }
-
-    // v0.1.22 — v2 routing : set the while's EXIT topic. When set
-    // (+ LB on), on exit the envelope is rebuilt with this topic and
-    // forwarded to a registry-resolved provider — no static exit
-    // targets. The loop body still uses selfHost:selfPort (passed to
-    // WhileSetup) so the iteration stays on this node deterministically.
-    public static void WhileSetExitTopic(topic: string) {
-        @c { Amalgame_Pollen_Pollen_WhileSetExitTopic_c(topic); }
-    }
-
-    // v0.1.23 — explicit while.body : set the body action's consume
-    // topic. When set (+ LB on), on each iteration the controller
-    // forwards to a registry-resolved provider of this topic (the body
-    // action) instead of looping to self. The body action processes
-    // one iteration and is expected to forward back to the controller
-    // (by setting its own emit topic to the controller's consume
-    // topic). Empty → v1 fallback (loop to self).
-    public static void WhileSetBodyTopic(topic: string) {
-        @c { Amalgame_Pollen_Pollen_WhileSetBodyTopic_c(topic); }
-    }
-
-    public static int WorkflowVersion() {
-        var v: int = 0
-        @c { v = Amalgame_Pollen_Pollen_WorkflowVersion_c(); }
-        return v
     }
 
     public static string WorkflowActiveRole() {
