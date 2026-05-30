@@ -2240,22 +2240,11 @@ import Amalgame.String
                 if (!nl) break;
                 size_t line_len = (size_t)(nl - rbuf);
 
-                /* Decide ACK + forward policy under the wf mutex :
-                 *   wf active + topic ∈ consumes : ACK + forward
-                 *   wf active + topic ∉ consumes : drop, no ACK
-                 *   wf inactive                  : ACK (free-form fallback) */
+                /* Decide ACK policy under the wf mutex :
+                 *   v3 active + topic matches an entry's `on:` : ACK + dispatch
+                 *   v3 active + topic doesn't match           : drop, no ACK
+                 *   v3 inactive (no workflow loaded)           : ACK (free-form fallback) */
                 int do_ack = 1;
-                int do_forward = 0;
-                /* M2.4b — capture topic_in extent for the executions
-                 * recorder (set in the matched block below). */
-                const char* topic_in = NULL;
-                size_t topic_in_len = 0;
-                /* Phase 3d — v3 takes precedence over the v2 routing
-                 * tables. If a v3 entry's `on:` matches this topic, we
-                 * mark v3_handled, ACK as if v2 had matched, skip the
-                 * v2 dispatch block, and invoke the AM dispatcher AFTER
-                 * releasing the wf mutex (the dispatcher may call
-                 * Pollen.Publish which would otherwise deadlock). */
                 int v3_handled = 0;
                 const char* v3_topic_gc = 0;
                 const char* v3_env_gc   = 0;
@@ -2263,6 +2252,7 @@ import Amalgame.String
                 if (_pollen_v3_active && _pollen_v3_entry_count > 0) {
                     const char* tp3 = _pollen_find(rbuf, line_len,
                                                      TOPIC_KEY, TOPIC_KEY_LEN);
+                    int matched3 = 0;
                     if (tp3) {
                         tp3 += TOPIC_KEY_LEN;
                         const char* tq3 = memchr(tp3, '"',
@@ -2284,32 +2274,16 @@ import Amalgame.String
                                         v3_topic_gc = td;
                                         v3_env_gc   = ed;
                                         v3_handled  = 1;
-                                        topic_in     = tp3;
-                                        topic_in_len = tlen3;
+                                        matched3    = 1;
                                     }
                                 }
                             }
                         }
                     }
-                }
-                if (!v3_handled && _pollen_wf_active && _pollen_wf_n_consumes > 0) {
-                    const char* tp = _pollen_find(rbuf, line_len,
-                                                    TOPIC_KEY, TOPIC_KEY_LEN);
-                    int matched = 0;
-                    if (tp) {
-                        tp += TOPIC_KEY_LEN;
-                        const char* tq = memchr(tp, '"',
-                                                  line_len - (size_t)(tp - rbuf));
-                        if (tq && _pollen_wf_topic_consumed(
-                                tp, (size_t)(tq - tp))) {
-                            matched = 1;
-                            topic_in = tp;
-                            topic_in_len = (size_t)(tq - tp);
-                        }
-                    }
-                    if (matched) {
-                        do_forward = 1;
-                    } else {
+                    /* v3 is loaded but this topic isn't consumed by any
+                     * entry → drop silently (no ACK), same shape as the
+                     * v2 dispatcher's "topic not in consumes" branch. */
+                    if (!matched3) {
                         do_ack = 0;
                     }
                 }
@@ -2343,138 +2317,6 @@ import Amalgame.String
                                     goto worker_done;
                                 }
                             }
-                        }
-                    }
-                    if (do_forward) {
-                        /* M2.4 — debug bridge. If the envelope carries
-                         * a debug session + this role should pause,
-                         * phone home to the manager + act on the reply.
-                         * Produces the (possibly mutated / mode-rewritten)
-                         * envelope to dispatch. proceed==0 → operator hit
-                         * Cancel (or manager unreachable) → drop. */
-                        char dbg_env[16384];
-                        size_t dbg_len = 0;
-                        int proceed = _pollen_debug_process(rbuf, line_len,
-                            dbg_env, sizeof(dbg_env), &dbg_len);
-                        if (proceed) {
-                            /* Phase 6.2 — load metrics : count this hop +
-                             * mark in-flight for the duration of dispatch. */
-                            atomic_fetch_add(&_pollen_msgs_handled, 1);
-                            atomic_fetch_add(&_pollen_inflight, 1);
-                            const char* fenv = (dbg_len > 0) ? dbg_env : rbuf;
-                            size_t flen = (dbg_len > 0) ? dbg_len : line_len;
-                            /* v0.1.17 — Mosaic bridge transform. If an
-                             * OnMessage handler is registered, hand it the
-                             * consumed envelope ; it returns the new data
-                             * JSON to forward ("" → drop the message). Runs
-                             * on this worker thread (GC-registered) under
-                             * the wf mutex, so the handler must NOT call
-                             * Pollen.Forward (would re-lock + deadlock) —
-                             * return data / use Publish instead. */
-                            char hbuf[16384];
-                            int do_dispatch = 1;
-                            if (_pollen_on_message) {
-                                char* env_gc = (char*) GC_MALLOC_ATOMIC(flen + 1);
-                                if (env_gc) {
-                                    memcpy(env_gc, fenv, flen);
-                                    env_gc[flen] = 0;
-                                    char* nd = (char*) AmalgameClosure_call1(
-                                        _pollen_on_message, (void*) env_gc);
-                                    if (nd && nd[0]) {
-                                        size_t hn = _pollen_replace_data(
-                                            fenv, flen, nd, hbuf, sizeof(hbuf));
-                                        if (hn > 0) { fenv = hbuf; flen = hn; }
-                                    } else if (nd) {
-                                        do_dispatch = 0;  /* "" → drop */
-                                    }
-                                }
-                            }
-                            /* M2.3c.2 dispatch sequence :
-                             *   1. apply pending set ops (mutates state.X
-                             *      before the cond eval sees it),
-                             *   2. dispatch priority :
-                             *        while > for > cond > forward_all
-                             * These route flags are mutually exclusive per
-                             * node in the workflow-tree schema, but priority
-                             * is safer than asserting exclusion. */
-                            if (do_dispatch && _pollen_n_set_ops > 0) {
-                                _pollen_set_ops_apply(fenv, flen);
-                            }
-                            char fwd_new_mid[37] = {0};
-                            int n_nexts = _pollen_wf_n_nexts;
-                            if (do_dispatch) {
-                                if (_pollen_while_active) {
-                                    _pollen_while_forward(fenv, flen, fwd_new_mid);
-                                    n_nexts = 1;
-                                } else if (_pollen_for_active) {
-                                    _pollen_for_forward(fenv, flen, fwd_new_mid);
-                                    n_nexts = _pollen_for_route.n_targets;
-                                } else if (_pollen_cond_active && _pollen_cond_n_branches > 0) {
-                                    _pollen_cond_forward(fenv, flen, fwd_new_mid);
-                                    n_nexts = 1;
-                                } else {
-                                    _pollen_wf_forward_all(fenv, flen, fwd_new_mid);
-                                }
-                            }
-                            /* M2.4b — record this hop for the manager's
-                             * Live executions panel. Best-effort. */
-                            if (fwd_new_mid[0] && _pollen_shared_dir[0]) {
-                                /* incoming mid = parent of this hop */
-                                const char* pmp = _pollen_find(fenv, flen,
-                                                                 MID_KEY, MID_KEY_LEN);
-                                const char* parent = NULL; size_t parent_len = 0;
-                                if (pmp) {
-                                    /* the incoming mid is the ORIGINAL
-                                     * envelope's mid, but fenv may have
-                                     * been rewritten (debug). use rbuf for
-                                     * the true incoming mid. */
-                                    const char* imp = _pollen_find(rbuf, line_len,
-                                                                     MID_KEY, MID_KEY_LEN);
-                                    if (imp) {
-                                        imp += MID_KEY_LEN;
-                                        const char* imq = memchr(imp, '"',
-                                            line_len - (size_t)(imp - rbuf));
-                                        if (imq) { parent = imp; parent_len = (size_t)(imq - imp); }
-                                    }
-                                }
-                                /* debug session (optional) */
-                                const char* dseg = _pollen_find(rbuf, line_len,
-                                    "\"debug\":{\"session\":\"", 20);
-                                const char* dsess = NULL; size_t dsess_len = 0;
-                                if (dseg) {
-                                    dsess = dseg + 20;
-                                    const char* dq = memchr(dsess, '"',
-                                        line_len - (size_t)(dsess - rbuf));
-                                    if (dq) dsess_len = (size_t)(dq - dsess);
-                                }
-                                const char* tout = _pollen_wf_emit_topic[0]
-                                                     ? _pollen_wf_emit_topic : NULL;
-                                _pollen_wf_record_step(fwd_new_mid, 36,
-                                    parent, parent_len,
-                                    topic_in, topic_in_len,
-                                    tout, n_nexts,
-                                    dsess, dsess_len);
-                            }
-                            /* v0.1.17 — terminal node : this role has no
-                             * downstream (leaf in the tree), so the
-                             * execution ends here. If an OnComplete handler
-                             * is set, hand it the final envelope (for an
-                             * ingress node to resolve a pending HTTP reply
-                             * by rootMessageId). */
-                            if (do_dispatch && _pollen_on_complete
-                                && _pollen_wf_n_nexts == 0
-                                && !_pollen_cond_active
-                                && !_pollen_for_active
-                                && !_pollen_while_active) {
-                                char* env_gc = (char*) GC_MALLOC_ATOMIC(flen + 1);
-                                if (env_gc) {
-                                    memcpy(env_gc, fenv, flen);
-                                    env_gc[flen] = 0;
-                                    AmalgameClosure_call1(_pollen_on_complete,
-                                                          (void*) env_gc);
-                                }
-                            }
-                            atomic_fetch_sub(&_pollen_inflight, 1);  /* Phase 6.2 */
                         }
                     }
                 }
