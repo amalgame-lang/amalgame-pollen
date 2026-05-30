@@ -3790,6 +3790,28 @@ import Amalgame.String
         return 1;
     }
 
+    /* Phase 3c — entry lookup by `on:` topic.
+     *
+     * Returns the entry idx whose `on_topic` matches `topic` exactly,
+     * or -1 if no entry consumes that topic. Multi-entry routing is
+     * not supported in v0.2 (the validator rejects dup on_topic), so
+     * the first match is the canonical match.
+     *
+     * Hot-path : called by the listener thread for every bus message,
+     * so it walks `_pollen_v3_entries` directly with strcmp — same
+     * pattern as `_pollen_wf_topic_consumed`. The entry count is
+     * bounded at POLLEN_MAX_ENTRIES (256) so the linear scan stays
+     * sub-µs even fully loaded.
+     */
+    static int _pollen_v3_lookup_entry_by_topic(const char* topic) {
+        if (!topic || !topic[0]) return -1;
+        for (int i = 0; i < _pollen_v3_entry_count; i++) {
+            const char* t = _pollen_v3_entries[i].on_topic;
+            if (t && strcmp(t, topic) == 0) return i;
+        }
+        return -1;
+    }
+
     /* Snapshot the current provider count for a topic — used by the
      * AM-side audit so tests can verify the registry state without
      * needing to forge envelopes. */
@@ -6603,6 +6625,36 @@ public class Pollen {
             return new JsonValue()
         }
         return disp.GetState()
+    }
+
+    // ── Phase 3c — bus-triggered dispatch by topic ──────────────
+    //
+    // Looks up the first entry whose `on:` topic matches, dispatches
+    // its body. -1 if no entry consumes the topic (caller falls back
+    // to v2 routing or drops the message).
+    //
+    // Designed to be called from the listener thread once the topic
+    // has already been extracted from the envelope. Phase 3d will
+    // patch _pollen_listener_worker to invoke this when v3 is active.
+
+    public static int WorkflowV3LookupEntryByTopic(topic: string) {
+        var r: int = -1
+        @c { r = _pollen_v3_lookup_entry_by_topic(topic); }
+        return r
+    }
+
+    public static int WorkflowV3DispatchTopic(topic: string,
+                                                envelopeJson: string) {
+        let eidx: int = Pollen.WorkflowV3LookupEntryByTopic(topic)
+        if (eidx < 0) { return -1 }
+        return Pollen.WorkflowV3DispatchEntry(eidx, envelopeJson)
+    }
+
+    public static JsonValue WorkflowV3DispatchTopicState(topic: string,
+                                                          envelopeJson: string) {
+        let eidx: int = Pollen.WorkflowV3LookupEntryByTopic(topic)
+        if (eidx < 0) { return new JsonValue() }
+        return Pollen.WorkflowV3DispatchEntryState(eidx, envelopeJson)
     }
 }
 
