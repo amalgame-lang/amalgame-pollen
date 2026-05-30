@@ -2,6 +2,57 @@
 
 ## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
 
+### Added — Pollen v3 listener → dispatcher integration (Phase 3d)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher (target)".
+
+`_pollen_listener_worker` (the v2 hot path) is patched to fork to
+v3 when a v3 entry consumes the inbound message's topic. The v2
+routing tables remain the fallback for any topic no v3 entry
+claims, so existing v2 deployments are unaffected.
+
+- Forward decls at the top of the listener worker for
+  `_pollen_v3_active` / `_pollen_v3_entry_count` /
+  `_pollen_v3_dispatch_count` (tentative C definitions, fused with
+  the Phase 2 storage definitions) and the AM-generated
+  `Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic` entry point.
+- New `v3_handled` flag in the worker's per-message decision block,
+  set when `_pollen_v3_lookup_entry_by_topic` finds a match. The
+  envelope + topic are GC-duped while still holding the wf mutex so
+  the deferred AM call has stable storage.
+- The AM dispatcher is invoked AFTER releasing `_pollen_wf_mutex`.
+  Doing the call inside the critical section would risk deadlock —
+  the dispatcher allocates GC objects and may call Pollen.Publish
+  which re-locks the registry.
+- New `_pollen_v3_dispatch_count` atomic counter, bumped each time
+  the worker routes to v3. Exposed via
+  `Pollen.WorkflowV3DispatchCount` and
+  `Pollen.WorkflowV3ResetDispatchCount` so tests can observe the
+  fork without needing to inspect per-dispatch state (which is
+  otherwise ephemeral per `PollenDispatcher.Run`).
+
+### Tests
+
+- `tests/v3_listener_smoke.c` — C-side integration test
+  (registered via the existing `tests/run_tests.sh` runner so CI
+  picks it up automatically). Spins the listener on an ephemeral
+  port in a pthread, loads the v3 fixture, publishes to
+  "tick.hourly" then to "no.such.topic" via the real `Publish`
+  TCP path, polls `WorkflowV3DispatchCount`, and asserts :
+  - dispatch count = 1 after the v3-consumed publish
+  - dispatch count = 1 (unchanged) after the unrelated publish
+
+7 assertions, all green via `./tests/run_tests.sh ~/.local/bin/amc`.
+
+### Notes
+
+- The v2 hot path is preserved : every message still walks through
+  the same `_pollen_listener_worker` ; v3 simply takes precedence
+  when its lookup matches.
+- The Phase 2 executions recorder (`_pollen_wf_record_step` for the
+  manager's Live executions panel) is NOT yet hooked up for v3 —
+  follow-up before v0.2.0 ships.
+
 ### Added — Pollen v3 bus-triggered dispatch (Phase 3c)
 
 Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher (target)".
