@@ -1,0 +1,17 @@
+{
+  "schema": "pollen/v3",
+  "name": "cycle-invalid",
+  "version": 1,
+  "actions": {},
+  "entries": [
+    {
+      "name": "alpha",
+      "on":   "trigger.alpha",
+      "do":   { "type": "goto", "target": "beta" }
+    },
+    {
+      "name": "beta",
+      "do":   { "type": "goto", "target": "alpha" }
+    }
+  ]
+}

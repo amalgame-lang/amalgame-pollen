@@ -1,0 +1,36 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-multi-entry-demo",
+  "version": 1,
+  "actions": {
+    "fetch":   { "topic": "data.fetch" },
+    "compute": { "topic": "data.compute" },
+    "store":   { "topic": "data.store" }
+  },
+  "entries": [
+    {
+      "name": "via-cron",
+      "on":   "tick.hourly",
+      "do":   { "type": "goto", "target": "shared-pipeline",
+                "args": ["state.cron_dataset"] }
+    },
+    {
+      "name": "via-http",
+      "on":   "http.compute.request",
+      "do":   { "type": "goto", "target": "shared-pipeline",
+                "args": ["msg.data.dataset"] }
+    },
+    {
+      "name": "shared-pipeline",
+      "params":  ["dataset"],
+      "returns": "state.summary",
+      "do": [
+        { "type": "call", "action": "fetch" },
+        { "type": "call", "action": "compute" },
+        { "type": "call", "action": "store" },
+        { "type": "set",  "key": "state.summary",
+          "value": "\"processed-\" + string(params.dataset)" }
+      ]
+    }
+  ]
+}

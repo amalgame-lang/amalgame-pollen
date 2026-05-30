@@ -4,3 +4,15 @@
 
 # amc local package cache
 /.amalgame-cache/
+
+# v3 validator smoke test binary (built by tests/build-v3-validator-smoke.sh)
+/tests/v3_validator_smoke
+
+# CEL-lite smoke test binary (built by tests/build-cel-lite-smoke.sh)
+/tests/cel_lite_smoke
+
+# v3 loader smoke test binary (built by tests/build-v3-loader-smoke.sh)
+/tests/v3_loader_smoke
+
+# v3 dispatcher smoke test binary (built by tests/build-v3-dispatch-smoke.sh)
+/tests/v3_dispatch_smoke
