@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.3.0 — 2026-05-30
+
+### Internal — deep cleanup of dead v2 C helpers (Phase 6 follow-up)
+
+v0.2.0 retired the v2 public API but left the v2 internals (~2000
+LOC of unreachable C in `facade.am`'s `@c {}` block). v0.3.0 finishes
+the job — drops all helpers that were only callable from the
+removed wrappers.
+
+Removed from `facade.am` (no behaviour change — all of this was
+already unreachable from AM after v0.2.0) :
+
+- All orphan `_c` wrappers : `WorkflowLoad_c`, `StateGet/StateSet_c`,
+  `EvalExpr/EvalCond_c`, `OnMessage/OnComplete/Forward_c`,
+  `PublishDebug_c`, `WorkflowVersion_c`, plus the 16 M2.3c.x setter
+  wrappers (`WorkflowReloadBegin/Commit/AddConsume/AddNext/SetEmitTopic_c`,
+  `CondBranchOpen/AddTarget/SetTopic_c`, `SetOpAdd_c`, `ForSetup/
+  AddTarget/AddItem/SetTopic_c`, `WhileSetup/AddExit/SetExitTopic/
+  SetBodyTopic_c`).
+- Mosaic bridge globals + helper : `_pollen_on_message`,
+  `_pollen_on_complete`, `_pollen_replace_data`.
+- Debug bridge (M2.4) : `_pollen_debug_process`, `_pollen_debug_should_pause`,
+  `_pollen_debug_extract_manager`, `_pollen_debug_rewrite`,
+  `_pollen_debug_rewrite_data`, `_pollen_debug_pause` (~330 LOC).
+- M2.3c.x dispatch helpers : `_pollen_wf_forward_one`,
+  `_pollen_wf_forward_all`, `_pollen_wf_rebuild_envelope`,
+  `_pollen_wf_topic_consumed`, `_pollen_wf_reload_begin/commit`,
+  `_pollen_wf_add_consume/add_next/set_emit_topic`, plus the cond
+  branch setters (`_pollen_cond_*`), set-op setters
+  (`_pollen_set_ops_*`), for/while setters + forwarders
+  (`_pollen_for_*`, `_pollen_while_*`) — ~600 LOC.
+- M2.2 expression + cond evaluator (`_pollen_eval_expr`,
+  `_pollen_cond_eval_*`, `_pollen_resolve_path`,
+  `_pollen_expr_val_*`, …) — ~580 LOC.
+- Phase 5.3 per-execution state file I/O (`_pollen_state_filepath`,
+  `_pollen_state_dir_ensure`, `_pollen_state_read/write/find_value/set`,
+  `_pollen_extract_root_mid`) — ~170 LOC.
+- M2.3c.1 workflow runtime state : `_pollen_wf_active`, `_pollen_wf_n_consumes`,
+  `_pollen_wf_n_nexts`, `_pollen_wf_consumes[]`, `_pollen_wf_next_host[]`,
+  `_pollen_wf_next_port[]`, `_pollen_wf_emit_topic`, `_pollen_wf_version`,
+  plus the cond/set-op/for/while storage structs — ~125 LOC.
+
+### Carried changes
+
+- The capability writer now advertises this node's `actions` from
+  the v3 entries' `on:` topics (was the v2 consume list). New helper
+  `_pollen_v3_format_consumed_topics` snapshots them under the
+  wf mutex.
+- `_pollen_json_field` (generic JSON field finder) moved next to
+  `_pollen_find` so it's available to the capability registry
+  parser without depending on the dropped M2.2 block.
+- Header (`runtime/Amalgame_Pollen.h`) gets a forward declaration
+  of `Amalgame_Formats_Json_JsonValue` so `WorkflowV3DispatchEntryState`
+  / `DispatchTopicState` return types match the consumer's
+  amc-emitted TU (previously declared as `void*`, which conflicted
+  at link time).
+
+### Net diff vs v0.2.0
+
+- `facade.am` 6960 → 4790 LOC (-2170, ~31% smaller)
+- generated `.c` 9570 → 7483 lines (-2087)
+- package archive 167 KB → ~163 KB
+
+No behaviour change, no API surface change. All 198 test
+assertions still green (cel_lite, v3_validator, v3_loader,
+v3_dispatch, v3_listener, header_consumer_check, listener_smoke,
+publish_smoke).
+
 ## v0.2.0 — 2026-05-30
 
 ### Breaking — v1/v2 dispatcher dropped (Phase 6)
