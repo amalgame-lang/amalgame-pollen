@@ -36,6 +36,13 @@
 extern "C" {
 #endif
 
+/* Forward declaration for Amalgame.Formats.Json.JsonValue — the
+ * consumer's amc-generated TU defines the struct; we just need a
+ * pointer-compatible declaration here so WorkflowV3*State return
+ * types match. */
+struct _Amalgame_Formats_Json_JsonValue;
+typedef struct _Amalgame_Formats_Json_JsonValue Amalgame_Formats_Json_JsonValue;
+
 /* The engine is a singleton-per-process : one workflow loaded at a
  * time, one capability registry, one bus listener. v0.3 may
  * introduce an opaque AmalgamePollenEngine handle for multi-engine
@@ -76,7 +83,7 @@ code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
 
 /* Returns a List<string> of diagnostics ("[severity ruleN] path:
  * message"). Empty list = clean v3 workflow.json. */
-void*       Amalgame_Pollen_Pollen_WorkflowValidateV3(code_string workflowPath);
+AmalgameList* Amalgame_Pollen_Pollen_WorkflowValidateV3(code_string workflowPath);
 /* Load + resolve a v3 workflow into the runtime AST pools. Returns
  * true on success ; WorkflowV3LoadErrorMsg holds the last error. */
 code_bool   Amalgame_Pollen_Pollen_WorkflowLoadV3(code_string workflowPath);
@@ -109,13 +116,13 @@ int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeMaxIter(int64_t idx);
  * abort/error. The *State variant returns the final state blackboard
  * as a JsonValue for tests + introspection. */
 int64_t     Amalgame_Pollen_Pollen_WorkflowV3DispatchEntry(int64_t eidx, code_string envelopeJson);
-void*       Amalgame_Pollen_Pollen_WorkflowV3DispatchEntryState(int64_t eidx, code_string envelopeJson);
+Amalgame_Formats_Json_JsonValue* Amalgame_Pollen_Pollen_WorkflowV3DispatchEntryState(int64_t eidx, code_string envelopeJson);
 
 /* Resolve a bus topic to an entry index (or -1 if no entry consumes
  * it). DispatchTopic is the listener fast-path. */
 int64_t     Amalgame_Pollen_Pollen_WorkflowV3LookupEntryByTopic(code_string topic);
 int64_t     Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(code_string topic, code_string envelopeJson);
-void*       Amalgame_Pollen_Pollen_WorkflowV3DispatchTopicState(code_string topic, code_string envelopeJson);
+Amalgame_Formats_Json_JsonValue* Amalgame_Pollen_Pollen_WorkflowV3DispatchTopicState(code_string topic, code_string envelopeJson);
 
 /* Atomic counter bumped each time the listener fork routes to v3.
  * Reset variant for tests that need a clean baseline. */
