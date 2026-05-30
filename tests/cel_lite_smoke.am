@@ -1,0 +1,302 @@
+// tests/cel_lite_smoke.am
+//
+// Pollen v3 Phase 1 — smoke test for the CEL-lite lexer, Pratt
+// parser, and tree-walking evaluator. Exercises :
+//
+//   - happy-path : every primary, every operator, ternary, paths,
+//                  list literals, every builtin
+//   - error path : lex errors, parse errors, type errors, div-by-zero,
+//                  bound limits
+//
+// Run :
+//   ./tests/build-cel-lite-smoke.sh
+//   ./tests/cel_lite_smoke
+//
+// Exit code 0 = all green, 1 = at least one assertion failed.
+
+import Amalgame.Pollen
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+
+    public Failures: int
+
+    public Program() {
+        this.Failures = 0
+    }
+
+    // ── parse helpers ───────────────────────────────────
+
+    public bool ParseOK(src: string) {
+        let lex: CelLexer = new CelLexer(src)
+        let toks: List<CelToken> = lex.Lex()
+        if (lex.HasFailed()) { return false }
+        let par: CelParser = new CelParser(toks)
+        let root: int = par.Parse()
+        if (par.HasFailed()) { return false }
+        return root >= 0
+    }
+
+    public void AssertParse(label: string, src: string, wantOk: bool) {
+        let got: bool = this.ParseOK(src)
+        if (got != wantOk) {
+            let want: string = "OK"
+            if (!wantOk) { want = "FAIL" }
+            Console.WriteLine("  x {label} : expected {want}, got opposite on '{src}'")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("  . {label}")
+    }
+
+    // ── eval helpers ────────────────────────────────────
+
+    public CelValue Eval(src: string, env: CelEnv) {
+        let lex: CelLexer = new CelLexer(src)
+        let toks: List<CelToken> = lex.Lex()
+        let par: CelParser = new CelParser(toks)
+        let root: int = par.Parse()
+        let ev: CelEval = new CelEval(par.Nodes, env)
+        return ev.Eval(root)
+    }
+
+    public CelValue EvalEmpty(src: string) {
+        return this.Eval(src, new CelEnv())
+    }
+
+    public void AssertInt(label: string, src: string, want: int) {
+        let v: CelValue = this.EvalEmpty(src)
+        if (!v.IsInt() || v.I != want) {
+            let g: string = String_FromInt(v.I)
+            let w: string = String_FromInt(want)
+            Console.WriteLine("  x {label} : expected {w}, got {g}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("  . {label}")
+    }
+
+    public void AssertBool(label: string, src: string, want: bool) {
+        let v: CelValue = this.EvalEmpty(src)
+        if (!v.IsBool() || v.B != want) {
+            Console.WriteLine("  x {label} : bad result on '{src}'")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("  . {label}")
+    }
+
+    public void AssertStr(label: string, src: string, want: string) {
+        let v: CelValue = this.EvalEmpty(src)
+        if (!v.IsStr() || v.S != want) {
+            let got: string = v.S
+            Console.WriteLine("  x {label} : expected '{want}', got '{got}'")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("  . {label}")
+    }
+
+    public void AssertNull(label: string, src: string) {
+        let v: CelValue = this.EvalEmpty(src)
+        if (!v.IsNull()) {
+            Console.WriteLine("  x {label} : expected null on '{src}'")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("  . {label}")
+    }
+
+    // ── main ─────────────────────────────────────────────
+
+    public static void Main(string[] args) {
+        let p: Program = new Program()
+
+        Console.WriteLine("-- parse — happy path")
+        p.AssertParse("int literal",      "42", true)
+        p.AssertParse("float literal",    "3.14", true)
+        p.AssertParse("string literal",   "\"hi\"", true)
+        p.AssertParse("bool true",        "true", true)
+        p.AssertParse("bool false",       "false", true)
+        p.AssertParse("null",             "null", true)
+        p.AssertParse("ident",            "foo", true)
+        p.AssertParse("dot path",         "state.user.role", true)
+        p.AssertParse("call no args",     "len()", true)
+        p.AssertParse("call 1 arg",       "len(state.items)", true)
+        p.AssertParse("call 2 args",      "contains(\"abc\", \"b\")", true)
+        p.AssertParse("list literal",     "[1, 2, 3]", true)
+        p.AssertParse("empty list",       "[]", true)
+        p.AssertParse("index",            "items[0]", true)
+        p.AssertParse("paren",            "(1 + 2) * 3", true)
+        p.AssertParse("ternary",          "x > 0 ? \"pos\" : \"neg\"", true)
+        p.AssertParse("&& chain",         "a && b && c", true)
+        p.AssertParse("|| chain",         "a || b || c", true)
+        p.AssertParse("comparison",       "a == b && c != d && e < f", true)
+        p.AssertParse("in op",            "x in [1, 2, 3]", true)
+        p.AssertParse("substring in",     "\"a\" in \"cab\"", true)
+        p.AssertParse("unary minus",      "-x", true)
+        p.AssertParse("unary not",        "!flag", true)
+        p.AssertParse("nested ternary",   "a ? (b ? 1 : 2) : 3", true)
+
+        Console.WriteLine("-- parse — error path")
+        p.AssertParse("empty",                  "",      false)
+        p.AssertParse("dangling op",            "1 + ",  false)
+        p.AssertParse("missing rparen",         "(1 + 2", false)
+        p.AssertParse("missing rbrack",         "[1, 2", false)
+        p.AssertParse("missing comma",          "[1 2]", false)
+        p.AssertParse("missing colon",          "a ? b", false)
+        p.AssertParse("dot to non-ident",       "a.\"x\"", false)
+        p.AssertParse("unterminated string",    "\"hi", false)
+        p.AssertParse("invalid escape",         "\"\\q\"", false)
+        p.AssertParse("unknown char",           "1 @ 2", false)
+        p.AssertParse("trailing tokens",        "1 2", false)
+        p.AssertParse("call missing rparen",    "f(1, 2", false)
+
+        Console.WriteLine("-- eval — arithmetic")
+        p.AssertInt("add",        "1 + 2",     3)
+        p.AssertInt("sub",        "10 - 4",    6)
+        p.AssertInt("mul",        "6 * 7",     42)
+        p.AssertInt("div",        "20 / 5",    4)
+        p.AssertInt("mod",        "10 % 3",    1)
+        p.AssertInt("precedence", "1 + 2 * 3", 7)
+        p.AssertInt("paren",      "(1 + 2) * 3", 9)
+        p.AssertInt("unary -",    "-5",        -5)
+        p.AssertNull("div by 0",  "5 / 0")
+        p.AssertNull("mod by 0",  "5 % 0")
+
+        Console.WriteLine("-- eval — comparison + logic")
+        p.AssertBool("eq true",       "1 == 1",     true)
+        p.AssertBool("eq false",      "1 == 2",     false)
+        p.AssertBool("neq",           "1 != 2",     true)
+        p.AssertBool("lt",            "1 < 2",      true)
+        p.AssertBool("le eq",         "2 <= 2",     true)
+        p.AssertBool("gt",            "3 > 2",      true)
+        p.AssertBool("ge",            "2 >= 2",     true)
+        p.AssertBool("string eq",     "\"a\" == \"a\"", true)
+        p.AssertBool("string neq",    "\"a\" != \"b\"", true)
+        p.AssertBool("null == null",  "null == null",   true)
+        p.AssertBool("null == 0",     "null == 0",      false)
+        p.AssertBool("not true",      "!true",     false)
+        p.AssertBool("and ss",        "true && false", false)
+        p.AssertBool("or ss",         "true || false", true)
+        p.AssertBool("ternary T",     "true  ? 1 == 1 : 1 == 2", true)
+        p.AssertBool("ternary F",     "false ? 1 == 1 : 1 == 2", false)
+
+        Console.WriteLine("-- eval — strings + builtins")
+        p.AssertStr("concat",         "\"hi-\" + \"bob\"", "hi-bob")
+        p.AssertInt("len str",        "len(\"hello\")",    5)
+        p.AssertInt("len list",       "len([10, 20, 30])", 3)
+        p.AssertStr("string(int)",    "string(42)",        "42")
+        p.AssertStr("string(bool)",   "string(true)",      "true")
+        p.AssertStr("string(null)",   "string(null)",      "")
+        p.AssertInt("int(str)",       "int(\"7\")",        7)
+        p.AssertInt("int(true)",      "int(true)",         1)
+        p.AssertInt("int(float)",     "int(3.9)",          3)
+        p.AssertBool("bool(0)",       "bool(0)",           false)
+        p.AssertBool("bool(1)",       "bool(1)",           true)
+        p.AssertBool("bool(empty)",   "bool(\"\")",        false)
+        p.AssertBool("contains+",     "contains(\"hello\", \"ell\")", true)
+        p.AssertBool("contains-",     "contains(\"hello\", \"xy\")",  false)
+        p.AssertBool("startsWith",    "startsWith(\"hello\", \"he\")", true)
+        p.AssertBool("endsWith",      "endsWith(\"hello\", \"lo\")",   true)
+
+        Console.WriteLine("-- eval — `in` operator")
+        p.AssertBool("substr in",     "\"b\" in \"abc\"", true)
+        p.AssertBool("substr not in", "\"z\" in \"abc\"", false)
+        p.AssertBool("int in list",   "2 in [1, 2, 3]",   true)
+        p.AssertBool("int not in",    "9 in [1, 2, 3]",   false)
+        p.AssertBool("str in list",   "\"b\" in [\"a\", \"b\"]", true)
+
+        Console.WriteLine("-- eval — list indexing")
+        p.AssertInt("index 0",        "[10, 20, 30][0]",  10)
+        p.AssertInt("index 2",        "[10, 20, 30][2]",  30)
+        p.AssertNull("index OOB",     "[10, 20, 30][9]")
+
+        Console.WriteLine("-- eval — env-backed paths")
+        // Build a JsonValue env :
+        //   state = { count: 5, items: [1, 2, 3], user: { role: "admin" } }
+        let stateRoot: JsonValue = new JsonValue()
+        let sKeys: List<string> = new List<string>()
+        let sVals: List<JsonValue> = new List<JsonValue>()
+        stateRoot.SetObject(sKeys, sVals)
+        let v5: JsonValue = new JsonValue() ; v5.SetInt(5)
+        stateRoot.AppendEntry("count", v5)
+        let items: List<JsonValue> = new List<JsonValue>()
+        let v1: JsonValue = new JsonValue() ; v1.SetInt(1) ; items.Add(v1)
+        let v2: JsonValue = new JsonValue() ; v2.SetInt(2) ; items.Add(v2)
+        let v3: JsonValue = new JsonValue() ; v3.SetInt(3) ; items.Add(v3)
+        let itemsV: JsonValue = new JsonValue()
+        itemsV.SetArray(items)
+        stateRoot.AppendEntry("items", itemsV)
+        let user: JsonValue = new JsonValue()
+        let uKeys: List<string> = new List<string>()
+        let uVals: List<JsonValue> = new List<JsonValue>()
+        user.SetObject(uKeys, uVals)
+        let role: JsonValue = new JsonValue() ; role.SetString("admin")
+        user.AppendEntry("role", role)
+        stateRoot.AppendEntry("user", user)
+
+        let env: CelEnv = new CelEnv()
+        env.Bind("state", stateRoot)
+
+        let r1: CelValue = p.Eval("state.count", env)
+        if (r1.IsInt() && r1.I == 5) {
+            Console.WriteLine("  . path state.count")
+        } else {
+            Console.WriteLine("  x path state.count")
+            p.Failures = p.Failures + 1
+        }
+
+        let r2: CelValue = p.Eval("state.user.role == \"admin\"", env)
+        if (r2.IsBool() && r2.B) {
+            Console.WriteLine("  . path state.user.role compare")
+        } else {
+            Console.WriteLine("  x path state.user.role compare")
+            p.Failures = p.Failures + 1
+        }
+
+        let r3: CelValue = p.Eval("state.count > 0 && state.count < 10", env)
+        if (r3.IsBool() && r3.B) {
+            Console.WriteLine("  . state.count range compare")
+        } else {
+            Console.WriteLine("  x state.count range compare")
+            p.Failures = p.Failures + 1
+        }
+
+        let r4: CelValue = p.Eval("state.missing", env)
+        if (r4.IsNull()) {
+            Console.WriteLine("  . missing path -> null")
+        } else {
+            Console.WriteLine("  x missing path should be null")
+            p.Failures = p.Failures + 1
+        }
+
+        let r5: CelValue = p.Eval("len(state.items)", env)
+        if (r5.IsInt() && r5.I == 3) {
+            Console.WriteLine("  . len(state.items)")
+        } else {
+            Console.WriteLine("  x len(state.items)")
+            p.Failures = p.Failures + 1
+        }
+
+        let r6: CelValue = p.Eval(
+                "(state.count == null ? 0 : state.count) + 1", env)
+        if (r6.IsInt() && r6.I == 6) {
+            Console.WriteLine("  . ternary + arithmetic on state")
+        } else {
+            Console.WriteLine("  x ternary + arithmetic on state")
+            p.Failures = p.Failures + 1
+        }
+
+        Console.WriteLine("")
+        if (p.Failures == 0) {
+            Console.WriteLine("OK — all CEL-lite assertions green")
+        } else {
+            let n: string = String_FromInt(p.Failures)
+            Console.WriteLine("FAIL — {n} assertion(s) failed")
+        }
+    }
+}

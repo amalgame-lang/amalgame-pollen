@@ -1,0 +1,202 @@
+// tests/v3_loader_smoke.am
+//
+// Pollen v3 Phase 2 — smoke test for Pollen.WorkflowLoadV3.
+//
+// Loads each examples/workflow-v3-*.json, asserts the load succeeds,
+// counts come out right, and the AST shape matches a hand-rolled
+// expectation for the feature-demo (most complex example).
+//
+// Run :
+//   ./tests/build-v3-loader-smoke.sh
+//   ./tests/v3_loader_smoke
+
+import Amalgame.Pollen
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Spec {
+    public Path:        string
+    public ExpEntries:  int
+    public ExpAnchors:  int
+    public ExpActions:  int
+
+    public Spec(p: string, e: int, ac: int, ax: int) {
+        this.Path       = p
+        this.ExpEntries = e
+        this.ExpAnchors = ac
+        this.ExpActions = ax
+    }
+}
+
+public class Program {
+
+    public Failures: int
+
+    public Program() {
+        this.Failures = 0
+    }
+
+    public void AssertEq(label: string, got: int, want: int) {
+        if (got != want) {
+            let g: string = String_FromInt(got)
+            let w: string = String_FromInt(want)
+            Console.WriteLine("    x {label} : expected {w}, got {g}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("    . {label} = {got}")
+    }
+
+    public void AssertStrEq(label: string, got: string, want: string) {
+        if (got != want) {
+            Console.WriteLine("    x {label} : expected '{want}', got '{got}'")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("    . {label} = '{got}'")
+    }
+
+    public void AssertTrue(label: string, cond: bool) {
+        if (!cond) {
+            Console.WriteLine("    x {label}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("    . {label}")
+    }
+
+    public void RunOne(spec: Spec) {
+        Console.WriteLine("-- {spec.Path}")
+        let ok: bool = Pollen.WorkflowLoadV3(spec.Path)
+        if (!ok) {
+            let m: string = Pollen.WorkflowV3LoadErrorMsg()
+            Console.WriteLine("    x load failed : {m}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        this.AssertTrue("active", Pollen.WorkflowV3IsActive())
+        this.AssertEq("entries", Pollen.WorkflowV3EntryCount(),  spec.ExpEntries)
+        this.AssertEq("anchors", Pollen.WorkflowV3AnchorCount(), spec.ExpAnchors)
+        this.AssertEq("actions", Pollen.WorkflowV3ActionCount(), spec.ExpActions)
+        this.AssertTrue("nodes > 0", Pollen.WorkflowV3NodeCount() > 0)
+    }
+
+    public void RunFeatureDemo() {
+        let path: string = "examples/workflow-v3-feature-demo.json"
+        Console.WriteLine("-- {path} (deep structural check)")
+        let ok: bool = Pollen.WorkflowLoadV3(path)
+        if (!ok) {
+            let m: string = Pollen.WorkflowV3LoadErrorMsg()
+            Console.WriteLine("    x load failed : {m}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        // feature-demo : 4 entries (via-cron, via-http, shared-pipeline,
+        // retry-from-cache), 1 anchor (after-fetch), 4 actions
+        // (fetch, store, alert, audit).
+        this.AssertEq("entries", Pollen.WorkflowV3EntryCount(), 4)
+        this.AssertEq("anchors", Pollen.WorkflowV3AnchorCount(), 1)
+        this.AssertEq("actions", Pollen.WorkflowV3ActionCount(), 4)
+
+        // First entry is via-cron whose do is a single goto.
+        this.AssertStrEq("entry[0].name", Pollen.WorkflowV3EntryName(0), "via-cron")
+        let root0: int = Pollen.WorkflowV3EntryDoRoot(0)
+        this.AssertTrue("entry[0].do_root >= 0", root0 >= 0)
+        // POLLEN_AST_GOTO = 6
+        this.AssertEq("entry[0].do.kind=goto", Pollen.WorkflowV3NodeKind(root0), 6)
+        this.AssertStrEq("entry[0].do.target", Pollen.WorkflowV3NodeName(root0),
+                          "shared-pipeline")
+        // Goto must resolve to entries[2] (shared-pipeline).
+        // POLLEN_GOTO_ENTRY = 1
+        this.AssertEq("entry[0].do.goto_kind=entry",
+                       Pollen.WorkflowV3NodeGotoKind(root0), 1)
+        this.AssertEq("entry[0].do.goto_idx → shared-pipeline",
+                       Pollen.WorkflowV3NodeGotoIdx(root0), 2)
+
+        // Entry 2 is shared-pipeline. Its do is an array; the first
+        // step is a `call`, the second an `anchor`, the third a `for`.
+        this.AssertStrEq("entry[2].name",
+                          Pollen.WorkflowV3EntryName(2), "shared-pipeline")
+        let root2: int = Pollen.WorkflowV3EntryDoRoot(2)
+        this.AssertTrue("entry[2].do_root >= 0", root2 >= 0)
+        // POLLEN_AST_CALL = 1
+        this.AssertEq("entry[2].do[0].kind=call",
+                       Pollen.WorkflowV3NodeKind(root2), 1)
+        let step1: int = Pollen.WorkflowV3NodeNext(root2)
+        this.AssertTrue("entry[2].do[1] exists", step1 >= 0)
+        // POLLEN_AST_ANCHOR = 7
+        this.AssertEq("entry[2].do[1].kind=anchor",
+                       Pollen.WorkflowV3NodeKind(step1), 7)
+        this.AssertStrEq("entry[2].do[1].name=after-fetch",
+                          Pollen.WorkflowV3NodeName(step1), "after-fetch")
+        let step2: int = Pollen.WorkflowV3NodeNext(step1)
+        this.AssertTrue("entry[2].do[2] exists", step2 >= 0)
+        // POLLEN_AST_FOR = 3
+        this.AssertEq("entry[2].do[2].kind=for",
+                       Pollen.WorkflowV3NodeKind(step2), 3)
+        this.AssertStrEq("entry[2].do[2].var=item",
+                          Pollen.WorkflowV3NodeName(step2), "item")
+
+        // The for's body is an if (the only step). Its child0 = if node.
+        let forBody: int = Pollen.WorkflowV3NodeChild0(step2)
+        this.AssertTrue("for.body exists", forBody >= 0)
+        // POLLEN_AST_IF = 2
+        this.AssertEq("for.body.kind=if",
+                       Pollen.WorkflowV3NodeKind(forBody), 2)
+        // The if has two cases (when and else).
+        let case0: int = Pollen.WorkflowV3NodeChild0(forBody)
+        this.AssertTrue("if.case[0] exists", case0 >= 0)
+        // POLLEN_AST_CASE = 8
+        this.AssertEq("if.case[0].kind=case",
+                       Pollen.WorkflowV3NodeKind(case0), 8)
+        let case1: int = Pollen.WorkflowV3NodeNext(case0)
+        this.AssertTrue("if.case[1] exists", case1 >= 0)
+        this.AssertEq("if.case[1].kind=case",
+                       Pollen.WorkflowV3NodeKind(case1), 8)
+
+        // Last entry is retry-from-cache, its do = goto "after-fetch"
+        // (anchor target).
+        this.AssertStrEq("entry[3].name",
+                          Pollen.WorkflowV3EntryName(3), "retry-from-cache")
+        let root3: int = Pollen.WorkflowV3EntryDoRoot(3)
+        this.AssertTrue("entry[3].do_root >= 0", root3 >= 0)
+        this.AssertEq("entry[3].do.kind=goto",
+                       Pollen.WorkflowV3NodeKind(root3), 6)
+        this.AssertStrEq("entry[3].do.target=after-fetch",
+                          Pollen.WorkflowV3NodeName(root3), "after-fetch")
+        // POLLEN_GOTO_ANCHOR = 2
+        this.AssertEq("entry[3].do.goto_kind=anchor",
+                       Pollen.WorkflowV3NodeGotoKind(root3), 2)
+        this.AssertEq("entry[3].do.goto_idx → after-fetch (anchor 0)",
+                       Pollen.WorkflowV3NodeGotoIdx(root3), 0)
+    }
+
+    public static void Main(string[] args) {
+        let p: Program = new Program()
+        // (path, entries, anchors, actions)
+        let specs: List<Spec> = new List<Spec>()
+        specs.Add(new Spec("examples/workflow-v3-linear.json",        1, 0, 3))
+        specs.Add(new Spec("examples/workflow-v3-if.json",            1, 0, 4))
+        specs.Add(new Spec("examples/workflow-v3-for.json",           1, 0, 2))
+        specs.Add(new Spec("examples/workflow-v3-while.json",         1, 0, 3))
+        specs.Add(new Spec("examples/workflow-v3-control-flow.json",  1, 0, 6))
+        specs.Add(new Spec("examples/workflow-v3-call-modes.json",    1, 0, 5))
+        specs.Add(new Spec("examples/workflow-v3-multi-entry.json",   3, 0, 3))
+        specs.Add(new Spec("examples/workflow-v3-anchor-resume.json", 2, 1, 4))
+
+        let n: int = specs.Count()
+        for i in 0..n {
+            p.RunOne(specs.Get(i))
+        }
+        p.RunFeatureDemo()
+
+        Console.WriteLine("")
+        if (p.Failures == 0) {
+            Console.WriteLine("OK — v3 loader smoke all green")
+        } else {
+            let nf: string = String_FromInt(p.Failures)
+            Console.WriteLine("FAIL — {nf} assertion(s) failed")
+        }
+    }
+}

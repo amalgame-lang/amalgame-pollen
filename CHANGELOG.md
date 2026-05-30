@@ -1,5 +1,328 @@
 # Changelog
 
+## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
+
+### Added — Pollen v3 Live executions recording + cycle test (Phase 4 partial)
+
+Spec : `docs/proposals/pollen-v3.md` §"Implementation phases" Phase 4.
+
+Two robustness items that were carried as Phase 3d follow-ups :
+
+- **Live executions recorder hooked into v3** — after Phase 3d, v3
+  dispatch hops were invisible to the pollen-manager Live executions
+  panel because `_pollen_wf_record_step` was only fired on the v2
+  path. The listener worker now emits one record per v3-routed
+  message : fresh hop UUID, parent = inbound mid, topic_in = matched
+  topic, n_nexts=1, optional debug-session passthrough. Same shape
+  as the v2 record so the manager renders v2 + v3 hops uniformly.
+- **Negative test for cycle detection (rule 6)** — the validator's
+  DFS strongly-connected-components walk over the goto graph was
+  shipped in the rule 1-7 base but never exercised by a green-build
+  fixture. `examples/workflow-v3-cycle-invalid.json` (2 entries
+  pointing at each other) + a new `RunNegative` helper in
+  `tests/v3_validator_smoke.am` assert that the validator emits an
+  `[error rule6]` for the cycle. Catches a regression class
+  (silently-passing cycles) that would only surface at runtime
+  otherwise.
+
+### Notes
+
+- Runtime depth-cap fuzz (POLLEN_CALL_STACK_MAX=64) would need a
+  65-entry goto chain — verbose for the value, documented as a v4
+  candidate.
+- The v2 → v3 migration tool (~300 LOC per the spec) is still pending,
+  required before existing workflows can move over.
+
+### Added — Pollen v3 listener → dispatcher integration (Phase 3d)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher (target)".
+
+`_pollen_listener_worker` (the v2 hot path) is patched to fork to
+v3 when a v3 entry consumes the inbound message's topic. The v2
+routing tables remain the fallback for any topic no v3 entry
+claims, so existing v2 deployments are unaffected.
+
+- Forward decls at the top of the listener worker for
+  `_pollen_v3_active` / `_pollen_v3_entry_count` /
+  `_pollen_v3_dispatch_count` (tentative C definitions, fused with
+  the Phase 2 storage definitions) and the AM-generated
+  `Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic` entry point.
+- New `v3_handled` flag in the worker's per-message decision block,
+  set when `_pollen_v3_lookup_entry_by_topic` finds a match. The
+  envelope + topic are GC-duped while still holding the wf mutex so
+  the deferred AM call has stable storage.
+- The AM dispatcher is invoked AFTER releasing `_pollen_wf_mutex`.
+  Doing the call inside the critical section would risk deadlock —
+  the dispatcher allocates GC objects and may call Pollen.Publish
+  which re-locks the registry.
+- New `_pollen_v3_dispatch_count` atomic counter, bumped each time
+  the worker routes to v3. Exposed via
+  `Pollen.WorkflowV3DispatchCount` and
+  `Pollen.WorkflowV3ResetDispatchCount` so tests can observe the
+  fork without needing to inspect per-dispatch state (which is
+  otherwise ephemeral per `PollenDispatcher.Run`).
+
+### Tests
+
+- `tests/v3_listener_smoke.c` — C-side integration test
+  (registered via the existing `tests/run_tests.sh` runner so CI
+  picks it up automatically). Spins the listener on an ephemeral
+  port in a pthread, loads the v3 fixture, publishes to
+  "tick.hourly" then to "no.such.topic" via the real `Publish`
+  TCP path, polls `WorkflowV3DispatchCount`, and asserts :
+  - dispatch count = 1 after the v3-consumed publish
+  - dispatch count = 1 (unchanged) after the unrelated publish
+
+7 assertions, all green via `./tests/run_tests.sh ~/.local/bin/amc`.
+
+### Notes
+
+- The v2 hot path is preserved : every message still walks through
+  the same `_pollen_listener_worker` ; v3 simply takes precedence
+  when its lookup matches.
+- The Phase 2 executions recorder (`_pollen_wf_record_step` for the
+  manager's Live executions panel) is NOT yet hooked up for v3 —
+  follow-up before v0.2.0 ships.
+
+### Added — Pollen v3 bus-triggered dispatch (Phase 3c)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher (target)".
+
+Exposes the topic→entry routing surface the listener thread will
+call once Phase 3d patches `_pollen_listener_worker`. Keeping the
+listener change out of this commit because it touches a hot path
+that's currently exercised by every v2 message — wants its own
+slice with dedicated wire-level integration tests.
+
+- C-side `_pollen_v3_lookup_entry_by_topic(topic)` — linear scan
+  over `_pollen_v3_entries[]` matching `on_topic`. Bounded at 256
+  entries (`POLLEN_MAX_ENTRIES`), sub-µs even fully loaded — same
+  pattern as `_pollen_wf_topic_consumed` in the v2 path.
+- AM-side wrappers :
+  - `Pollen.WorkflowV3LookupEntryByTopic(topic) → int`
+  - `Pollen.WorkflowV3DispatchTopic(topic, envelopeJson) → int`
+  - `Pollen.WorkflowV3DispatchTopicState(topic, envelopeJson) → JsonValue`
+- The dispatcher's `BuildEnv` already binds the parsed envelope as
+  `msg`, so CEL-lite paths like `msg.data.user.id` and
+  `msg.data.n * 2` resolve out of the box — no code change needed,
+  just exercised by the new fixture entry.
+
+### Tests
+
+Added `by-topic` entry to the fixture (with `on: tick.hourly` and
+three `set` steps that read msg.data fields). 5 new assertions :
+lookup hit, lookup miss, three msg.data-driven `set` results.
+35 dispatcher assertions total, all green.
+
+### Notes
+
+- Phase 3d will patch `_pollen_listener_worker`'s
+  `if (matched) { do_forward = 1; }` block : when `_pollen_v3_active`
+  and the topic matches a v3 entry, call
+  `Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(topic, envelope)`
+  instead of the v2 routing-table forward. v2 stays the fallback for
+  topics that no v3 entry consumes.
+- Phase 3d will also need an integration smoke test that spins up a
+  real listener + posts an envelope + asserts the dispatcher ran.
+
+### Added — Pollen v3 `call` step wired to the capability registry (Phase 3b)
+
+Spec : `docs/proposals/pollen-v3.md` §"`call` resolution".
+
+The Phase 3a `call` stub is replaced by real capability-registry
+dispatch reusing the v2 LB + publish primitives.
+
+- New C helpers in the top `@c` block :
+  - `_pollen_v3_action_topic(name)` — action → topic lookup
+  - `_pollen_v3_publish_all(topic, data)` — registry-iterate +
+    `_pollen_publish_one` per provider declaring the topic
+  - `_pollen_v3_call_action(action, mode, on_error, data)` —
+    top-level entry. mode=0 (one) → `_pollen_lb_pick` P2C ; mode=1
+    (all) → broadcast. Returns providers-published-to, or -1 when
+    `on_error="fail"` finds 0 providers.
+- `PollenDispatcher.StepCall` rewritten : audits the call into
+  `state.__calls[]` (audit list stays for tests), JSON-encodes the
+  state via `Json.Encode`, calls the C helper. -1 return → `Fail()`
+  aborts the dispatch.
+- `on_error` policies fully enforced :
+  - `"log"`  *(default)* — 0 providers warns + chain continues
+  - `"fail"` — 0 providers aborts (the trailing step does NOT run)
+  - `"drop"` — 0 providers silently continues
+
+### Tests
+
+`tests/v3_dispatch_smoke.am` extended with three new entries in
+`workflow-v3-dispatch-fixture.json` (`with-call-fail`,
+`with-call-drop`, `with-call-all`). 30 assertions total ; verifies :
+- fail policy : `rc=-1`, `before` ran, `after` did NOT, audit captures
+  the attempted call
+- drop policy : full chain runs silently
+- mode=all : audit records the call ; 0-provider case returns 0 sent
+
+### Notes
+
+- The listener-thread wiring (incoming bus message → dispatch via
+  v3 when `_pollen_v3_active`) is deferred to Phase 3c. Today the v3
+  dispatcher is only callable via `Pollen.WorkflowV3DispatchEntry`.
+- The C-side `_pollen_v3_publish_all` snapshots the registry under
+  the mutex, then sends outside the lock — same pattern as the v2
+  fan-out forwarder, keeps slow socket I/O off the registry hot path.
+
+### Added — Pollen v3 tree-walker dispatcher (Phase 3a, AM-side)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher".
+
+Choice : AM-side dispatcher (not C). Reuses the Phase 1 CelEval verbatim
+for every expression — no parallel C-side eval implementation. Reads
+the AST through the Phase 2 C-side accessors.
+
+- `PollenFrame` — one call-stack frame : entry idx, param bindings,
+  bind-key (where to write the entry's `returns` on pop), caller-idx.
+- `PollenDispatcher` — owns the frame stack (cap 64,
+  `POLLEN_CALL_STACK_MAX`), the per-message state blackboard
+  (`JsonValue` object), and the bus envelope. Public entry points :
+  - `Pollen.WorkflowV3DispatchEntry(eidx, envelopeJson) → int`
+  - `Pollen.WorkflowV3DispatchEntryState(eidx, envelopeJson) → JsonValue`
+  - dotted-key state Set/Get walking nested objects, creating leaves
+    on demand.
+- Step handlers implemented :
+  - `set`    — eval value, write to dotted state key
+  - `goto`   — push frame, bind params from `args[]`, dispatch target
+    body, eval `returns`, pop, bind into caller's state via `bind`
+  - `anchor` — fall-through no-op
+  - `if`     — first-match-wins over `cases[].when` + `else: true`
+  - `for`    — eval `in`, iterate the list, bind loop var on the
+    current frame's params (also exposed at the env root so bare
+    `item.X` works per cel-lite §4)
+  - `while`  — eval `cond`, dispatch body, bounded by `maxIter` or
+    a 100k hard cap
+  - `call`   — STUB this slice : records the action name into
+    `state.__calls[]` so tests can verify the dispatcher walked it.
+    Full LB via capability registry + bus forwarding ships in
+    Phase 3b.
+- Eval bridges : `BuildEnv()` exposes `state` / `params` / `msg` plus
+  each frame param as a top-level root ; `CelToJson` / `JsonToCel`
+  bridge the two value types.
+- 16 additional C-side accessors needed by the dispatcher exposed via
+  AM wrappers (NodeExpr / NodeBind / NodeMode / NodeOnError /
+  NodeMaxIter / NodeHasElse / NodeArgsCount / NodeArg /
+  EntryHasReturns / EntryReturns / EntryParamCount / EntryParam /
+  AnchorEntryIdx / AnchorNodeIdx).
+
+### Tests
+
+- `tests/v3_dispatch_smoke.am` (+ `build-v3-dispatch-smoke.sh`) +
+  `examples/workflow-v3-dispatch-fixture.json` — 21 assertions
+  covering every implemented step (linear sequence, arithmetic, if
+  branching, for iteration + sum, while + maxIter, goto with params /
+  returns / bind, call stub audit). All green.
+
+### Notes
+
+- v2 dispatcher / routing tables remain alive. This phase adds a
+  parallel v3 dispatch entry point ; no wiring into the bus listener
+  yet (Phase 3b).
+- `call` is intentionally a stub here — once the listener fork lands
+  it'll dispatch through the capability registry with mode=one (P2C
+  LB) / mode=all (broadcast) per the spec.
+
+### Added — Pollen v3 runtime loader + AST + name resolver (Phase 2, C-side)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher", §"Memory bounds".
+
+- C-side static buffers in the top-level `@c` block:
+  - `_pollen_v3_ast[4096]` (`POLLEN_MAX_AST_NODES`) — flat AST pool,
+    indexed by int32. Each node carries `kind`, two child slots,
+    `next_sibling` for sequence chains, `goto_kind`/`goto_idx` for
+    resolved targets, and GC-allocated `name` / `expr` / `bind_key`.
+  - `_pollen_v3_entries[256]` (`POLLEN_MAX_ENTRIES`) — entries pool
+    with `name`, `on_topic`, `do_root`, `returns_expr`, `params[8]`.
+  - `_pollen_v3_anchors[4096]` (`POLLEN_MAX_ANCHORS_TOTAL`).
+  - `_pollen_v3_actions[256]` (`POLLEN_MAX_ACTIONS`).
+  - `_pollen_v3_args_pool[1024]` — flat pool for `goto.args[]`.
+- Setter API: `_pollen_v3_reload_begin` → 18 setters → `_pollen_v3_reload_commit`.
+  The commit step runs `_pollen_v3_resolve_gotos`, which walks the
+  AST and links every `goto` node to its target entry / anchor idx.
+- Introspection API: 11 `_pollen_v3_count_*` / `_pollen_v3_node_*`
+  / `_pollen_v3_entry_*` accessors for tests + dispatcher debug.
+
+- AM-side `Pollen.WorkflowLoadV3(path) → bool` walks the JSON via
+  `JsonParser` and drives the C setters. Mirrors the v2 reload
+  pattern (Begin → setters → Commit) — Phase 3's dispatcher will
+  consume the populated buffers directly.
+
+- AM-side introspection wrappers : `WorkflowV3IsActive` /
+  `WorkflowV3EntryCount` / `WorkflowV3AnchorCount` / `WorkflowV3NodeCount` /
+  `WorkflowV3EntryName(eidx)` / `WorkflowV3EntryDoRoot(eidx)` /
+  `WorkflowV3NodeKind(idx)` / `WorkflowV3NodeChild0(idx)` /
+  `WorkflowV3NodeNext(idx)` / `WorkflowV3NodeGotoKind(idx)` /
+  `WorkflowV3NodeGotoIdx(idx)` / `WorkflowV3NodeName(idx)` /
+  `WorkflowV3LoadErrorMsg`.
+
+### Tests
+
+- `tests/v3_loader_smoke.am` (+ `build-v3-loader-smoke.sh`) — loads
+  every v3 example, asserts entries / anchors / actions counts, then
+  walks the feature-demo AST to verify the structural shape
+  (sibling chain + child0 nesting + goto resolution against both
+  entry and anchor targets). 67 assertions, all green.
+
+### Notes
+
+- v2 dispatcher / routing tables stay alive in parallel — this phase
+  is loader-only, no execution yet. Phase 3 wires the tree-walker.
+- Goto resolution happens at commit time ; unresolved targets are
+  flagged in the load-error trail so the dispatcher (Phase 3) can
+  fail-fast even if a workflow slips through the validator.
+
+### Added — Pollen v3 CEL-lite expression engine (Phase 1, AM-side)
+
+Spec : `docs/proposals/pollen-v3-cel-lite.md`. Lives in `facade.am`.
+
+- `CelLexer`  — char-by-char tokenizer, every literal/op from the spec
+  (ints, floats, strings with `\" \\ \n \t` escapes, bools, null,
+  idents, all single/two-char operators). Bound : 256 tokens.
+- `CelParser` — Pratt parser with a precedence table for binary ops,
+  explicit dispatch for unary/postfix/ternary/primary, list literals
+  and calls. Bound : 128 AST nodes. Produces an indexed node pool
+  consumed by the evaluator.
+- `CelValue` — tagged-union runtime value (`Null/Bool/Int/Float/Str/List_`).
+- `CelEnv`   — path-root resolver bridge, JSON-backed. Caller pushes
+  the well-known roots (`state`, `params`, `msg`) plus any for-loop
+  var binding before eval ; missing path → `null` per spec.
+- `CelEval`  — tree-walking evaluator implementing every coercion +
+  builtin (`len`, `int`, `float`, `string`, `bool`, `contains`,
+  `startsWith`, `endsWith`), short-circuit `&&` / `||`, ternary,
+  `in` for `string in string` and `T in list<T>`, list indexing,
+  div/mod-by-zero → null, ordered compare against null → type error.
+
+### Validator rule 8 now fully enforced
+
+- New private helper `Pollen._v3CheckExpr(expr, ctx, path, diags)` runs
+  Lex + Parse on every expression string and emits `[error rule8]`
+  diagnostics with lex/parse error messages + column numbers.
+- All previous "non-empty" stub checks for `set.value`, `if.cases[].when`,
+  `for.in`, `while.cond`, `goto.args[]`, `entry.returns` replaced by
+  the new helper. The 9 shipped v3 example workflows still validate
+  with zero errors.
+
+### Tests
+
+- `tests/cel_lite_smoke.am` (+ `build-cel-lite-smoke.sh`) — 83 assertions
+  covering parse happy / error path, arithmetic, comparison, logical
+  ops, string concat + builtins, `in` operator, list indexing, and
+  env-backed path resolution. All green.
+- Existing `tests/v3_validator_smoke.am` — still 9/9 clean.
+
+### Notes
+- The unknown-path-root warn from cel-lite.md §4 is **deferred**. The
+  validator can't distinguish a typo from a legit for-loop var without
+  threading scope info ; the Phase 2 runtime resolver will fire the
+  warning instead.
+- Locked-out v0.4+ features (comprehensions, macros, regex, map
+  literals, string slicing, bitwise ops) reject cleanly at parse time.
+
+
 ## v0.1.23 — 2026-05-28
 
 ### Added — explicit `while.body` (uniform schema with `for.do` / `if.then`)

@@ -1,0 +1,29 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-anchor-resume-demo",
+  "version": 1,
+  "actions": {
+    "fetch":   { "topic": "data.fetch" },
+    "validate":{ "topic": "data.validate" },
+    "process": { "topic": "data.process" },
+    "persist": { "topic": "data.persist" }
+  },
+  "entries": [
+    {
+      "name": "fresh-run",
+      "on":   "data.in",
+      "do":   [
+        { "type": "call", "action": "fetch" },
+        { "type": "anchor", "name": "after-fetch" },
+        { "type": "call", "action": "validate" },
+        { "type": "call", "action": "process" },
+        { "type": "call", "action": "persist" }
+      ]
+    },
+    {
+      "name": "retry-from-cache",
+      "on":   "data.retry",
+      "do":   { "type": "goto", "target": "after-fetch" }
+    }
+  ]
+}

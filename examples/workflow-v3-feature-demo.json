@@ -1,0 +1,58 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-feature-demo",
+  "version": 1,
+  "actions": {
+    "fetch":  { "topic": "data.fetch" },
+    "store":  { "topic": "data.store" },
+    "alert":  { "topic": "ops.alert" },
+    "audit":  { "topic": "ops.audit" }
+  },
+  "entries": [
+    {
+      "name": "via-cron",
+      "on":   "tick",
+      "do":   { "type": "goto", "target": "shared-pipeline",
+                "args":   ["state.daily_dataset"],
+                "bind":   "state.last_summary" }
+    },
+    {
+      "name": "via-http",
+      "on":   "http.compute.request",
+      "do":   { "type": "goto", "target": "shared-pipeline",
+                "args":   ["msg.data.dataset"],
+                "bind":   "state.last_summary" }
+    },
+    {
+      "name": "shared-pipeline",
+      "params":  ["dataset"],
+      "returns": "state.summary",
+      "do": [
+        { "type": "call", "action": "fetch",
+          "on_error": "fail" },
+        { "type": "anchor", "name": "after-fetch" },
+        { "type": "for", "var": "item", "in": "state.items",
+          "do": {
+            "type": "if",
+            "cases": [
+              { "when": "item.priority > 5",
+                "do":   { "type": "call", "action": "alert",
+                          "mode": "all", "on_error": "log" } },
+              { "else": true,
+                "do":   { "type": "call", "action": "store" } }
+            ] } },
+        { "type": "call", "action": "audit",
+          "mode": "all", "on_error": "drop" },
+        { "type": "set", "key": "state.summary",
+          "value": "\"processed-\" + string(len(state.items))" }
+      ]
+    },
+    {
+      "name": "retry-from-cache",
+      "on":      "data.retry",
+      "params":  ["dataset"],
+      "returns": "state.summary",
+      "do":      { "type": "goto", "target": "after-fetch" }
+    }
+  ]
+}
