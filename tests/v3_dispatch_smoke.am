@@ -1,0 +1,186 @@
+// tests/v3_dispatch_smoke.am
+//
+// Pollen v3 Phase 3 — smoke test for the tree-walker dispatcher.
+//
+// Loads examples/workflow-v3-dispatch-fixture.json and runs each
+// entry, asserting the final state blackboard matches expectations.
+// Covers : sequence + set + if + for + while + anchor + goto with
+// params/bind/returns. `call` is stubbed (no network) — verified
+// only by checking state.__calls appends.
+
+import Amalgame.Pollen
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+
+    public Failures: int
+
+    public Program() {
+        this.Failures = 0
+    }
+
+    public void AssertInt(label: string, got: int, want: int) {
+        if (got != want) {
+            let g: string = String_FromInt(got)
+            let w: string = String_FromInt(want)
+            Console.WriteLine("    x {label} : expected {w}, got {g}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("    . {label} = {got}")
+    }
+
+    public void AssertStr(label: string, got: string, want: string) {
+        if (got != want) {
+            Console.WriteLine("    x {label} : expected '{want}', got '{got}'")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("    . {label} = '{got}'")
+    }
+
+    public void AssertTrue(label: string, cond: bool) {
+        if (!cond) {
+            Console.WriteLine("    x {label}")
+            this.Failures = this.Failures + 1
+            return
+        }
+        Console.WriteLine("    . {label}")
+    }
+
+    public int LookupEntry(name: string) {
+        let n: int = Pollen.WorkflowV3EntryCount()
+        for i in 0..n {
+            if (Pollen.WorkflowV3EntryName(i) == name) { return i }
+        }
+        return -1
+    }
+
+    public JsonValue Dispatch(entryName: string) {
+        let eidx: int = this.LookupEntry(entryName)
+        if (eidx < 0) {
+            Console.WriteLine("  ! entry '{entryName}' not found")
+            this.Failures = this.Failures + 1
+            return new JsonValue()
+        }
+        return Pollen.WorkflowV3DispatchEntryState(eidx, "")
+    }
+
+    public static void Main(string[] args) {
+        let p: Program = new Program()
+
+        Console.WriteLine("-- load fixture")
+        let ok: bool = Pollen.WorkflowLoadV3("examples/workflow-v3-dispatch-fixture.json")
+        if (!ok) {
+            let m: string = Pollen.WorkflowV3LoadErrorMsg()
+            Console.WriteLine("  ! load failed : {m}")
+            return
+        }
+        p.AssertTrue("v3 active", Pollen.WorkflowV3IsActive())
+        p.AssertInt("entries", Pollen.WorkflowV3EntryCount(), 12)
+
+        Console.WriteLine("-- linear (sequence + set + arithmetic)")
+        let s1: JsonValue = p.Dispatch("linear")
+        p.AssertInt("answer = 42",      s1.Get("answer").AsInt(),   42)
+        p.AssertStr("greeting=hi-bob",  s1.Get("greeting").AsString(), "hi-bob")
+        p.AssertInt("computed = 1+2*3", s1.Get("computed").AsInt(),  7)
+
+        Console.WriteLine("-- with-if (case match)")
+        let s2: JsonValue = p.Dispatch("with-if")
+        p.AssertInt("x = 5",     s2.Get("x").AsInt(),     5)
+        // 5 > 10 false, 5 > 3 true → branch=mid
+        p.AssertStr("branch=mid", s2.Get("branch").AsString(), "mid")
+
+        Console.WriteLine("-- with-for (iteration + loop var binding)")
+        let s3: JsonValue = p.Dispatch("with-for")
+        p.AssertInt("sum = 60", s3.Get("sum").AsInt(), 60)
+
+        Console.WriteLine("-- with-while (cond + maxIter)")
+        let s4: JsonValue = p.Dispatch("with-while")
+        p.AssertInt("i = 5", s4.Get("i").AsInt(), 5)
+
+        Console.WriteLine("-- with-anchor (fall-through after-set)")
+        let eaIdx: int = p.LookupEntry("with-anchor")
+        // Anchor entry takes a `start` param via goto ; we can't bind
+        // it without a goto caller. Skip params binding by dispatching
+        // synthetically — params.start will be null, so x will be null
+        // then multiplied by 2 stays null. Test the goto path instead.
+        let goIdx: int = p.LookupEntry("with-goto")
+        Console.WriteLine("-- with-goto (push frame + params + bind + returns)")
+        let s5: JsonValue = Pollen.WorkflowV3DispatchEntryState(goIdx, "")
+        p.AssertInt("before = 1", s5.Get("before").AsInt(), 1)
+        p.AssertInt("after = 1",  s5.Get("after").AsInt(),  1)
+        // callee's params.x = 7 ; returns = params.x * 10 = 70 ;
+        // bound to caller's state.result.
+        p.AssertInt("result = 70", s5.Get("result").AsInt(), 70)
+        // callee_seen was set in the callee's frame, but state is
+        // shared per dispatch invocation (cel-lite spec §"state scoping").
+        p.AssertInt("callee_seen = 7", s5.Get("callee_seen").AsInt(), 7)
+
+        Console.WriteLine("-- with-call (on_error=log default, 0 providers in registry)")
+        let s6: JsonValue = p.Dispatch("with-call")
+        let calls: JsonValue = s6.Get("__calls")
+        p.AssertTrue("calls is array", calls.IsArray())
+        if (calls.IsArray()) {
+            let cl: List<JsonValue> = calls.AsArray()
+            p.AssertInt("calls.length = 2", cl.Count(), 2)
+            if (cl.Count() >= 2) {
+                p.AssertStr("calls[0]=store", cl.Get(0).AsString(), "store")
+                p.AssertStr("calls[1]=alert", cl.Get(1).AsString(), "alert")
+            }
+        }
+
+        Console.WriteLine("-- with-call-fail (on_error=fail with 0 providers → abort)")
+        let efIdx: int = p.LookupEntry("with-call-fail")
+        let disp:  PollenDispatcher = new PollenDispatcher()
+        let rc:    int = disp.Run(efIdx, "")
+        p.AssertInt("rc = -1 (abort)", rc, -1)
+        let sf: JsonValue = disp.GetState()
+        // Audit lists the attempted call even on abort.
+        p.AssertTrue("__calls captured", sf.Get("__calls").IsArray())
+        p.AssertInt("before set",        sf.Get("before").AsInt(), 1)
+        // The trailing `set` after the failing call must NOT have run.
+        p.AssertTrue("after NOT set", !sf.Has("after"))
+
+        Console.WriteLine("-- with-call-drop (on_error=drop with 0 providers → silent)")
+        let s7: JsonValue = p.Dispatch("with-call-drop")
+        p.AssertInt("before = 1", s7.Get("before").AsInt(), 1)
+        // drop continues the chain.
+        p.AssertInt("after = 1",  s7.Get("after").AsInt(),  1)
+
+        Console.WriteLine("-- with-call-all (mode=all, 0 providers → 0 published)")
+        let s8: JsonValue = p.Dispatch("with-call-all")
+        // mode=all default on_error=log → 0 providers warns + continues.
+        let c8: JsonValue = s8.Get("__calls")
+        p.AssertTrue("calls audit exists", c8.IsArray())
+        if (c8.IsArray()) {
+            p.AssertInt("calls.length = 1", c8.AsArray().Count(), 1)
+        }
+
+        Console.WriteLine("-- dispatch-by-topic (Phase 3c)")
+        // Lookup hit
+        let bIdx: int = Pollen.WorkflowV3LookupEntryByTopic("tick.hourly")
+        let byIdx: int = p.LookupEntry("by-topic")
+        p.AssertInt("lookup tick.hourly → by-topic", bIdx, byIdx)
+        // Lookup miss
+        p.AssertInt("lookup unknown → -1",
+                     Pollen.WorkflowV3LookupEntryByTopic("no.such.topic"), -1)
+        // Dispatch with a synthetic envelope carrying msg.data fields.
+        let env: string = "{\"messageId\":\"abc\",\"data\":{\"user\":{\"id\":42},\"n\":21}}"
+        let s9: JsonValue = Pollen.WorkflowV3DispatchTopicState("tick.hourly", env)
+        p.AssertStr("got_topic", s9.Get("got_topic").AsString(), "tick.hourly")
+        p.AssertInt("user_id from msg.data.user.id", s9.Get("user_id").AsInt(), 42)
+        p.AssertInt("doubled = msg.data.n * 2",      s9.Get("doubled").AsInt(), 42)
+
+        Console.WriteLine("")
+        if (p.Failures == 0) {
+            Console.WriteLine("OK — v3 dispatcher smoke all green")
+        } else {
+            let n: string = String_FromInt(p.Failures)
+            Console.WriteLine("FAIL — {n} assertion(s) failed")
+        }
+    }
+}

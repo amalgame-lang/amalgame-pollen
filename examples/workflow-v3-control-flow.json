@@ -1,0 +1,47 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-control-flow-demo",
+  "version": 1,
+  "actions": {
+    "intake":  { "topic": "order.in" },
+    "retrier": { "topic": "order.retry" },
+    "attempt": { "topic": "order.attempt" },
+    "batcher": { "topic": "order.batch" },
+    "worker":  { "topic": "order.work" },
+    "alert":   { "topic": "ops.alert" }
+  },
+  "entries": [
+    {
+      "name": "main",
+      "on":   "order.in",
+      "do":   [
+        { "type": "call", "action": "intake" },
+        { "type": "call", "action": "retrier" },
+        { "type": "while",
+          "cond":    "state.amount > 0",
+          "maxIter": 3,
+          "do":      [
+            { "type": "call", "action": "attempt" },
+            { "type": "if",
+              "cases": [
+                { "when": "state.last_error != null",
+                  "do":   { "type": "call", "action": "alert" } }
+              ] },
+            { "type": "set", "key": "state.amount",
+              "value": "state.amount - 1" }
+          ] },
+        { "type": "call", "action": "batcher" },
+        { "type": "for", "var": "item", "in": "state.items",
+          "do":   [
+            { "type": "if",
+              "cases": [
+                { "when": "item.priority > 5",
+                  "do":   { "type": "call", "action": "alert" } },
+                { "else": true,
+                  "do":   { "type": "call", "action": "worker" } }
+              ] }
+          ] }
+      ]
+    }
+  ]
+}

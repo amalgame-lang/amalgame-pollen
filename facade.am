@@ -26,6 +26,10 @@
 
 namespace Amalgame.Pollen
 
+import Amalgame.Formats.Json
+import Amalgame.Collections
+import Amalgame.String
+
 @c {
     #include <stdio.h>
     #include <stdint.h>
@@ -2200,6 +2204,22 @@ namespace Amalgame.Pollen
      * pthread.h is already included earlier alongside workflow
      * state definitions. */
 
+    /* Phase 3d — forward decls so _pollen_listener_worker can branch
+     * on the v3 storage layer before reaching its definition further
+     * down the @c block. The tentative-definition rule lets these
+     * `static int` lines coexist with the real definitions in the
+     * Phase 2 storage section. */
+    static int _pollen_v3_active;
+    static int _pollen_v3_entry_count;
+    static _Atomic int _pollen_v3_dispatch_count;
+    static int _pollen_v3_lookup_entry_by_topic(const char* topic);
+
+    /* AM-defined v3 dispatcher entry point (Pollen.WorkflowV3DispatchTopic).
+     * Defined later in this TU by the amc codegen ; called from
+     * _pollen_listener_worker after the wf-mutex is released. */
+    extern int64_t Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(
+        code_string topic, code_string envelopeJson);
+
     static void* _pollen_listener_worker(void* arg) {
         int fd = (int)(intptr_t) arg;
         char rbuf[16384];
@@ -2230,8 +2250,49 @@ namespace Amalgame.Pollen
                  * recorder (set in the matched block below). */
                 const char* topic_in = NULL;
                 size_t topic_in_len = 0;
+                /* Phase 3d — v3 takes precedence over the v2 routing
+                 * tables. If a v3 entry's `on:` matches this topic, we
+                 * mark v3_handled, ACK as if v2 had matched, skip the
+                 * v2 dispatch block, and invoke the AM dispatcher AFTER
+                 * releasing the wf mutex (the dispatcher may call
+                 * Pollen.Publish which would otherwise deadlock). */
+                int v3_handled = 0;
+                const char* v3_topic_gc = 0;
+                const char* v3_env_gc   = 0;
                 pthread_mutex_lock(&_pollen_wf_mutex);
-                if (_pollen_wf_active && _pollen_wf_n_consumes > 0) {
+                if (_pollen_v3_active && _pollen_v3_entry_count > 0) {
+                    const char* tp3 = _pollen_find(rbuf, line_len,
+                                                     TOPIC_KEY, TOPIC_KEY_LEN);
+                    if (tp3) {
+                        tp3 += TOPIC_KEY_LEN;
+                        const char* tq3 = memchr(tp3, '"',
+                                                   line_len - (size_t)(tp3 - rbuf));
+                        if (tq3) {
+                            size_t tlen3 = (size_t)(tq3 - tp3);
+                            char tnt[POLLEN_TOPIC_MAX];
+                            if (tlen3 < sizeof(tnt)) {
+                                memcpy(tnt, tp3, tlen3);
+                                tnt[tlen3] = 0;
+                                if (_pollen_v3_lookup_entry_by_topic(tnt) >= 0) {
+                                    /* GC-dup so the AM call after the
+                                     * unlock has stable storage. */
+                                    char* td = (char*) GC_MALLOC_ATOMIC(tlen3 + 1);
+                                    char* ed = (char*) GC_MALLOC_ATOMIC(line_len + 1);
+                                    if (td && ed) {
+                                        memcpy(td, tp3, tlen3); td[tlen3] = 0;
+                                        memcpy(ed, rbuf, line_len); ed[line_len] = 0;
+                                        v3_topic_gc = td;
+                                        v3_env_gc   = ed;
+                                        v3_handled  = 1;
+                                        topic_in     = tp3;
+                                        topic_in_len = tlen3;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!v3_handled && _pollen_wf_active && _pollen_wf_n_consumes > 0) {
                     const char* tp = _pollen_find(rbuf, line_len,
                                                     TOPIC_KEY, TOPIC_KEY_LEN);
                     int matched = 0;
@@ -2418,6 +2479,65 @@ namespace Amalgame.Pollen
                     }
                 }
                 pthread_mutex_unlock(&_pollen_wf_mutex);
+
+                /* Phase 3d — v3 dispatch happens AFTER the mutex
+                 * release. The dispatcher walks the AST, evaluates
+                 * CEL-lite expressions, may call Pollen.Publish ;
+                 * all of those allocate GC objects + the publish
+                 * path re-locks the registry mutex. Doing the call
+                 * inside the wf-mutex critical section would risk
+                 * a deadlock if the dispatched workflow re-enters
+                 * via a self-call. */
+                if (v3_handled && v3_topic_gc && v3_env_gc) {
+                    atomic_fetch_add(&_pollen_msgs_handled, 1);
+                    atomic_fetch_add(&_pollen_inflight, 1);
+                    /* Phase 4 — surface the v3 hop in the manager's
+                     * Live executions panel. Generated here (not by
+                     * the dispatcher) so a single hop is recorded
+                     * per inbound message regardless of how many
+                     * inner steps the dispatcher walks. */
+                    if (_pollen_shared_dir[0]) {
+                        char hop_mid[37];
+                        _pollen_gen_uuid(hop_mid);
+                        /* Pull the inbound mid as parent. */
+                        const char* pmp = _pollen_find(rbuf, line_len,
+                                                        MID_KEY, MID_KEY_LEN);
+                        const char* parent3 = 0; size_t parent3_len = 0;
+                        if (pmp) {
+                            const char* pmv = pmp + MID_KEY_LEN;
+                            const char* pmq = memchr(pmv, '"',
+                                line_len - (size_t)(pmv - rbuf));
+                            if (pmq) {
+                                parent3     = pmv;
+                                parent3_len = (size_t)(pmq - pmv);
+                            }
+                        }
+                        /* Optional debug session, same shape as v2. */
+                        const char* dseg = _pollen_find(rbuf, line_len,
+                            "\"debug\":{\"session\":\"", 20);
+                        const char* dsess3 = 0; size_t dsess3_len = 0;
+                        if (dseg) {
+                            const char* dsv = dseg + 20;
+                            const char* dsq = memchr(dsv, '"',
+                                line_len - (size_t)(dsv - rbuf));
+                            if (dsq) {
+                                dsess3     = dsv;
+                                dsess3_len = (size_t)(dsq - dsv);
+                            }
+                        }
+                        _pollen_wf_record_step(hop_mid, 36,
+                            parent3, parent3_len,
+                            v3_topic_gc, strlen(v3_topic_gc),
+                            0 /* topic_out — v3 owns its forwards */,
+                            1 /* n_nexts — count the v3 hop */,
+                            dsess3, dsess3_len);
+                    }
+                    (void) Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(
+                        (code_string) v3_topic_gc,
+                        (code_string) v3_env_gc);
+                    atomic_fetch_add(&_pollen_v3_dispatch_count, 1);
+                    atomic_fetch_sub(&_pollen_inflight, 1);
+                }
 
                 size_t consumed = line_len + 1;
                 memmove(rbuf, rbuf + consumed, rlen - consumed);
@@ -3156,6 +3276,690 @@ namespace Amalgame.Pollen
         return (code_string) out;
     }
 
+    /* === Pollen v3 — runtime AST + name resolver =============
+     *
+     * Phase 2 of the v3 roadmap (docs/proposals/pollen-v3.md §"v3
+     * dispatcher"). Storage only — no dispatch yet (Phase 3).
+     *
+     * Layout :
+     *   - one flat AST pool indexed by int32. Each node carries a
+     *     `kind`, up to two child indices, and a `next_sibling`
+     *     index that chains array-of-steps sequences. Container
+     *     types (`for`, `while`, `if`, `entry.do`) point `child0`
+     *     at the head of the body chain.
+     *   - one entries[] pool, one anchors[] pool, one actions[] pool.
+     *     entries[i].do_root indexes into the AST pool ; anchors[i]
+     *     and goto-target resolution carry int idx into entries[] /
+     *     anchors[] (see `goto_kind`).
+     *   - GC-allocated `const char*` strings for names / exprs /
+     *     params / bind_key, so an entry name like "shared-pipeline"
+     *     isn't capped at a fixed buffer length.
+     *
+     * Setters are called from AM-side `Pollen.WorkflowLoadV3` between
+     * `_pollen_v3_reload_begin` and `_pollen_v3_reload_commit`. The
+     * commit step runs `_pollen_v3_resolve_gotos` so post-load each
+     * goto node knows whether its target is an entry or an anchor.
+     */
+
+    #define POLLEN_MAX_ENTRIES             256
+    #define POLLEN_MAX_AST_NODES          4096
+    #define POLLEN_MAX_ANCHORS_TOTAL      4096
+    #define POLLEN_MAX_ACTIONS             256
+    #define POLLEN_MAX_ENTRY_PARAMS          8
+
+    /* PollenAstKind — must match enum CelNodeKind / AM-side AstKind
+     * indices used by the walker (see WorkflowLoadV3). */
+    #define POLLEN_AST_CALL    1
+    #define POLLEN_AST_IF      2
+    #define POLLEN_AST_FOR     3
+    #define POLLEN_AST_WHILE   4
+    #define POLLEN_AST_SET     5
+    #define POLLEN_AST_GOTO    6
+    #define POLLEN_AST_ANCHOR  7
+    #define POLLEN_AST_CASE    8   /* synthetic — one per if.cases[i] */
+
+    /* goto_kind values stored on POLLEN_AST_GOTO nodes after resolve. */
+    #define POLLEN_GOTO_UNRESOLVED  0
+    #define POLLEN_GOTO_ENTRY       1
+    #define POLLEN_GOTO_ANCHOR      2
+
+    typedef struct {
+        uint8_t  kind;
+        uint8_t  mode;          /* call.mode : 0=one  1=all */
+        uint8_t  on_error;      /* call.on_error : 0=log 1=fail 2=drop */
+        uint8_t  has_else;      /* CASE node : 1 if `else: true` */
+        int32_t  child0;        /* container body head ; CASE → body head */
+        int32_t  child1;        /* reserved for future use */
+        int32_t  next_sibling;  /* chain element of sequence / case list */
+        int32_t  max_iter;      /* while.maxIter (0 = no cap declared) */
+        int32_t  args_first;    /* goto.args[] — flat pool offset */
+        int32_t  args_count;
+        int32_t  goto_kind;     /* POLLEN_GOTO_* */
+        int32_t  goto_idx;      /* entries[]/anchors[] idx post-resolve */
+        const char* name;       /* call.action / set.key / goto.target /
+                                  * anchor.name / for.var */
+        const char* expr;       /* when / cond / in / value / arg /
+                                  * returns / goto target name before resolve */
+        const char* bind_key;   /* goto.bind */
+    } PollenAstNode;
+
+    typedef struct {
+        const char* name;
+        const char* on_topic;        /* NULL if no `on:` */
+        int32_t     do_root;          /* AST idx of body head, -1 if empty */
+        int32_t     has_returns;
+        const char* returns_expr;
+        int32_t     params_count;
+        const char* params[POLLEN_MAX_ENTRY_PARAMS];
+    } PollenEntry;
+
+    typedef struct {
+        const char* name;
+        int32_t     entry_idx;
+        int32_t     node_idx;
+    } PollenAnchor;
+
+    typedef struct {
+        const char* name;
+        const char* topic;
+    } PollenAction;
+
+    static PollenAstNode _pollen_v3_ast[POLLEN_MAX_AST_NODES];
+    static int           _pollen_v3_ast_count;
+
+    static PollenEntry   _pollen_v3_entries[POLLEN_MAX_ENTRIES];
+    static int           _pollen_v3_entry_count;
+
+    static PollenAnchor  _pollen_v3_anchors[POLLEN_MAX_ANCHORS_TOTAL];
+    static int           _pollen_v3_anchor_count;
+
+    static PollenAction  _pollen_v3_actions[POLLEN_MAX_ACTIONS];
+    static int           _pollen_v3_action_count;
+
+    /* Args pool — every goto.args[] expression slots a (char*) here ;
+     * the goto node carries (args_first, args_count) into this pool. */
+    #define POLLEN_MAX_ARG_STRINGS  1024
+    static const char* _pollen_v3_args_pool[POLLEN_MAX_ARG_STRINGS];
+    static int         _pollen_v3_args_pool_count;
+
+    /* Load-time error trail. The AM walker bubbles a clear message up
+     * to the caller without using exceptions ; we leave it accessible
+     * to AM via Pollen.WorkflowLoadErrorMsg(). */
+    static char _pollen_v3_load_err[512];
+    static int  _pollen_v3_has_load_err;
+
+    static int _pollen_v3_active;   /* 1 once a v3 workflow has been
+                                      * committed ; flipped off only by
+                                      * a v2 load or another v3 reload */
+    /* Phase 3d — counter bumped each time the listener thread routes
+     * a message to the v3 dispatcher. Exposed via
+     * Pollen.WorkflowV3DispatchCount so the integration test can
+     * verify the listener → dispatcher fork without needing to
+     * observe per-dispatch state (which is otherwise ephemeral). */
+    static _Atomic int _pollen_v3_dispatch_count = 0;
+
+    static void _pollen_v3_set_err(const char* msg) {
+        if (_pollen_v3_has_load_err) return;   /* keep first error */
+        strncpy(_pollen_v3_load_err, msg, sizeof(_pollen_v3_load_err) - 1);
+        _pollen_v3_load_err[sizeof(_pollen_v3_load_err) - 1] = 0;
+        _pollen_v3_has_load_err = 1;
+    }
+
+    /* GC-backed strdup so AM-supplied `code_string`s survive past the
+     * setter call (the AM side may reuse its own buffers). */
+    static const char* _pollen_v3_dup(const char* s) {
+        if (!s) return 0;
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (!out) return 0;
+        memcpy(out, s, n);
+        out[n] = 0;
+        return out;
+    }
+
+    static void _pollen_v3_reload_begin(void) {
+        pthread_mutex_lock(&_pollen_wf_mutex);
+        _pollen_v3_ast_count    = 0;
+        _pollen_v3_entry_count  = 0;
+        _pollen_v3_anchor_count = 0;
+        _pollen_v3_action_count = 0;
+        _pollen_v3_args_pool_count = 0;
+        _pollen_v3_load_err[0]  = 0;
+        _pollen_v3_has_load_err = 0;
+    }
+
+    /* Allocate a fresh node, return its index. -1 on overflow. */
+    static int _pollen_v3_alloc_node(int kind) {
+        if (_pollen_v3_ast_count >= POLLEN_MAX_AST_NODES) {
+            _pollen_v3_set_err("AST node pool exhausted (POLLEN_MAX_AST_NODES=4096)");
+            return -1;
+        }
+        int i = _pollen_v3_ast_count++;
+        PollenAstNode* n = &_pollen_v3_ast[i];
+        memset(n, 0, sizeof(*n));
+        n->kind         = (uint8_t) kind;
+        n->child0       = -1;
+        n->child1       = -1;
+        n->next_sibling = -1;
+        n->args_first   = -1;
+        n->args_count   = 0;
+        n->goto_kind    = POLLEN_GOTO_UNRESOLVED;
+        n->goto_idx     = -1;
+        return i;
+    }
+
+    static int _pollen_v3_node_set_name(int idx, const char* name) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].name = _pollen_v3_dup(name);
+        return 0;
+    }
+    static int _pollen_v3_node_set_expr(int idx, const char* e) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].expr = _pollen_v3_dup(e);
+        return 0;
+    }
+    static int _pollen_v3_node_set_bind(int idx, const char* b) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].bind_key = _pollen_v3_dup(b);
+        return 0;
+    }
+    static int _pollen_v3_node_set_child0(int idx, int child) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].child0 = child;
+        return 0;
+    }
+    static int _pollen_v3_node_set_next(int idx, int next) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].next_sibling = next;
+        return 0;
+    }
+    static int _pollen_v3_node_set_mode(int idx, int mode) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].mode = (uint8_t) mode;
+        return 0;
+    }
+    static int _pollen_v3_node_set_on_error(int idx, int oe) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].on_error = (uint8_t) oe;
+        return 0;
+    }
+    static int _pollen_v3_node_set_max_iter(int idx, int mi) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].max_iter = mi;
+        return 0;
+    }
+    static int _pollen_v3_node_set_has_else(int idx, int he) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].has_else = (uint8_t) (he ? 1 : 0);
+        return 0;
+    }
+
+    /* Append a goto-arg expression to the flat pool, return its idx. */
+    static int _pollen_v3_push_arg(const char* expr) {
+        if (_pollen_v3_args_pool_count >= POLLEN_MAX_ARG_STRINGS) {
+            _pollen_v3_set_err("goto.args pool exhausted (POLLEN_MAX_ARG_STRINGS=1024)");
+            return -1;
+        }
+        int i = _pollen_v3_args_pool_count++;
+        _pollen_v3_args_pool[i] = _pollen_v3_dup(expr);
+        return i;
+    }
+
+    static int _pollen_v3_node_set_args(int idx, int first, int count) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        _pollen_v3_ast[idx].args_first = first;
+        _pollen_v3_ast[idx].args_count = count;
+        return 0;
+    }
+
+    /* === Entries ============================================ */
+
+    static int _pollen_v3_add_entry(const char* name, const char* on_topic) {
+        if (_pollen_v3_entry_count >= POLLEN_MAX_ENTRIES) {
+            _pollen_v3_set_err("entries[] full (POLLEN_MAX_ENTRIES=256)");
+            return -1;
+        }
+        int i = _pollen_v3_entry_count++;
+        PollenEntry* e = &_pollen_v3_entries[i];
+        memset(e, 0, sizeof(*e));
+        e->name     = _pollen_v3_dup(name);
+        e->on_topic = (on_topic && on_topic[0]) ? _pollen_v3_dup(on_topic) : 0;
+        e->do_root  = -1;
+        return i;
+    }
+
+    static int _pollen_v3_entry_set_do_root(int eidx, int node_idx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        _pollen_v3_entries[eidx].do_root = node_idx;
+        return 0;
+    }
+    static int _pollen_v3_entry_set_returns(int eidx, const char* expr) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        _pollen_v3_entries[eidx].has_returns  = 1;
+        _pollen_v3_entries[eidx].returns_expr = _pollen_v3_dup(expr);
+        return 0;
+    }
+    static int _pollen_v3_entry_add_param(int eidx, const char* name) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        PollenEntry* e = &_pollen_v3_entries[eidx];
+        if (e->params_count >= POLLEN_MAX_ENTRY_PARAMS) {
+            _pollen_v3_set_err("entry params overflow (POLLEN_MAX_ENTRY_PARAMS=8)");
+            return -1;
+        }
+        e->params[e->params_count++] = _pollen_v3_dup(name);
+        return 0;
+    }
+
+    /* === Anchors ============================================ */
+
+    static int _pollen_v3_add_anchor(int entry_idx, const char* name,
+                                       int node_idx) {
+        if (_pollen_v3_anchor_count >= POLLEN_MAX_ANCHORS_TOTAL) {
+            _pollen_v3_set_err("anchors[] full (POLLEN_MAX_ANCHORS_TOTAL=4096)");
+            return -1;
+        }
+        int i = _pollen_v3_anchor_count++;
+        PollenAnchor* a = &_pollen_v3_anchors[i];
+        a->name      = _pollen_v3_dup(name);
+        a->entry_idx = entry_idx;
+        a->node_idx  = node_idx;
+        return i;
+    }
+
+    /* === Actions ============================================ */
+
+    static int _pollen_v3_add_action(const char* name, const char* topic) {
+        if (_pollen_v3_action_count >= POLLEN_MAX_ACTIONS) {
+            _pollen_v3_set_err("actions[] full (POLLEN_MAX_ACTIONS=256)");
+            return -1;
+        }
+        int i = _pollen_v3_action_count++;
+        _pollen_v3_actions[i].name  = _pollen_v3_dup(name);
+        _pollen_v3_actions[i].topic = _pollen_v3_dup(topic);
+        return i;
+    }
+
+    /* === Lookups ============================================ */
+
+    static int _pollen_v3_lookup_entry(const char* name) {
+        if (!name) return -1;
+        for (int i = 0; i < _pollen_v3_entry_count; i++) {
+            if (_pollen_v3_entries[i].name &&
+                strcmp(_pollen_v3_entries[i].name, name) == 0) return i;
+        }
+        return -1;
+    }
+    static int _pollen_v3_lookup_anchor(const char* name) {
+        if (!name) return -1;
+        for (int i = 0; i < _pollen_v3_anchor_count; i++) {
+            if (_pollen_v3_anchors[i].name &&
+                strcmp(_pollen_v3_anchors[i].name, name) == 0) return i;
+        }
+        return -1;
+    }
+    static int _pollen_v3_lookup_action(const char* name) {
+        if (!name) return -1;
+        for (int i = 0; i < _pollen_v3_action_count; i++) {
+            if (_pollen_v3_actions[i].name &&
+                strcmp(_pollen_v3_actions[i].name, name) == 0) return i;
+        }
+        return -1;
+    }
+
+    /* === Goto resolver ====================================== */
+    /*
+     * Walks the AST pool ; for each POLLEN_AST_GOTO node, looks the
+     * target name up against entries first, then anchors. Unresolved
+     * targets stay flagged so the dispatcher can fail-fast at run
+     * time (the validator already rejects them at load time, but the
+     * runtime double-check is cheap insurance).
+     */
+    static int _pollen_v3_resolve_gotos(void) {
+        int unresolved = 0;
+        for (int i = 0; i < _pollen_v3_ast_count; i++) {
+            PollenAstNode* n = &_pollen_v3_ast[i];
+            if (n->kind != POLLEN_AST_GOTO) continue;
+            int eidx = _pollen_v3_lookup_entry(n->name);
+            if (eidx >= 0) {
+                n->goto_kind = POLLEN_GOTO_ENTRY;
+                n->goto_idx  = eidx;
+                continue;
+            }
+            int aidx = _pollen_v3_lookup_anchor(n->name);
+            if (aidx >= 0) {
+                n->goto_kind = POLLEN_GOTO_ANCHOR;
+                n->goto_idx  = aidx;
+                continue;
+            }
+            unresolved++;
+        }
+        if (unresolved > 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "goto resolver: %d unresolved target(s)", unresolved);
+            _pollen_v3_set_err(buf);
+        }
+        return unresolved;
+    }
+
+    static int _pollen_v3_reload_commit(void) {
+        int unres = _pollen_v3_resolve_gotos();
+        if (_pollen_v3_has_load_err) {
+            pthread_mutex_unlock(&_pollen_wf_mutex);
+            return -1;
+        }
+        _pollen_v3_active = 1;
+        _pollen_wf_version++;
+        pthread_mutex_unlock(&_pollen_wf_mutex);
+        (void) unres;
+        return 0;
+    }
+
+    /* === Introspection (for tests + dispatcher debug) ========= */
+
+    static int _pollen_v3_count_entries(void) { return _pollen_v3_entry_count; }
+    static int _pollen_v3_count_anchors(void) { return _pollen_v3_anchor_count; }
+    static int _pollen_v3_count_actions(void) { return _pollen_v3_action_count; }
+    static int _pollen_v3_count_nodes(void)   { return _pollen_v3_ast_count; }
+    static int _pollen_v3_is_active(void)     { return _pollen_v3_active; }
+    static int _pollen_v3_get_dispatch_count(void) {
+        return atomic_load(&_pollen_v3_dispatch_count);
+    }
+    static void _pollen_v3_reset_dispatch_count(void) {
+        atomic_store(&_pollen_v3_dispatch_count, 0);
+    }
+
+    static code_string _pollen_v3_get_load_err(void) {
+        if (!_pollen_v3_has_load_err) {
+            char* out = (char*) GC_MALLOC_ATOMIC(1);
+            if (out) out[0] = 0;
+            return (code_string) out;
+        }
+        size_t n = strlen(_pollen_v3_load_err);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, _pollen_v3_load_err, n); out[n] = 0; }
+        return (code_string) out;
+    }
+
+    static code_string _pollen_v3_entry_name(int eidx) {
+        const char* s = (eidx >= 0 && eidx < _pollen_v3_entry_count)
+                          ? _pollen_v3_entries[eidx].name : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+
+    static int _pollen_v3_entry_do_root(int eidx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return -1;
+        return _pollen_v3_entries[eidx].do_root;
+    }
+    static int _pollen_v3_node_kind(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return (int) _pollen_v3_ast[idx].kind;
+    }
+    static int _pollen_v3_node_child0(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        return _pollen_v3_ast[idx].child0;
+    }
+    static int _pollen_v3_node_next(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        return _pollen_v3_ast[idx].next_sibling;
+    }
+    static int _pollen_v3_node_goto_kind(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].goto_kind;
+    }
+    static int _pollen_v3_node_goto_idx(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return -1;
+        return _pollen_v3_ast[idx].goto_idx;
+    }
+    static int _pollen_v3_node_mode(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].mode;
+    }
+    static int _pollen_v3_node_on_error(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].on_error;
+    }
+    static int _pollen_v3_node_max_iter(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].max_iter;
+    }
+    static int _pollen_v3_node_has_else(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].has_else;
+    }
+    static int _pollen_v3_node_args_count(int idx) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) return 0;
+        return _pollen_v3_ast[idx].args_count;
+    }
+    static code_string _pollen_v3_node_arg(int idx, int i) {
+        if (idx < 0 || idx >= _pollen_v3_ast_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        PollenAstNode* n = &_pollen_v3_ast[idx];
+        if (i < 0 || i >= n->args_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        const char* s = _pollen_v3_args_pool[n->args_first + i];
+        if (!s) s = "";
+        size_t L = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(L + 1);
+        if (out) { memcpy(out, s, L); out[L] = 0; }
+        return (code_string) out;
+    }
+    static code_string _pollen_v3_node_name(int idx) {
+        const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
+                          ? _pollen_v3_ast[idx].name : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static code_string _pollen_v3_node_expr(int idx) {
+        const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
+                          ? _pollen_v3_ast[idx].expr : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static code_string _pollen_v3_node_bind(int idx) {
+        const char* s = (idx >= 0 && idx < _pollen_v3_ast_count)
+                          ? _pollen_v3_ast[idx].bind_key : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static int _pollen_v3_entry_has_returns(int eidx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return 0;
+        return _pollen_v3_entries[eidx].has_returns;
+    }
+    static code_string _pollen_v3_entry_returns(int eidx) {
+        const char* s = (eidx >= 0 && eidx < _pollen_v3_entry_count)
+                          ? _pollen_v3_entries[eidx].returns_expr : "";
+        if (!s) s = "";
+        size_t n = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) { memcpy(out, s, n); out[n] = 0; }
+        return (code_string) out;
+    }
+    static int _pollen_v3_entry_param_count(int eidx) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) return 0;
+        return _pollen_v3_entries[eidx].params_count;
+    }
+    static code_string _pollen_v3_entry_param(int eidx, int i) {
+        if (eidx < 0 || eidx >= _pollen_v3_entry_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        PollenEntry* e = &_pollen_v3_entries[eidx];
+        if (i < 0 || i >= e->params_count) {
+            char* o = (char*) GC_MALLOC_ATOMIC(1); if (o) o[0] = 0;
+            return (code_string) o;
+        }
+        const char* s = e->params[i];
+        if (!s) s = "";
+        size_t L = strlen(s);
+        char* out = (char*) GC_MALLOC_ATOMIC(L + 1);
+        if (out) { memcpy(out, s, L); out[L] = 0; }
+        return (code_string) out;
+    }
+    static int _pollen_v3_anchor_node_idx_c(int aidx) {
+        if (aidx < 0 || aidx >= _pollen_v3_anchor_count) return -1;
+        return _pollen_v3_anchors[aidx].node_idx;
+    }
+    static int _pollen_v3_anchor_entry_idx_c(int aidx) {
+        if (aidx < 0 || aidx >= _pollen_v3_anchor_count) return -1;
+        return _pollen_v3_anchors[aidx].entry_idx;
+    }
+
+    /* === Phase 3b — call dispatch ============================
+     *
+     * Wires `call` to the existing v2 capability registry + publish
+     * primitives. mode=one picks one provider via power-of-two
+     * choices (_pollen_lb_pick) ; mode=all iterates the registry and
+     * publishes to every provider declaring the action's topic.
+     *
+     * Returns the number of providers actually published-to. Negative
+     * return = on_error policy abort (caller dispatcher fails).
+     *
+     * on_error values match POLLEN_AST_CALL.on_error storage :
+     *   0 = "log"  (default) — 0 providers warns + returns 0
+     *   1 = "fail"           — 0 providers returns -1 (abort)
+     *   2 = "drop"           — 0 providers silently returns 0
+     */
+
+    /* Lookup the topic associated with an action name. Returns NULL
+     * if no such action is registered. */
+    static const char* _pollen_v3_action_topic(const char* name) {
+        if (!name || !name[0]) return 0;
+        for (int i = 0; i < _pollen_v3_action_count; i++) {
+            if (_pollen_v3_actions[i].name &&
+                strcmp(_pollen_v3_actions[i].name, name) == 0) {
+                return _pollen_v3_actions[i].topic;
+            }
+        }
+        return 0;
+    }
+
+    /* Iterate the capability registry and publish to every provider
+     * advertising `topic`. Returns the count published. The registry
+     * mutex is held only during the candidate-snapshot — the publish
+     * itself happens outside the lock to avoid blocking other
+     * registry writers on slow socket I/O. */
+    static int _pollen_v3_publish_all(const char* topic, const char* data_json) {
+        if (!topic || !topic[0] || !data_json) return 0;
+        char hosts[POLLEN_REG_MAX][POLLEN_HOST_MAX];
+        int  ports[POLLEN_REG_MAX];
+        int  nc = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n && nc < POLLEN_REG_MAX; i++) {
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++) {
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) {
+                    strncpy(hosts[nc], _pollen_reg[i].host, POLLEN_HOST_MAX - 1);
+                    hosts[nc][POLLEN_HOST_MAX - 1] = 0;
+                    ports[nc] = _pollen_reg[i].port;
+                    nc++;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        int sent = 0;
+        for (int i = 0; i < nc; i++) {
+            char mid[37];
+            if (_pollen_publish_one(hosts[i], ports[i], topic, 1,
+                                      data_json, mid)) {
+                sent++;
+            }
+        }
+        return sent;
+    }
+
+    /* Top-level entry point invoked by the AM StepCall handler. */
+    static int _pollen_v3_call_action(const char* action_name,
+                                        int mode, int on_error,
+                                        const char* data_json) {
+        const char* topic = _pollen_v3_action_topic(action_name);
+        if (!topic) {
+            /* Validator should already have caught this — but if a
+             * runtime-only load slipped through, surface it. */
+            if (on_error == 1) return -1;
+            return 0;
+        }
+
+        if (mode == 1) {
+            /* mode=all */
+            int n = _pollen_v3_publish_all(topic, data_json);
+            if (n == 0 && on_error == 1) return -1;
+            return n;
+        }
+
+        /* mode=one (default) — P2C pick. */
+        char host[POLLEN_HOST_MAX]; int port = 0;
+        if (!_pollen_lb_pick(topic, host, sizeof(host), &port)) {
+            if (on_error == 1) return -1;
+            return 0;
+        }
+        char mid[37];
+        if (!_pollen_publish_one(host, port, topic, 1, data_json, mid)) {
+            if (on_error == 1) return -1;
+            return 0;
+        }
+        return 1;
+    }
+
+    /* Phase 3c — entry lookup by `on:` topic.
+     *
+     * Returns the entry idx whose `on_topic` matches `topic` exactly,
+     * or -1 if no entry consumes that topic. Multi-entry routing is
+     * not supported in v0.2 (the validator rejects dup on_topic), so
+     * the first match is the canonical match.
+     *
+     * Hot-path : called by the listener thread for every bus message,
+     * so it walks `_pollen_v3_entries` directly with strcmp — same
+     * pattern as `_pollen_wf_topic_consumed`. The entry count is
+     * bounded at POLLEN_MAX_ENTRIES (256) so the linear scan stays
+     * sub-µs even fully loaded.
+     */
+    static int _pollen_v3_lookup_entry_by_topic(const char* topic) {
+        if (!topic || !topic[0]) return -1;
+        for (int i = 0; i < _pollen_v3_entry_count; i++) {
+            const char* t = _pollen_v3_entries[i].on_topic;
+            if (t && strcmp(t, topic) == 0) return i;
+        }
+        return -1;
+    }
+
+    /* Snapshot the current provider count for a topic — used by the
+     * AM-side audit so tests can verify the registry state without
+     * needing to forge envelopes. */
+    static int _pollen_v3_action_provider_count(const char* action_name) {
+        const char* topic = _pollen_v3_action_topic(action_name);
+        if (!topic) return 0;
+        int nc = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n; i++) {
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++) {
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) {
+                    nc++;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        return nc;
+    }
+
     /* === Introspection ======================================== */
     static int64_t
     Amalgame_Pollen_Pollen_WorkflowVersion_c(void) {
@@ -3168,6 +3972,1229 @@ namespace Amalgame.Pollen
         char* out = (char*) GC_MALLOC_ATOMIC(len + 1);
         if (out) { memcpy(out, _pollen_pkg_role, len); out[len] = 0; }
         return (code_string) out;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Pollen v3 — CEL-lite expression language
+// ─────────────────────────────────────────────────────────────────
+//
+// Spec : docs/proposals/pollen-v3-cel-lite.md. Three blocks below :
+//   1. Lexer            — char-by-char tokenizer
+//   2. Pratt parser     — precedence table → AST nodes (indexed)
+//   3. Tree-walking eval — operates on a tagged-union value
+//
+// Validator rule 8 invokes Lex+Parse for every expression field;
+// the evaluator is exposed for runtime use (Phase 3 dispatcher).
+
+// ── Token / node / value kinds ───────────────────────────────────
+
+public enum CelTokKind {
+    Int      // i64 literal
+    Float    // f64 literal
+    Str      // string literal
+    Bool     // true / false
+    Null     // null
+    Ident    // identifier
+    LParen   // (
+    RParen   // )
+    LBrack   // [
+    RBrack   // ]
+    Comma    // ,
+    Dot      // .
+    Question // ?
+    Colon    // :
+    Plus     // +
+    Minus    // -
+    Star     // *
+    Slash    // /
+    Percent  // %
+    Eq       // ==
+    Neq      // !=
+    Lt       // <
+    Le       // <=
+    Gt       // >
+    Ge       // >=
+    And      // &&
+    Or       // ||
+    Not      // !
+    In       // in
+    Eof
+}
+
+public enum CelNodeKind {
+    LitInt
+    LitFloat
+    LitStr
+    LitBool
+    LitNull
+    Ident       // bare identifier (well-known root or builtin name)
+    Call        // identifier(args...)
+    List_       // [a, b, c]
+    Unary       // -x, !x
+    Binary      // arithmetic / comparison / logical / `in`
+    Index       // a[i]
+    DotAccess   // a.b
+    Ternary     // c ? t : f
+}
+
+public enum CelValKind {
+    Null
+    Bool
+    Int
+    Float
+    Str
+    List_
+}
+
+// ── CelToken ─────────────────────────────────────────────────────
+
+public class CelToken {
+    public Kind:     CelTokKind
+    public Text:     string
+    public IntVal:   int
+    public FloatVal: float
+    public StrVal:   string   // unescaped payload for CelTokKind.Str
+    public Col:      int
+
+    public CelToken(kind: CelTokKind, text: string, col: int) {
+        this.Kind     = kind
+        this.Text     = text
+        this.IntVal   = 0
+        this.FloatVal = 0.0
+        this.StrVal   = ""
+        this.Col      = col
+    }
+}
+
+// ── CelLexer ─────────────────────────────────────────────────────
+//
+// Produces a List<CelToken>. On failure, sets Failed + ErrMsg/ErrCol
+// and stops emitting. Caller checks HasFailed() before parsing.
+// Max token count enforced via POLLEN_MAX_CEL_TOKENS (256).
+
+public class CelLexer {
+    private Source: string
+    private Pos:    int
+    private Failed: bool
+    private ErrMsg: string
+    private ErrCol: int
+
+    public CelLexer(string source) {
+        this.Source = source
+        this.Pos    = 0
+        this.Failed = false
+        this.ErrMsg = ""
+        this.ErrCol = 0
+    }
+
+    public bool   HasFailed() { return this.Failed }
+    public string ErrorMsg()  { return this.ErrMsg }
+    public int    ErrorCol()  { return this.ErrCol }
+
+    private void Fail(string msg) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.ErrMsg = msg
+        this.ErrCol = this.Pos
+    }
+
+    private bool AtEnd() { return this.Pos >= String_Length(this.Source) }
+
+    private string Peek() {
+        if (this.AtEnd()) { return "" }
+        return String_CharAt1(this.Source, this.Pos)
+    }
+
+    private string PeekAt(int off) {
+        let i: int = this.Pos + off
+        if (i < 0)                            { return "" }
+        if (i >= String_Length(this.Source))  { return "" }
+        return String_CharAt1(this.Source, i)
+    }
+
+    private string Advance() {
+        if (this.AtEnd()) { return "" }
+        let c: string = String_CharAt1(this.Source, this.Pos)
+        this.Pos = this.Pos + 1
+        return c
+    }
+
+    private static bool IsDigit(string c) {
+        if (String_Length(c) == 0) { return false }
+        return String_IndexOf("0123456789", c) >= 0
+    }
+
+    private static bool IsAlpha(string c) {
+        if (String_Length(c) == 0) { return false }
+        if (c == "_") { return true }
+        if (String_IndexOf("abcdefghijklmnopqrstuvwxyz", c) >= 0) { return true }
+        if (String_IndexOf("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0) { return true }
+        return false
+    }
+
+    private static bool IsAlphaNum(string c) {
+        return CelLexer.IsAlpha(c) || CelLexer.IsDigit(c)
+    }
+
+    public List<CelToken> Lex() {
+        let toks: List<CelToken> = new List<CelToken>()
+        while (!this.AtEnd() && !this.Failed) {
+            let c: string = this.Peek()
+            // whitespace
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+                this.Advance()
+                continue
+            }
+            let startCol: int = this.Pos
+
+            // identifier / keyword
+            if (CelLexer.IsAlpha(c)) {
+                var s: string = ""
+                while (!this.AtEnd() && CelLexer.IsAlphaNum(this.Peek())) {
+                    s = s + this.Advance()
+                }
+                if (s == "true") {
+                    let t: CelToken = new CelToken(CelTokKind.Bool, s, startCol)
+                    t.IntVal = 1
+                    toks.Add(t)
+                } else if (s == "false") {
+                    let t: CelToken = new CelToken(CelTokKind.Bool, s, startCol)
+                    t.IntVal = 0
+                    toks.Add(t)
+                } else if (s == "null") {
+                    toks.Add(new CelToken(CelTokKind.Null, s, startCol))
+                } else if (s == "in") {
+                    toks.Add(new CelToken(CelTokKind.In, s, startCol))
+                } else {
+                    toks.Add(new CelToken(CelTokKind.Ident, s, startCol))
+                }
+                continue
+            }
+
+            // number — int or float
+            if (CelLexer.IsDigit(c)) {
+                var intPart: string = ""
+                while (!this.AtEnd() && CelLexer.IsDigit(this.Peek())) {
+                    intPart = intPart + this.Advance()
+                }
+                if (this.Peek() == "." && CelLexer.IsDigit(this.PeekAt(1))) {
+                    var fracPart: string = "" + this.Advance() // '.'
+                    while (!this.AtEnd() && CelLexer.IsDigit(this.Peek())) {
+                        fracPart = fracPart + this.Advance()
+                    }
+                    let raw: string = intPart + fracPart
+                    let t: CelToken = new CelToken(CelTokKind.Float, raw, startCol)
+                    t.FloatVal = String_ToFloat(raw)
+                    toks.Add(t)
+                } else {
+                    // Detect i64 overflow at lex time.
+                    let n: int = String_Length(intPart)
+                    if (n > 19) {
+                        this.Fail("integer literal overflows i64 (max 19 digits)")
+                        return toks
+                    }
+                    let t: CelToken = new CelToken(CelTokKind.Int, intPart, startCol)
+                    t.IntVal = String_ToInt(intPart)
+                    toks.Add(t)
+                }
+                continue
+            }
+
+            // string literal — only \" \\ \n \t escapes
+            if (c == "\"") {
+                this.Advance()
+                var s: string = ""
+                var closed: bool = false
+                while (!this.AtEnd()) {
+                    let ch: string = this.Peek()
+                    if (ch == "\"") { this.Advance(); closed = true; break }
+                    if (ch == "\n") {
+                        this.Fail("newline inside string literal")
+                        return toks
+                    }
+                    if (ch == "\\") {
+                        this.Advance()
+                        if (this.AtEnd()) {
+                            this.Fail("unterminated escape in string literal")
+                            return toks
+                        }
+                        let esc: string = this.Advance()
+                        if      (esc == "\"") { s = s + "\"" }
+                        else if (esc == "\\") { s = s + "\\" }
+                        else if (esc == "n")  { s = s + "\n" }
+                        else if (esc == "t")  { s = s + "\t" }
+                        else {
+                            this.Fail("invalid escape '\\" + esc + "'")
+                            return toks
+                        }
+                        continue
+                    }
+                    s = s + this.Advance()
+                }
+                if (!closed) {
+                    this.Fail("unterminated string literal")
+                    return toks
+                }
+                let t: CelToken = new CelToken(CelTokKind.Str, "\"" + s + "\"", startCol)
+                t.StrVal = s
+                toks.Add(t)
+                continue
+            }
+
+            // two-char operators
+            if (c == "=" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Eq, "==", startCol))
+                continue
+            }
+            if (c == "!" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Neq, "!=", startCol))
+                continue
+            }
+            if (c == "<" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Le, "<=", startCol))
+                continue
+            }
+            if (c == ">" && this.PeekAt(1) == "=") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Ge, ">=", startCol))
+                continue
+            }
+            if (c == "&" && this.PeekAt(1) == "&") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.And, "&&", startCol))
+                continue
+            }
+            if (c == "|" && this.PeekAt(1) == "|") {
+                this.Advance(); this.Advance()
+                toks.Add(new CelToken(CelTokKind.Or, "||", startCol))
+                continue
+            }
+
+            // single-char punctuation / operators
+            this.Advance()
+            if      (c == "(") { toks.Add(new CelToken(CelTokKind.LParen,   c, startCol)) }
+            else if (c == ")") { toks.Add(new CelToken(CelTokKind.RParen,   c, startCol)) }
+            else if (c == "[") { toks.Add(new CelToken(CelTokKind.LBrack,   c, startCol)) }
+            else if (c == "]") { toks.Add(new CelToken(CelTokKind.RBrack,   c, startCol)) }
+            else if (c == ",") { toks.Add(new CelToken(CelTokKind.Comma,    c, startCol)) }
+            else if (c == ".") { toks.Add(new CelToken(CelTokKind.Dot,      c, startCol)) }
+            else if (c == "?") { toks.Add(new CelToken(CelTokKind.Question, c, startCol)) }
+            else if (c == ":") { toks.Add(new CelToken(CelTokKind.Colon,    c, startCol)) }
+            else if (c == "+") { toks.Add(new CelToken(CelTokKind.Plus,     c, startCol)) }
+            else if (c == "-") { toks.Add(new CelToken(CelTokKind.Minus,    c, startCol)) }
+            else if (c == "*") { toks.Add(new CelToken(CelTokKind.Star,     c, startCol)) }
+            else if (c == "/") { toks.Add(new CelToken(CelTokKind.Slash,    c, startCol)) }
+            else if (c == "%") { toks.Add(new CelToken(CelTokKind.Percent,  c, startCol)) }
+            else if (c == "<") { toks.Add(new CelToken(CelTokKind.Lt,       c, startCol)) }
+            else if (c == ">") { toks.Add(new CelToken(CelTokKind.Gt,       c, startCol)) }
+            else if (c == "!") { toks.Add(new CelToken(CelTokKind.Not,      c, startCol)) }
+            else {
+                this.Fail("unexpected character '" + c + "'")
+                return toks
+            }
+        }
+
+        // POLLEN_MAX_CEL_TOKENS bound check.
+        if (toks.Count() > 256) {
+            this.Fail("expression exceeds POLLEN_MAX_CEL_TOKENS (256)")
+            return toks
+        }
+
+        toks.Add(new CelToken(CelTokKind.Eof, "", this.Pos))
+        return toks
+    }
+}
+
+// ── CelNode (AST) ────────────────────────────────────────────────
+//
+// Nodes live in an indexed pool (CelParser.Nodes). Children refer
+// to siblings by integer index, never by direct reference, so the
+// tree is array-of-struct friendly + cheap to walk.
+//
+// Fields used per Kind :
+//
+//   LitInt    IntVal
+//   LitFloat  FloatVal
+//   LitStr    StrVal
+//   LitBool   BoolVal
+//   LitNull   —
+//   Ident     StrVal=name
+//   Call      StrVal=name, Args=arg node idxs
+//   List_     Args=elem node idxs
+//   Unary     OpTok, Left=child
+//   Binary    OpTok, Left, Right
+//   Index     Left=collection, Right=index expr
+//   DotAccess Left=lhs,        StrVal=field name
+//   Ternary   Left=cond,       Mid=then, Right=else
+
+public class CelNode {
+    public Kind:     CelNodeKind
+    public IntVal:   int
+    public FloatVal: float
+    public StrVal:   string
+    public BoolVal:  bool
+    public OpTok:    CelTokKind   // operator for Unary / Binary
+    public Left:     int          // child index, -1 if absent
+    public Right:    int
+    public Mid:      int          // for Ternary
+    public Args:     List<int>
+    public Col:      int
+
+    public CelNode(CelNodeKind kind, int col) {
+        this.Kind     = kind
+        this.IntVal   = 0
+        this.FloatVal = 0.0
+        this.StrVal   = ""
+        this.BoolVal  = false
+        this.OpTok    = CelTokKind.Eof
+        this.Left     = -1
+        this.Right    = -1
+        this.Mid      = -1
+        this.Args     = new List<int>()
+        this.Col      = col
+    }
+}
+
+// ── CelParser (Pratt) ────────────────────────────────────────────
+//
+// One precedence table + one parse_expr(minPrec) routine drives all
+// binary ops. Unary / postfix / primary are dispatched explicitly.
+// AST nodes are allocated from a private List<CelNode>; the root
+// node index is returned by Parse(). Bound : POLLEN_MAX_CEL_AST_NODES
+// (128) — anything bigger rejects at parse time.
+
+public class CelParser {
+    private Tokens: List<CelToken>
+    private Pos:    int
+    public  Nodes:  List<CelNode>
+    private Failed: bool
+    private ErrMsg: string
+    private ErrCol: int
+
+    public CelParser(List<CelToken> tokens) {
+        this.Tokens = tokens
+        this.Pos    = 0
+        this.Nodes  = new List<CelNode>()
+        this.Failed = false
+        this.ErrMsg = ""
+        this.ErrCol = 0
+    }
+
+    public bool   HasFailed() { return this.Failed }
+    public string ErrorMsg()  { return this.ErrMsg }
+    public int    ErrorCol()  { return this.ErrCol }
+
+    private void Fail(string msg, int col) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.ErrMsg = msg
+        this.ErrCol = col
+    }
+
+    private CelToken Peek() {
+        return this.Tokens.Get(this.Pos)
+    }
+
+    private CelToken PeekAt(int off) {
+        let i: int = this.Pos + off
+        if (i < 0 || i >= this.Tokens.Count()) {
+            return this.Tokens.Get(this.Tokens.Count() - 1) // Eof
+        }
+        return this.Tokens.Get(i)
+    }
+
+    private CelToken Advance() {
+        let t: CelToken = this.Tokens.Get(this.Pos)
+        if (this.Pos < this.Tokens.Count() - 1) { this.Pos = this.Pos + 1 }
+        return t
+    }
+
+    private bool Accept(CelTokKind k) {
+        if (this.Peek().Kind == k) { this.Advance(); return true }
+        return false
+    }
+
+    private bool Expect(CelTokKind k, string what) {
+        let t: CelToken = this.Peek()
+        if (t.Kind != k) {
+            this.Fail("expected " + what + ", got '" + t.Text + "'", t.Col)
+            return false
+        }
+        this.Advance()
+        return true
+    }
+
+    private int AddNode(CelNode n) {
+        if (this.Nodes.Count() >= 128) {
+            this.Fail("expression exceeds POLLEN_MAX_CEL_AST_NODES (128)", n.Col)
+            return -1
+        }
+        this.Nodes.Add(n)
+        return this.Nodes.Count() - 1
+    }
+
+    // Map a binary operator token to its precedence (1 = lowest).
+    // 0 means "not a binary op at this position".
+    private static int OpPrec(CelTokKind k) {
+        if (k == CelTokKind.Or)                                 { return 2 }
+        if (k == CelTokKind.And)                                { return 3 }
+        if (k == CelTokKind.Eq || k == CelTokKind.Neq)          { return 4 }
+        if (k == CelTokKind.Lt || k == CelTokKind.Le ||
+            k == CelTokKind.Gt || k == CelTokKind.Ge ||
+            k == CelTokKind.In)                                 { return 5 }
+        if (k == CelTokKind.Plus  || k == CelTokKind.Minus)     { return 6 }
+        if (k == CelTokKind.Star  || k == CelTokKind.Slash ||
+            k == CelTokKind.Percent)                            { return 7 }
+        return 0
+    }
+
+    // Top-level entry. Returns root node index, or -1 on failure.
+    public int Parse() {
+        let root: int = this.ParseExpr(1)
+        if (this.Failed) { return -1 }
+        if (this.Peek().Kind != CelTokKind.Eof) {
+            let t: CelToken = this.Peek()
+            this.Fail("trailing tokens after expression: '" + t.Text + "'", t.Col)
+            return -1
+        }
+        return root
+    }
+
+    // Pratt loop : parse a unary, then fold binary ops with prec >= minPrec.
+    // Handles the ternary `? :` at the lowest precedence as a special case.
+    private int ParseExpr(int minPrec) {
+        if (this.Failed) { return -1 }
+        var lhs: int = this.ParseUnary()
+        if (this.Failed) { return -1 }
+        while (!this.Failed) {
+            let k: CelTokKind = this.Peek().Kind
+            let prec: int = CelParser.OpPrec(k)
+            if (prec == 0 || prec < minPrec) { break }
+            let opCol: int = this.Peek().Col
+            this.Advance()
+            let rhs: int = this.ParseExpr(prec + 1) // left-assoc
+            if (this.Failed) { return -1 }
+            let n: CelNode = new CelNode(CelNodeKind.Binary, opCol)
+            n.OpTok = k
+            n.Left  = lhs
+            n.Right = rhs
+            lhs = this.AddNode(n)
+            if (this.Failed) { return -1 }
+        }
+        // Ternary `cond ? then : else` — right-assoc, lowest prec.
+        if (minPrec <= 1 && this.Peek().Kind == CelTokKind.Question) {
+            let qCol: int = this.Peek().Col
+            this.Advance()
+            let thenIdx: int = this.ParseExpr(1)
+            if (this.Failed) { return -1 }
+            if (!this.Expect(CelTokKind.Colon, "':' in ternary")) { return -1 }
+            let elseIdx: int = this.ParseExpr(1)
+            if (this.Failed) { return -1 }
+            let n: CelNode = new CelNode(CelNodeKind.Ternary, qCol)
+            n.Left  = lhs
+            n.Mid   = thenIdx
+            n.Right = elseIdx
+            lhs = this.AddNode(n)
+        }
+        return lhs
+    }
+
+    private int ParseUnary() {
+        let t: CelToken = this.Peek()
+        if (t.Kind == CelTokKind.Not || t.Kind == CelTokKind.Minus) {
+            this.Advance()
+            let child: int = this.ParseUnary()
+            if (this.Failed) { return -1 }
+            let n: CelNode = new CelNode(CelNodeKind.Unary, t.Col)
+            n.OpTok = t.Kind
+            n.Left  = child
+            return this.AddNode(n)
+        }
+        return this.ParsePostfix()
+    }
+
+    private int ParsePostfix() {
+        var lhs: int = this.ParsePrimary()
+        if (this.Failed) { return -1 }
+        while (!this.Failed) {
+            let k: CelTokKind = this.Peek().Kind
+            if (k == CelTokKind.Dot) {
+                let dotCol: int = this.Peek().Col
+                this.Advance()
+                let id: CelToken = this.Peek()
+                if (id.Kind != CelTokKind.Ident) {
+                    this.Fail("expected identifier after '.'", id.Col)
+                    return -1
+                }
+                this.Advance()
+                let n: CelNode = new CelNode(CelNodeKind.DotAccess, dotCol)
+                n.Left   = lhs
+                n.StrVal = id.Text
+                lhs = this.AddNode(n)
+            } else if (k == CelTokKind.LBrack) {
+                let brCol: int = this.Peek().Col
+                this.Advance()
+                let idx: int = this.ParseExpr(1)
+                if (this.Failed) { return -1 }
+                if (!this.Expect(CelTokKind.RBrack, "']'")) { return -1 }
+                let n: CelNode = new CelNode(CelNodeKind.Index, brCol)
+                n.Left  = lhs
+                n.Right = idx
+                lhs = this.AddNode(n)
+            } else {
+                break
+            }
+        }
+        return lhs
+    }
+
+    private int ParsePrimary() {
+        let t: CelToken = this.Peek()
+        if (t.Kind == CelTokKind.Int) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitInt, t.Col)
+            n.IntVal = t.IntVal
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Float) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitFloat, t.Col)
+            n.FloatVal = t.FloatVal
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Str) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitStr, t.Col)
+            n.StrVal = t.StrVal
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Bool) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitBool, t.Col)
+            n.BoolVal = t.IntVal != 0
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Null) {
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.LitNull, t.Col)
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.LParen) {
+            this.Advance()
+            let inner: int = this.ParseExpr(1)
+            if (this.Failed) { return -1 }
+            if (!this.Expect(CelTokKind.RParen, "')'")) { return -1 }
+            return inner
+        }
+        if (t.Kind == CelTokKind.LBrack) {
+            let brCol: int = t.Col
+            this.Advance()
+            let n: CelNode = new CelNode(CelNodeKind.List_, brCol)
+            if (this.Peek().Kind != CelTokKind.RBrack) {
+                while (true) {
+                    let it: int = this.ParseExpr(1)
+                    if (this.Failed) { return -1 }
+                    n.Args.Add(it)
+                    if (this.Peek().Kind == CelTokKind.Comma) { this.Advance(); continue }
+                    break
+                }
+            }
+            if (!this.Expect(CelTokKind.RBrack, "']' in list literal")) { return -1 }
+            return this.AddNode(n)
+        }
+        if (t.Kind == CelTokKind.Ident) {
+            this.Advance()
+            // call vs bare ident
+            if (this.Peek().Kind == CelTokKind.LParen) {
+                this.Advance()
+                let n: CelNode = new CelNode(CelNodeKind.Call, t.Col)
+                n.StrVal = t.Text
+                if (this.Peek().Kind != CelTokKind.RParen) {
+                    while (true) {
+                        let a: int = this.ParseExpr(1)
+                        if (this.Failed) { return -1 }
+                        n.Args.Add(a)
+                        if (this.Peek().Kind == CelTokKind.Comma) { this.Advance(); continue }
+                        break
+                    }
+                }
+                if (!this.Expect(CelTokKind.RParen, "')' in call")) { return -1 }
+                return this.AddNode(n)
+            }
+            let n: CelNode = new CelNode(CelNodeKind.Ident, t.Col)
+            n.StrVal = t.Text
+            return this.AddNode(n)
+        }
+        this.Fail("unexpected token '" + t.Text + "' in expression", t.Col)
+        return -1
+    }
+}
+
+// ── CelValue (runtime tagged union) ──────────────────────────────
+//
+// Used by CelEval. Mirrors the type system in cel-lite.md §4.
+// List elements are themselves CelValue (so heterogeneous lists are
+// representable — the eval reports them as type errors per spec).
+
+public class CelValue {
+    public Kind:   CelValKind
+    public B:      bool
+    public I:      int
+    public F:      float
+    public S:      string
+    public Items:  List<CelValue>
+
+    public CelValue() {
+        this.Kind  = CelValKind.Null
+        this.B     = false
+        this.I     = 0
+        this.F     = 0.0
+        this.S     = ""
+        this.Items = new List<CelValue>()
+    }
+
+    public bool IsNull()  { return this.Kind == CelValKind.Null }
+    public bool IsBool()  { return this.Kind == CelValKind.Bool }
+    public bool IsInt()   { return this.Kind == CelValKind.Int }
+    public bool IsFloat() { return this.Kind == CelValKind.Float }
+    public bool IsStr()   { return this.Kind == CelValKind.Str }
+    public bool IsList()  { return this.Kind == CelValKind.List_ }
+
+    public static CelValue Null_() {
+        return new CelValue()
+    }
+    public static CelValue Bool_(bool b) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Bool
+        v.B    = b
+        return v
+    }
+    public static CelValue Int_(int n) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Int
+        v.I    = n
+        return v
+    }
+    public static CelValue Float_(float f) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Float
+        v.F    = f
+        return v
+    }
+    public static CelValue Str_(string s) {
+        let v: CelValue = new CelValue()
+        v.Kind = CelValKind.Str
+        v.S    = s
+        return v
+    }
+    public static CelValue List__(List<CelValue> xs) {
+        let v: CelValue = new CelValue()
+        v.Kind  = CelValKind.List_
+        v.Items = xs
+        return v
+    }
+}
+
+// ── CelEnv (resolver bridge for path roots) ──────────────────────
+//
+// The evaluator looks up `state.X`, `params.X`, `msg.data.X` and any
+// for-loop-bound name via this object. v0.2 ships a JSON-backed
+// implementation : roots are JsonValues, dot/index navigates the
+// JSON document. Loop bindings are pushed/popped as needed.
+//
+// Runtime (C-side dispatcher, Phase 3) supplies its own subclass.
+// Pure-AM unit tests build a JsonValue env and pass it in.
+
+public class CelEnv {
+    private RootNames: List<string>
+    private RootVals:  List<JsonValue>
+
+    public CelEnv() {
+        this.RootNames = new List<string>()
+        this.RootVals  = new List<JsonValue>()
+    }
+
+    public void Bind(string name, JsonValue v) {
+        // Latest binding wins ; supports loop shadowing.
+        this.RootNames.Add(name)
+        this.RootVals.Add(v)
+    }
+
+    public void Unbind(string name) {
+        // Remove the most recent binding of `name` (LIFO).
+        let n: int = this.RootNames.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (this.RootNames.Get(j) == name) {
+                this.RootNames.RemoveAt(j)
+                this.RootVals.RemoveAt(j)
+                return
+            }
+        }
+    }
+
+    public bool Has(string name) {
+        let n: int = this.RootNames.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (this.RootNames.Get(j) == name) { return true }
+        }
+        return false
+    }
+
+    public JsonValue Lookup(string name) {
+        let n: int = this.RootNames.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (this.RootNames.Get(j) == name) { return this.RootVals.Get(j) }
+        }
+        return new JsonValue() // Null
+    }
+}
+
+// ── CelEval (tree-walking evaluator) ─────────────────────────────
+//
+// One Eval(rootIdx, env) entry. Errors set Failed + ErrMsg/ErrCol,
+// short-circuit subsequent evals, and surface to the caller via
+// HasFailed() — the dispatcher's on_error policy picks from there.
+//
+// Coercion + builtins follow cel-lite.md §4-§5 exactly.
+
+public class CelEval {
+    private Nodes:  List<CelNode>
+    private Env:    CelEnv
+    private Failed: bool
+    private ErrMsg: string
+    private ErrCol: int
+
+    public CelEval(List<CelNode> nodes, CelEnv env) {
+        this.Nodes  = nodes
+        this.Env    = env
+        this.Failed = false
+        this.ErrMsg = ""
+        this.ErrCol = 0
+    }
+
+    public bool   HasFailed() { return this.Failed }
+    public string ErrorMsg()  { return this.ErrMsg }
+    public int    ErrorCol()  { return this.ErrCol }
+
+    private void Fail(string msg, int col) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.ErrMsg = msg
+        this.ErrCol = col
+    }
+
+    // Lexicographic byte compare. Returns -1 / 0 / +1.
+    public static int _StrCmp(string a, string b) {
+        var r: int = 0
+        @c { r = strcmp(a, b); }
+        if (r < 0) { return -1 }
+        if (r > 0) { return  1 }
+        return 0
+    }
+
+    // Truncate float to int (toward zero) for `int(floatVal)`.
+    public static int _FloatTrunc(float x) {
+        var r: int = 0
+        @c { r = (int64_t) x; }
+        return r
+    }
+
+    public CelValue Eval(int rootIdx) {
+        if (rootIdx < 0) {
+            this.Fail("empty AST", 0)
+            return CelValue.Null_()
+        }
+        return this.EvalNode(rootIdx)
+    }
+
+    // Convert a JsonValue (env-resolved) to a CelValue. Objects don't
+    // have a first-class CelValue kind ; we surface them as opaque
+    // Str of the JSON re-encoding so callers see something useful in
+    // error messages, while equality still degrades to false.
+    private static CelValue FromJson(JsonValue jv) {
+        if (jv.IsNull())   { return CelValue.Null_() }
+        if (jv.IsBool())   { return CelValue.Bool_(jv.AsBool()) }
+        if (jv.IsInt())    { return CelValue.Int_(jv.AsInt()) }
+        if (jv.IsFloat())  { return CelValue.Float_(jv.AsFloat()) }
+        if (jv.IsString()) { return CelValue.Str_(jv.AsString()) }
+        if (jv.IsArray()) {
+            let xs: List<CelValue> = new List<CelValue>()
+            let items: List<JsonValue> = jv.AsArray()
+            let n: int = items.Count()
+            for i in 0..n {
+                xs.Add(CelEval.FromJson(items.Get(i)))
+            }
+            return CelValue.List__(xs)
+        }
+        // Object — opaque ; expose as Null at the leaf, dot-walk
+        // happens inside EvalDotPath against the underlying JSON.
+        return CelValue.Null_()
+    }
+
+    private CelValue EvalNode(int idx) {
+        if (this.Failed || idx < 0) { return CelValue.Null_() }
+        let n: CelNode = this.Nodes.Get(idx)
+        let k: CelNodeKind = n.Kind
+
+        if (k == CelNodeKind.LitInt)   { return CelValue.Int_(n.IntVal) }
+        if (k == CelNodeKind.LitFloat) { return CelValue.Float_(n.FloatVal) }
+        if (k == CelNodeKind.LitStr)   { return CelValue.Str_(n.StrVal) }
+        if (k == CelNodeKind.LitBool)  { return CelValue.Bool_(n.BoolVal) }
+        if (k == CelNodeKind.LitNull)  { return CelValue.Null_() }
+
+        if (k == CelNodeKind.Ident) {
+            if (this.Env.Has(n.StrVal)) {
+                return CelEval.FromJson(this.Env.Lookup(n.StrVal))
+            }
+            // Per spec : unknown root evaluates to null silently.
+            return CelValue.Null_()
+        }
+
+        if (k == CelNodeKind.List_) {
+            let xs: List<CelValue> = new List<CelValue>()
+            let m: int = n.Args.Count()
+            for i in 0..m {
+                xs.Add(this.EvalNode(n.Args.Get(i)))
+                if (this.Failed) { return CelValue.Null_() }
+            }
+            return CelValue.List__(xs)
+        }
+
+        if (k == CelNodeKind.DotAccess) {
+            // Resolve a contiguous DotAccess + Ident chain against the
+            // env's JsonValue so we can walk into nested objects.
+            return this.EvalPath(idx)
+        }
+
+        if (k == CelNodeKind.Index) {
+            let coll: CelValue = this.EvalNode(n.Left)
+            if (this.Failed) { return CelValue.Null_() }
+            let key: CelValue = this.EvalNode(n.Right)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!coll.IsList()) {
+                this.Fail("index on non-list", n.Col)
+                return CelValue.Null_()
+            }
+            if (!key.IsInt()) {
+                this.Fail("non-int index", n.Col)
+                return CelValue.Null_()
+            }
+            if (key.I < 0) {
+                this.Fail("negative index", n.Col)
+                return CelValue.Null_()
+            }
+            if (key.I >= coll.Items.Count()) {
+                return CelValue.Null_() // out-of-range → null per spec
+            }
+            return coll.Items.Get(key.I)
+        }
+
+        if (k == CelNodeKind.Unary)   { return this.EvalUnary(n) }
+        if (k == CelNodeKind.Binary)  { return this.EvalBinary(n) }
+        if (k == CelNodeKind.Ternary) { return this.EvalTernary(n) }
+        if (k == CelNodeKind.Call)    { return this.EvalCall(n) }
+
+        this.Fail("unhandled node kind", n.Col)
+        return CelValue.Null_()
+    }
+
+    // Walk a DotAccess chain into the underlying JsonValue root.
+    // If any segment is missing → null (spec §4).
+    private CelValue EvalPath(int idx) {
+        // Collect segments from root to leaf.
+        let segs: List<string> = new List<string>()
+        var cur: int = idx
+        while (true) {
+            let nd: CelNode = this.Nodes.Get(cur)
+            if (nd.Kind != CelNodeKind.DotAccess) { break }
+            segs.Add(nd.StrVal)
+            cur = nd.Left
+        }
+        let head: CelNode = this.Nodes.Get(cur)
+        if (head.Kind != CelNodeKind.Ident) {
+            // Non-ident root — fall back to evaluating that subtree,
+            // then can't walk further as JSON. Type error.
+            this.Fail("path root must be an identifier", head.Col)
+            return CelValue.Null_()
+        }
+        if (!this.Env.Has(head.StrVal)) {
+            return CelValue.Null_() // unknown root → null (warn comes from validator)
+        }
+        var jv: JsonValue = this.Env.Lookup(head.StrVal)
+        // segs is leaf→root order ; walk right-to-left.
+        let m: int = segs.Count()
+        for i in 0..m {
+            let segName: string = segs.Get(m - 1 - i)
+            if (!jv.IsObject()) { return CelValue.Null_() }
+            if (!jv.Has(segName)) { return CelValue.Null_() }
+            jv = jv.Get(segName)
+        }
+        return CelEval.FromJson(jv)
+    }
+
+    private CelValue EvalUnary(CelNode n) {
+        let v: CelValue = this.EvalNode(n.Left)
+        if (this.Failed) { return CelValue.Null_() }
+        if (n.OpTok == CelTokKind.Not) {
+            if (!v.IsBool()) {
+                this.Fail("'!' requires bool operand", n.Col)
+                return CelValue.Null_()
+            }
+            return CelValue.Bool_(!v.B)
+        }
+        if (n.OpTok == CelTokKind.Minus) {
+            if (v.IsInt())   { return CelValue.Int_(-v.I) }
+            if (v.IsFloat()) { return CelValue.Float_(-v.F) }
+            this.Fail("unary '-' on non-numeric", n.Col)
+            return CelValue.Null_()
+        }
+        this.Fail("unknown unary op", n.Col)
+        return CelValue.Null_()
+    }
+
+    private CelValue EvalBinary(CelNode n) {
+        let op: CelTokKind = n.OpTok
+
+        // Short-circuit logical ops.
+        if (op == CelTokKind.And) {
+            let l: CelValue = this.EvalNode(n.Left)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!l.IsBool()) { this.Fail("'&&' requires bool", n.Col); return CelValue.Null_() }
+            if (!l.B) { return CelValue.Bool_(false) }
+            let r: CelValue = this.EvalNode(n.Right)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!r.IsBool()) { this.Fail("'&&' requires bool", n.Col); return CelValue.Null_() }
+            return CelValue.Bool_(r.B)
+        }
+        if (op == CelTokKind.Or) {
+            let l: CelValue = this.EvalNode(n.Left)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!l.IsBool()) { this.Fail("'||' requires bool", n.Col); return CelValue.Null_() }
+            if (l.B) { return CelValue.Bool_(true) }
+            let r: CelValue = this.EvalNode(n.Right)
+            if (this.Failed) { return CelValue.Null_() }
+            if (!r.IsBool()) { this.Fail("'||' requires bool", n.Col); return CelValue.Null_() }
+            return CelValue.Bool_(r.B)
+        }
+
+        let l: CelValue = this.EvalNode(n.Left)
+        if (this.Failed) { return CelValue.Null_() }
+        let r: CelValue = this.EvalNode(n.Right)
+        if (this.Failed) { return CelValue.Null_() }
+
+        // Arithmetic.
+        if (op == CelTokKind.Plus) {
+            if (l.IsStr() && r.IsStr()) { return CelValue.Str_(l.S + r.S) }
+            return this.NumOp(l, r, op, n.Col)
+        }
+        if (op == CelTokKind.Minus || op == CelTokKind.Star ||
+            op == CelTokKind.Slash || op == CelTokKind.Percent) {
+            return this.NumOp(l, r, op, n.Col)
+        }
+
+        // Equality.
+        if (op == CelTokKind.Eq)  { return CelValue.Bool_(this.EqCmp(l, r, n.Col)) }
+        if (op == CelTokKind.Neq) { return CelValue.Bool_(!this.EqCmp(l, r, n.Col)) }
+
+        // Ordered comparison.
+        if (op == CelTokKind.Lt || op == CelTokKind.Le ||
+            op == CelTokKind.Gt || op == CelTokKind.Ge) {
+            return this.OrdCmp(l, r, op, n.Col)
+        }
+
+        // Membership.
+        if (op == CelTokKind.In) {
+            if (l.IsStr() && r.IsStr()) {
+                return CelValue.Bool_(String_IndexOf(r.S, l.S) >= 0)
+            }
+            if (r.IsList()) {
+                let m: int = r.Items.Count()
+                for i in 0..m {
+                    if (this.EqCmp(l, r.Items.Get(i), n.Col)) {
+                        return CelValue.Bool_(true)
+                    }
+                }
+                return CelValue.Bool_(false)
+            }
+            this.Fail("'in' requires (string,string) or (T,list<T>)", n.Col)
+            return CelValue.Null_()
+        }
+
+        this.Fail("unknown binary op", n.Col)
+        return CelValue.Null_()
+    }
+
+    // Arithmetic on numeric operands. int op int → int (wrap), any
+    // float operand → float. Anything else → type error.
+    private CelValue NumOp(CelValue l, CelValue r, CelTokKind op, int col) {
+        if (l.IsInt() && r.IsInt()) {
+            let a: int = l.I
+            let b: int = r.I
+            if (op == CelTokKind.Plus)    { return CelValue.Int_(a + b) }
+            if (op == CelTokKind.Minus)   { return CelValue.Int_(a - b) }
+            if (op == CelTokKind.Star)    { return CelValue.Int_(a * b) }
+            if (op == CelTokKind.Slash)   {
+                if (b == 0) { return CelValue.Null_() }
+                return CelValue.Int_(a / b)
+            }
+            if (op == CelTokKind.Percent) {
+                if (b == 0) { return CelValue.Null_() }
+                return CelValue.Int_(a % b)
+            }
+        }
+        if ((l.IsInt() || l.IsFloat()) && (r.IsInt() || r.IsFloat())) {
+            var af: float = 0.0
+            var bf: float = 0.0
+            if (l.IsInt()) { af = l.I + 0.0 } else { af = l.F }
+            if (r.IsInt()) { bf = r.I + 0.0 } else { bf = r.F }
+            if (op == CelTokKind.Plus)    { return CelValue.Float_(af + bf) }
+            if (op == CelTokKind.Minus)   { return CelValue.Float_(af - bf) }
+            if (op == CelTokKind.Star)    { return CelValue.Float_(af * bf) }
+            if (op == CelTokKind.Slash)   {
+                if (bf == 0.0) { return CelValue.Null_() }
+                return CelValue.Float_(af / bf)
+            }
+            // % undefined for float in cel-lite ; fall through to type err
+        }
+        this.Fail("arithmetic on non-numeric operands", col)
+        return CelValue.Null_()
+    }
+
+    private bool EqCmp(CelValue l, CelValue r, int col) {
+        if (l.IsNull() && r.IsNull()) { return true }
+        if (l.IsNull() || r.IsNull()) { return false }
+        if (l.IsBool() && r.IsBool()) { return l.B == r.B }
+        if (l.IsInt()  && r.IsInt())  { return l.I == r.I }
+        if (l.IsStr()  && r.IsStr())  { return l.S == r.S }
+        if ((l.IsInt() || l.IsFloat()) && (r.IsInt() || r.IsFloat())) {
+            var af: float = 0.0
+            var bf: float = 0.0
+            if (l.IsInt()) { af = l.I + 0.0 } else { af = l.F }
+            if (r.IsInt()) { bf = r.I + 0.0 } else { bf = r.F }
+            return af == bf
+        }
+        // Different kinds (e.g. int vs string) — strict false per CEL.
+        return false
+    }
+
+    private CelValue OrdCmp(CelValue l, CelValue r, CelTokKind op, int col) {
+        if (l.IsNull() || r.IsNull()) {
+            this.Fail("ordered compare with null", col)
+            return CelValue.Null_()
+        }
+        if (l.IsStr() && r.IsStr()) {
+            let cmp: int = CelEval._StrCmp(l.S, r.S)
+            if (op == CelTokKind.Lt) { return CelValue.Bool_(cmp <  0) }
+            if (op == CelTokKind.Le) { return CelValue.Bool_(cmp <= 0) }
+            if (op == CelTokKind.Gt) { return CelValue.Bool_(cmp >  0) }
+            if (op == CelTokKind.Ge) { return CelValue.Bool_(cmp >= 0) }
+        }
+        if ((l.IsInt() || l.IsFloat()) && (r.IsInt() || r.IsFloat())) {
+            var af: float = 0.0
+            var bf: float = 0.0
+            if (l.IsInt()) { af = l.I + 0.0 } else { af = l.F }
+            if (r.IsInt()) { bf = r.I + 0.0 } else { bf = r.F }
+            if (op == CelTokKind.Lt) { return CelValue.Bool_(af <  bf) }
+            if (op == CelTokKind.Le) { return CelValue.Bool_(af <= bf) }
+            if (op == CelTokKind.Gt) { return CelValue.Bool_(af >  bf) }
+            if (op == CelTokKind.Ge) { return CelValue.Bool_(af >= bf) }
+        }
+        this.Fail("ordered compare on incompatible types", col)
+        return CelValue.Null_()
+    }
+
+    private CelValue EvalTernary(CelNode n) {
+        let c: CelValue = this.EvalNode(n.Left)
+        if (this.Failed) { return CelValue.Null_() }
+        if (!c.IsBool()) {
+            this.Fail("ternary condition is not bool", n.Col)
+            return CelValue.Null_()
+        }
+        if (c.B) { return this.EvalNode(n.Mid) }
+        return this.EvalNode(n.Right)
+    }
+
+    private CelValue EvalCall(CelNode n) {
+        let name: string = n.StrVal
+        let argc: int = n.Args.Count()
+        // len(s|l)
+        if (name == "len") {
+            if (argc != 1) { this.Fail("len() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsStr())  { return CelValue.Int_(String_Length(v.S)) }
+            if (v.IsList()) { return CelValue.Int_(v.Items.Count()) }
+            this.Fail("len() arg must be string or list", n.Col)
+            return CelValue.Null_()
+        }
+        if (name == "int") {
+            if (argc != 1) { this.Fail("int() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsInt())   { return v }
+            if (v.IsFloat()) { return CelValue.Int_(CelEval._FloatTrunc(v.F)) }
+            if (v.IsBool())  { if (v.B) { return CelValue.Int_(1) } return CelValue.Int_(0) }
+            if (v.IsNull())  { return CelValue.Int_(0) }
+            if (v.IsStr())   { return CelValue.Int_(String_ToInt(v.S)) }
+            this.Fail("int() unsupported operand", n.Col); return CelValue.Null_()
+        }
+        if (name == "float") {
+            if (argc != 1) { this.Fail("float() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsFloat()) { return v }
+            if (v.IsInt())   { return CelValue.Float_(v.I + 0.0) }
+            if (v.IsStr())   { return CelValue.Float_(String_ToFloat(v.S)) }
+            this.Fail("float() unsupported operand", n.Col); return CelValue.Null_()
+        }
+        if (name == "string") {
+            if (argc != 1) { this.Fail("string() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsStr())   { return v }
+            if (v.IsNull())  { return CelValue.Str_("") }
+            if (v.IsBool())  { if (v.B) { return CelValue.Str_("true") } return CelValue.Str_("false") }
+            if (v.IsInt())   { return CelValue.Str_(String_FromInt(v.I)) }
+            if (v.IsFloat()) { return CelValue.Str_(String_FromFloat(v.F)) }
+            return CelValue.Str_("")
+        }
+        if (name == "bool") {
+            if (argc != 1) { this.Fail("bool() expects 1 arg", n.Col); return CelValue.Null_() }
+            let v: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            if (v.IsBool())  { return v }
+            if (v.IsNull())  { return CelValue.Bool_(false) }
+            if (v.IsStr())   { return CelValue.Bool_(String_Length(v.S) > 0) }
+            if (v.IsInt())   { return CelValue.Bool_(v.I != 0) }
+            if (v.IsFloat()) { return CelValue.Bool_(v.F != 0.0) }
+            return CelValue.Bool_(false)
+        }
+        if (name == "contains" || name == "startsWith" || name == "endsWith") {
+            if (argc != 2) {
+                this.Fail(name + "() expects 2 args", n.Col)
+                return CelValue.Null_()
+            }
+            let a: CelValue = this.EvalNode(n.Args.Get(0))
+            if (this.Failed) { return CelValue.Null_() }
+            let b: CelValue = this.EvalNode(n.Args.Get(1))
+            if (this.Failed) { return CelValue.Null_() }
+            if (!a.IsStr() || !b.IsStr()) {
+                this.Fail(name + "() args must be strings", n.Col)
+                return CelValue.Null_()
+            }
+            if (name == "contains")   { return CelValue.Bool_(String_IndexOf(a.S, b.S) >= 0) }
+            if (name == "startsWith") { return CelValue.Bool_(String_StartsWith(a.S, b.S)) }
+            if (name == "endsWith")   { return CelValue.Bool_(String_EndsWith(a.S, b.S)) }
+        }
+        this.Fail("unknown function '" + name + "'", n.Col)
+        return CelValue.Null_()
     }
 }
 
@@ -3538,5 +5565,1812 @@ public class Pollen {
         var r: string = ""
         @c { r = Amalgame_Pollen_Pollen_WorkflowActiveRole_c(); }
         return r
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Pollen v3 — workflow.json validator (Phase 1, pure AM)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Loads workflowPath, parses as JSON, enforces the v3 schema
+    // rules 1-7 from docs/proposals/pollen-v3.md ; rule 8 is stubbed
+    // to a non-empty check pending the CEL-lite lexer/parser session.
+    //
+    // Returns a List<string> of diagnostics, each formatted as
+    //   "[severity ruleN] path: message"
+    // Severity is "error" or "warn". An empty list means clean v3.
+    //
+    // Sole entry point ; everything else in this block is a private
+    // static helper invoked via Pollen._v3xxx().
+
+    public static List<string> WorkflowValidateV3(workflowPath: string) {
+        let diags: List<string> = new List<string>()
+
+        if (!File_Exists(workflowPath)) {
+            diags.Add("[error file] {workflowPath}: file not found")
+            return diags
+        }
+        let body: string = File_ReadAll(workflowPath)
+        let parser: JsonParser = new JsonParser(body)
+        let root: JsonValue = parser.ParseTopLevel()
+        if (parser.HasFailed()) {
+            let e: string = parser.ErrorMsg()
+            diags.Add("[error parse] {workflowPath}: {e}")
+            return diags
+        }
+        if (!root.IsObject()) {
+            diags.Add("[error shape] $: top-level must be an object")
+            return diags
+        }
+
+        let schema: string = root.Get("schema").AsString()
+        if (schema != "pollen/v3") {
+            diags.Add("[error schema] $.schema: expected \"pollen/v3\", got \"" + schema + "\"")
+            return diags
+        }
+
+        let entriesV: JsonValue = root.Get("entries")
+        if (!entriesV.IsArray()) {
+            diags.Add("[error shape] $.entries: must be an array")
+            return diags
+        }
+        let entries: List<JsonValue> = entriesV.AsArray()
+        let nEntries: int = entries.Count()
+        if (nEntries == 0) {
+            diags.Add("[error shape] $.entries: at least one entry required")
+            return diags
+        }
+
+        // actions{}: every {name → {topic}} must be a non-empty string.
+        let actionsV: JsonValue = root.Get("actions")
+        let actionNames: List<string> = new List<string>()
+        if (actionsV.IsObject()) {
+            let aks: List<string> = actionsV.Keys()
+            let aN: int = aks.Count()
+            for ai in 0..aN {
+                let an: string = aks.Get(ai)
+                actionNames.Add(an)
+                let aE: JsonValue = actionsV.Get(an)
+                if (!aE.IsObject()) {
+                    diags.Add("[error shape] $.actions." + an + ": must be an object")
+                    continue
+                }
+                let t: string = aE.Get("topic").AsString()
+                if (String_Length(t) == 0) {
+                    diags.Add("[error shape] $.actions." + an + ".topic: required non-empty string")
+                }
+            }
+        } else if (actionsV.IsNull() || !root.Has("actions")) {
+            // tolerate missing actions table (workflows with goto-only chains
+            // may legitimately have none) — but warn so the typo case surfaces.
+            diags.Add("[warn shape] $.actions: missing — workflow has no call() steps?")
+        } else {
+            diags.Add("[error shape] $.actions: must be an object")
+        }
+
+        // ── Pass 1 — collect entry shape + anchor names.
+
+        let entryNames: List<string> = new List<string>()
+        let entryHasOn: List<bool> = new List<bool>()
+        let entryOn: List<string> = new List<string>()
+        let entryHasReturns: List<bool> = new List<bool>()
+        let entryDo: List<JsonValue> = new List<JsonValue>()
+
+        let anchorNames: List<string> = new List<string>()
+        let anchorEntryIdx: List<int> = new List<int>()
+
+        for i in 0..nEntries {
+            let e: JsonValue = entries.Get(i)
+            let path: string = "$.entries[" + String_FromInt(i) + "]"
+            if (!e.IsObject()) {
+                diags.Add("[error shape] " + path + ": must be an object")
+                continue
+            }
+            let name: string = e.Get("name").AsString()
+            if (String_Length(name) == 0) {
+                diags.Add("[error rule1] " + path + ": missing or empty 'name'")
+                continue
+            }
+
+            // Rule 1 — entry-name uniqueness.
+            var dup: bool = false
+            let priorCount: int = entryNames.Count()
+            for p in 0..priorCount {
+                if (entryNames.Get(p) == name) {
+                    diags.Add("[error rule1] " + path + ": duplicate entry name '" + name + "'")
+                    dup = true
+                    break
+                }
+            }
+            if (dup) { continue }
+
+            entryNames.Add(name)
+            let onV: JsonValue = e.Get("on")
+            let onStr: string = onV.AsString()
+            let hasOn: bool = onV.IsString() && String_Length(onStr) > 0
+            entryHasOn.Add(hasOn)
+            entryOn.Add(onStr)
+
+            let retV: JsonValue = e.Get("returns")
+            let hasReturns: bool = retV.IsString() && String_Length(retV.AsString()) > 0
+            entryHasReturns.Add(hasReturns)
+
+            // Rule 8 — `returns` expression must lex+parse cleanly.
+            if (e.Has("returns") && retV.IsString()) {
+                Pollen._v3CheckExpr(retV.AsString(), "returns",
+                                     path + ".returns", diags)
+            }
+
+            entryDo.Add(e.Get("do"))
+
+            // Anchor collection — recurse into the entry's do tree.
+            let entryOwnerIdx: int = entryNames.Count() - 1
+            Pollen._v3CollectAnchors(e.Get("do"), entryOwnerIdx, anchorNames,
+                                      anchorEntryIdx, entryNames.Get(entryOwnerIdx),
+                                      path + ".do", diags)
+        }
+
+        let nEntriesKept: int = entryNames.Count()
+
+        // Rule 1 — anchor name uniqueness across the whole workflow + no
+        // collision with entry names (flat goto namespace).
+        let nAnchors: int = anchorNames.Count()
+        for i in 0..nAnchors {
+            let an: string = anchorNames.Get(i)
+            for j in 0..i {
+                if (anchorNames.Get(j) == an) {
+                    diags.Add("[error rule1] $.entries[" +
+                               String_FromInt(anchorEntryIdx.Get(i)) +
+                               "]: duplicate anchor name '" + an + "'")
+                    break
+                }
+            }
+            for k in 0..nEntriesKept {
+                if (entryNames.Get(k) == an) {
+                    diags.Add("[error rule1] $.entries[" +
+                               String_FromInt(anchorEntryIdx.Get(i)) +
+                               "]: anchor '" + an + "' collides with an entry name")
+                    break
+                }
+            }
+        }
+
+        // ── Pass 2 — walk every entry body, recording goto edges,
+        // shape errors, depth tracking + rule 8 non-empty expr stub.
+
+        let gotoFromEntry: List<int> = new List<int>()
+        let gotoTarget: List<string> = new List<string>()
+        let gotoToEntry: List<int> = new List<int>()  // -1 if unresolved
+
+        // Hash-able? No — small N. Plain scan for resolution.
+        for i in 0..nEntriesKept {
+            let entryPath: string = "$.entries[" + String_FromInt(i) + "].do"
+            Pollen._v3WalkBody(entryDo.Get(i), i, entryPath, actionNames,
+                                gotoFromEntry, gotoTarget, diags)
+        }
+
+        // Resolve goto targets against entryNames + anchorNames.
+        let nGotos: int = gotoTarget.Count()
+        for gi in 0..nGotos {
+            let tgt: string = gotoTarget.Get(gi)
+            var resolved: int = -1
+            for k in 0..nEntriesKept {
+                if (entryNames.Get(k) == tgt) { resolved = k; break }
+            }
+            if (resolved < 0) {
+                for k in 0..nAnchors {
+                    if (anchorNames.Get(k) == tgt) {
+                        resolved = anchorEntryIdx.Get(k)
+                        break
+                    }
+                }
+            }
+            gotoToEntry.Add(resolved)
+            if (resolved < 0) {
+                diags.Add("[error rule1] $.entries[" +
+                           String_FromInt(gotoFromEntry.Get(gi)) +
+                           "]: goto target '" + tgt + "' resolves to no entry or anchor")
+            }
+        }
+
+        // ── Rules 2-5.
+
+        // Build a "referenced by goto" bitmap keyed by entry index.
+        let refByGoto: List<bool> = new List<bool>()
+        for i in 0..nEntriesKept { refByGoto.Add(false) }
+        // And one for anchor names — to check rule 3 (orphan anchor).
+        let anchorReferenced: List<bool> = new List<bool>()
+        for i in 0..nAnchors { anchorReferenced.Add(false) }
+
+        for gi in 0..nGotos {
+            let tgt: string = gotoTarget.Get(gi)
+            for k in 0..nEntriesKept {
+                if (entryNames.Get(k) == tgt) {
+                    refByGoto.Set(k, true)
+                    break
+                }
+            }
+            for k in 0..nAnchors {
+                if (anchorNames.Get(k) == tgt) {
+                    anchorReferenced.Set(k, true)
+                    break
+                }
+            }
+        }
+
+        for i in 0..nEntriesKept {
+            let path: string = "$.entries[" + String_FromInt(i) + "]"
+            let hasOn: bool = entryHasOn.Get(i)
+            let referenced: bool = refByGoto.Get(i)
+            let hasReturns: bool = entryHasReturns.Get(i)
+            // Rule 2 — entry reachability.
+            if (!hasOn && !referenced) {
+                diags.Add("[error rule2] " + path + ": unreachable entry '" +
+                           entryNames.Get(i) + "' (no 'on:' and no goto targets it)")
+            }
+            // Rule 4 — dual-mode warn.
+            if (hasOn && referenced) {
+                diags.Add("[warn rule4] " + path + ": dual-mode entry '" +
+                           entryNames.Get(i) +
+                           "' — ensure params binding is intentional (bus envelope vs goto args)")
+            }
+            // Rule 5 — return discard.
+            if (hasReturns && hasOn && !referenced) {
+                diags.Add("[warn rule5] " + path + ": entry '" + entryNames.Get(i) +
+                           "' declares 'returns' but is bus-only — value will be discarded")
+            }
+        }
+
+        // Rule 3 — orphan anchors.
+        for i in 0..nAnchors {
+            if (!anchorReferenced.Get(i)) {
+                diags.Add("[warn rule3] $.entries[" +
+                           String_FromInt(anchorEntryIdx.Get(i)) +
+                           "]: orphan anchor '" + anchorNames.Get(i) +
+                           "' (no goto targets it)")
+            }
+        }
+
+        // ── Rule 6 — DFS color-based cycle detection on the entry
+        // goto-call graph. Edge u→v exists if some goto inside entry u
+        // resolves to entry v (or an anchor owned by entry v).
+        // Iterative DFS, three colors: 0=white, 1=gray (on stack), 2=black.
+        let color: List<int> = new List<int>()
+        for i in 0..nEntriesKept { color.Add(0) }
+
+        // Cap to avoid runaway in pathological inputs.
+        var cycleBudget: int = 256
+
+        for s in 0..nEntriesKept {
+            if (color.Get(s) != 0) { continue }
+            let stackNode: List<int> = new List<int>()
+            let stackEdgeCursor: List<int> = new List<int>()
+            stackNode.Add(s)
+            stackEdgeCursor.Add(0)
+            color.Set(s, 1)
+
+            while (stackNode.Count() > 0 && cycleBudget > 0) {
+                cycleBudget = cycleBudget - 1
+                let top: int = stackNode.Count() - 1
+                let cur: int = stackNode.Get(top)
+                let startEi: int = stackEdgeCursor.Get(top)
+
+                var foundNext: int = -1
+                var foundEi: int = startEi
+                for k in startEi..nGotos {
+                    if (gotoFromEntry.Get(k) == cur) {
+                        let tgtIdx: int = gotoToEntry.Get(k)
+                        if (tgtIdx >= 0) {
+                            foundNext = tgtIdx
+                            foundEi = k + 1
+                            break
+                        }
+                    }
+                }
+
+                if (foundNext < 0) {
+                    color.Set(cur, 2)
+                    stackNode.RemoveAt(top)
+                    stackEdgeCursor.RemoveAt(top)
+                    continue
+                }
+
+                stackEdgeCursor.Set(top, foundEi)
+                let c: int = color.Get(foundNext)
+                if (c == 1) {
+                    // Back-edge → cycle. Build chain from the gray stack.
+                    var chain: string = entryNames.Get(foundNext)
+                    var emit: bool = false
+                    let sc: int = stackNode.Count()
+                    for sj in 0..sc {
+                        let v: int = stackNode.Get(sj)
+                        if (v == foundNext) { emit = true }
+                        if (emit) {
+                            chain = chain + " → " + entryNames.Get(v)
+                        }
+                    }
+                    // chain currently starts with the back-edge target and
+                    // ends at the current `cur` ; close the loop visually.
+                    chain = chain + " → " + entryNames.Get(foundNext)
+                    diags.Add("[error rule6] $.entries: goto cycle detected: " + chain)
+                    // Don't push : continue scanning sibling edges.
+                } else if (c == 0) {
+                    color.Set(foundNext, 1)
+                    stackNode.Add(foundNext)
+                    stackEdgeCursor.Add(0)
+                }
+                // c == 2 : already explored, skip silently.
+            }
+        }
+        if (cycleBudget <= 0) {
+            diags.Add("[error rule6] $.entries: cycle-DFS budget exhausted (workflow too tangled — split into files)")
+        }
+
+        // ── Rule 7 — static call-chain depth warn (>32).
+        // Longest path in the goto DAG (only valid if rule 6 found no
+        // cycles ; if it did, skip rule 7 — chain is already broken).
+        var anyCycle: bool = false
+        let dN: int = diags.Count()
+        for di in 0..dN {
+            let d: string = diags.Get(di)
+            // crude substring check via String_Contains if available — fall
+            // back to length+startsWith pattern. Use String_Contains here
+            // (Amalgame.String).
+            if (String_Contains(d, "rule6")) { anyCycle = true; break }
+        }
+        if (!anyCycle) {
+            // Memoized longest-path via post-order DFS. depth[v] = 1 if v
+            // has no outgoing edges, else 1 + max(depth[u] for u in succ(v)).
+            // -1 means not yet computed.
+            let depth: List<int> = new List<int>()
+            for i in 0..nEntriesKept { depth.Add(-1) }
+
+            for s in 0..nEntriesKept {
+                if (depth.Get(s) >= 0) { continue }
+                // iterative post-order
+                let stk: List<int> = new List<int>()
+                let cur: List<int> = new List<int>()  // edge cursor
+                stk.Add(s)
+                cur.Add(0)
+                var depthBudget: int = 4096
+                while (stk.Count() > 0 && depthBudget > 0) {
+                    depthBudget = depthBudget - 1
+                    let top: int = stk.Count() - 1
+                    let v: int = stk.Get(top)
+                    let ei: int = cur.Get(top)
+
+                    var nextV: int = -1
+                    var nextEi: int = ei
+                    for k in ei..nGotos {
+                        if (gotoFromEntry.Get(k) == v) {
+                            let tgtIdx: int = gotoToEntry.Get(k)
+                            if (tgtIdx >= 0) {
+                                nextV = tgtIdx
+                                nextEi = k + 1
+                                break
+                            }
+                        }
+                    }
+                    if (nextV < 0) {
+                        // No more out-edges : compute depth[v] = 1 + max child depth.
+                        var maxChild: int = 0
+                        for k in 0..nGotos {
+                            if (gotoFromEntry.Get(k) == v) {
+                                let tgtIdx: int = gotoToEntry.Get(k)
+                                if (tgtIdx >= 0) {
+                                    let cd: int = depth.Get(tgtIdx)
+                                    if (cd > maxChild) { maxChild = cd }
+                                }
+                            }
+                        }
+                        depth.Set(v, 1 + maxChild)
+                        stk.RemoveAt(top)
+                        cur.RemoveAt(top)
+                        continue
+                    }
+                    cur.Set(top, nextEi)
+                    if (depth.Get(nextV) < 0) {
+                        // push child — but watch for an "already on stack" case
+                        // (shouldn't happen, no cycles assumed) ; cheap guard.
+                        var onStack: bool = false
+                        let sc: int = stk.Count()
+                        for sj in 0..sc {
+                            if (stk.Get(sj) == nextV) { onStack = true; break }
+                        }
+                        if (!onStack) {
+                            stk.Add(nextV)
+                            cur.Add(0)
+                        }
+                    }
+                }
+            }
+
+            var maxDepth: int = 0
+            for i in 0..nEntriesKept {
+                let d: int = depth.Get(i)
+                if (d > maxDepth) { maxDepth = d }
+            }
+            if (maxDepth > 32) {
+                diags.Add("[warn rule7] $.entries: longest goto call-chain depth is " +
+                           String_FromInt(maxDepth) +
+                           " (>32) — runtime cap is 64 frames, consider refactor")
+            }
+        }
+
+        return diags
+    }
+
+    // ───────── private v3 validator helpers ─────────
+
+    // Rule 8 — run the CEL-lite lexer + parser against a single
+    // expression string. Emits diagnostics for empty / lex-failed /
+    // parse-failed / over-budget expressions. The runtime evaluator
+    // isn't invoked here (no env at validation time).
+    private static void _v3CheckExpr(string expr, string ctx,
+                                      string path, List<string> diags) {
+        if (String_Length(expr) == 0) {
+            diags.Add("[error rule8] " + path + ": empty expression")
+            return
+        }
+        let lex: CelLexer = new CelLexer(expr)
+        let toks: List<CelToken> = lex.Lex()
+        if (lex.HasFailed()) {
+            let col: int = lex.ErrorCol()
+            let m: string = lex.ErrorMsg()
+            diags.Add("[error rule8] " + path + ": lex error at col " +
+                       String_FromInt(col) + ": " + m)
+            return
+        }
+        let par: CelParser = new CelParser(toks)
+        let root: int = par.Parse()
+        if (par.HasFailed()) {
+            let col: int = par.ErrorCol()
+            let m: string = par.ErrorMsg()
+            diags.Add("[error rule8] " + path + ": parse error at col " +
+                       String_FromInt(col) + ": " + m)
+            return
+        }
+        // Note: cel-lite.md §4 calls for a warn on unknown path roots
+        // (typo signal: `stat.X` for `state.X`). We don't emit it yet
+        // because the validator can't tell a typo from a legit for-loop
+        // var without threading scope through the whole walker. The
+        // runtime resolver (Phase 2) has full scope info and will fire
+        // the warning instead.
+    }
+
+    // Walk a step (or step-array) collecting `anchor` declarations.
+    // Anchors live anywhere in the entry's do-tree ; the validator
+    // resolves goto targets against the flat global anchor namespace.
+    private static void _v3CollectAnchors(stepV: JsonValue, entryIdx: int,
+            anchorNames: List<string>, anchorEntryIdx: List<int>,
+            entryName: string, path: string, diags: List<string>) {
+
+        if (stepV.IsArray()) {
+            let arr: List<JsonValue> = stepV.AsArray()
+            let n: int = arr.Count()
+            for i in 0..n {
+                Pollen._v3CollectAnchors(arr.Get(i), entryIdx, anchorNames,
+                                          anchorEntryIdx, entryName,
+                                          path + "[" + String_FromInt(i) + "]", diags)
+            }
+            return
+        }
+        if (!stepV.IsObject()) { return }
+        let kind: string = stepV.Get("type").AsString()
+        if (kind == "anchor") {
+            let an: string = stepV.Get("name").AsString()
+            if (String_Length(an) == 0) {
+                diags.Add("[error shape] " + path + ": 'anchor' missing 'name'")
+                return
+            }
+            anchorNames.Add(an)
+            anchorEntryIdx.Add(entryIdx)
+            return
+        }
+        if (kind == "if") {
+            let casesV: JsonValue = stepV.Get("cases")
+            if (!casesV.IsArray()) { return }
+            let cs: List<JsonValue> = casesV.AsArray()
+            let n: int = cs.Count()
+            for i in 0..n {
+                let cVal: JsonValue = cs.Get(i)
+                if (!cVal.IsObject()) { continue }
+                Pollen._v3CollectAnchors(cVal.Get("do"), entryIdx, anchorNames,
+                                          anchorEntryIdx, entryName,
+                                          path + ".cases[" + String_FromInt(i) + "].do", diags)
+            }
+            return
+        }
+        if (kind == "for" || kind == "while") {
+            Pollen._v3CollectAnchors(stepV.Get("do"), entryIdx, anchorNames,
+                                      anchorEntryIdx, entryName,
+                                      path + ".do", diags)
+            return
+        }
+        // call / set / goto : no nested do.
+    }
+
+    // Walk a step-tree collecting goto edges + shape errors. Also
+    // enforces rule 8 stub (every expression field non-empty).
+    private static void _v3WalkBody(stepV: JsonValue, entryIdx: int, path: string,
+            actionNames: List<string>,
+            gotoFromEntry: List<int>, gotoTarget: List<string>,
+            diags: List<string>) {
+
+        if (stepV.IsArray()) {
+            let arr: List<JsonValue> = stepV.AsArray()
+            let n: int = arr.Count()
+            if (n == 0) {
+                diags.Add("[warn shape] " + path + ": empty step array")
+            }
+            for i in 0..n {
+                Pollen._v3WalkBody(arr.Get(i), entryIdx,
+                                    path + "[" + String_FromInt(i) + "]",
+                                    actionNames, gotoFromEntry, gotoTarget, diags)
+            }
+            return
+        }
+        if (!stepV.IsObject()) {
+            diags.Add("[error shape] " + path + ": step must be an object or array")
+            return
+        }
+        let kind: string = stepV.Get("type").AsString()
+        if (String_Length(kind) == 0) {
+            diags.Add("[error shape] " + path + ": step missing 'type'")
+            return
+        }
+
+        if (kind == "call") {
+            let act: string = stepV.Get("action").AsString()
+            if (String_Length(act) == 0) {
+                diags.Add("[error shape] " + path + ": 'call' missing 'action'")
+            } else {
+                var found: bool = false
+                let aN: int = actionNames.Count()
+                for k in 0..aN {
+                    if (actionNames.Get(k) == act) { found = true; break }
+                }
+                if (!found) {
+                    diags.Add("[error shape] " + path + ": 'call' references unknown action '" + act + "'")
+                }
+            }
+            if (stepV.Has("mode")) {
+                let mode: string = stepV.Get("mode").AsString()
+                if (mode != "one" && mode != "all") {
+                    diags.Add("[error shape] " + path + ".mode: must be \"one\" or \"all\", got \"" + mode + "\"")
+                }
+            }
+            if (stepV.Has("on_error")) {
+                let oe: string = stepV.Get("on_error").AsString()
+                if (oe != "log" && oe != "fail" && oe != "drop") {
+                    diags.Add("[error shape] " + path + ".on_error: must be \"log\"/\"fail\"/\"drop\", got \"" + oe + "\"")
+                }
+            }
+            return
+        }
+
+        if (kind == "set") {
+            let key: string = stepV.Get("key").AsString()
+            if (String_Length(key) == 0) {
+                diags.Add("[error shape] " + path + ": 'set' missing 'key'")
+            }
+            let valV: JsonValue = stepV.Get("value")
+            if (!valV.IsString()) {
+                diags.Add("[error shape] " + path + ".value: must be a CEL-lite expression string")
+            } else {
+                Pollen._v3CheckExpr(valV.AsString(), "value", path + ".value", diags)
+            }
+            return
+        }
+
+        if (kind == "if") {
+            let casesV: JsonValue = stepV.Get("cases")
+            if (!casesV.IsArray()) {
+                diags.Add("[error shape] " + path + ".cases: must be an array")
+                return
+            }
+            let cs: List<JsonValue> = casesV.AsArray()
+            let n: int = cs.Count()
+            if (n == 0) {
+                diags.Add("[error shape] " + path + ".cases: must have at least one case")
+            }
+            for i in 0..n {
+                let cVal: JsonValue = cs.Get(i)
+                let cPath: string = path + ".cases[" + String_FromInt(i) + "]"
+                if (!cVal.IsObject()) {
+                    diags.Add("[error shape] " + cPath + ": case must be an object")
+                    continue
+                }
+                let isElse: bool = cVal.Has("else") && cVal.Get("else").AsBool()
+                if (isElse) {
+                    if (i != n - 1) {
+                        diags.Add("[error shape] " + cPath + ": 'else' case must be terminal")
+                    }
+                } else {
+                    let whenV: JsonValue = cVal.Get("when")
+                    if (!whenV.IsString()) {
+                        diags.Add("[error shape] " + cPath + ".when: must be a CEL-lite expression string")
+                    } else {
+                        Pollen._v3CheckExpr(whenV.AsString(), "when", cPath + ".when", diags)
+                    }
+                }
+                Pollen._v3WalkBody(cVal.Get("do"), entryIdx, cPath + ".do",
+                                    actionNames, gotoFromEntry, gotoTarget, diags)
+            }
+            return
+        }
+
+        if (kind == "for") {
+            let v: string = stepV.Get("var").AsString()
+            if (String_Length(v) == 0) {
+                diags.Add("[error shape] " + path + ": 'for' missing 'var'")
+            }
+            let inV: JsonValue = stepV.Get("in")
+            if (!inV.IsString()) {
+                diags.Add("[error shape] " + path + ".in: must be a CEL-lite expression string")
+            } else {
+                Pollen._v3CheckExpr(inV.AsString(), "in", path + ".in", diags)
+            }
+            Pollen._v3WalkBody(stepV.Get("do"), entryIdx, path + ".do",
+                                actionNames, gotoFromEntry, gotoTarget, diags)
+            return
+        }
+
+        if (kind == "while") {
+            let condV: JsonValue = stepV.Get("cond")
+            if (!condV.IsString()) {
+                diags.Add("[error shape] " + path + ".cond: must be a CEL-lite expression string")
+            } else {
+                Pollen._v3CheckExpr(condV.AsString(), "cond", path + ".cond", diags)
+            }
+            if (stepV.Has("maxIter")) {
+                let mi: JsonValue = stepV.Get("maxIter")
+                if (!mi.IsNumber()) {
+                    diags.Add("[error shape] " + path + ".maxIter: must be a number")
+                } else if (mi.AsInt() <= 0) {
+                    diags.Add("[error shape] " + path + ".maxIter: must be > 0")
+                }
+            }
+            Pollen._v3WalkBody(stepV.Get("do"), entryIdx, path + ".do",
+                                actionNames, gotoFromEntry, gotoTarget, diags)
+            return
+        }
+
+        if (kind == "goto") {
+            let tgt: string = stepV.Get("target").AsString()
+            if (String_Length(tgt) == 0) {
+                diags.Add("[error shape] " + path + ": 'goto' missing 'target'")
+                return
+            }
+            gotoFromEntry.Add(entryIdx)
+            gotoTarget.Add(tgt)
+            if (stepV.Has("args")) {
+                let argsV: JsonValue = stepV.Get("args")
+                if (!argsV.IsArray()) {
+                    diags.Add("[error shape] " + path + ".args: must be an array of expressions")
+                } else {
+                    let aa: List<JsonValue> = argsV.AsArray()
+                    let an: int = aa.Count()
+                    for i in 0..an {
+                        let aV: JsonValue = aa.Get(i)
+                        if (!aV.IsString()) {
+                            diags.Add("[error shape] " + path + ".args[" + String_FromInt(i) +
+                                       "]: must be a CEL-lite expression string")
+                        } else {
+                            Pollen._v3CheckExpr(aV.AsString(), "arg",
+                                                 path + ".args[" + String_FromInt(i) + "]",
+                                                 diags)
+                        }
+                    }
+                }
+            }
+            if (stepV.Has("bind")) {
+                let b: string = stepV.Get("bind").AsString()
+                if (String_Length(b) == 0) {
+                    diags.Add("[error shape] " + path + ".bind: empty bind key")
+                }
+            }
+            return
+        }
+
+        if (kind == "anchor") {
+            // Already collected in pass 1 ; nothing to walk.
+            return
+        }
+
+        diags.Add("[error shape] " + path + ": unknown step type '" + kind + "'")
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Pollen v3 — runtime loader (Phase 2)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Parses a v3 workflow.json into the C-side AST + name maps
+    // (see docs/proposals/pollen-v3.md §"v3 dispatcher"). All storage
+    // lives in static C buffers ; this AM layer is purely a JSON
+    // walker that calls the `_pollen_v3_*` setters.
+    //
+    // Returns true on success. On failure, WorkflowV3LoadErrorMsg()
+    // returns the first error message ; caller should not consult
+    // the C-side buffers.
+    //
+    // Run Pollen.WorkflowValidateV3() first for full shape diagnostics
+    // — WorkflowLoadV3 assumes a well-formed v3 document.
+
+    public static bool WorkflowLoadV3(workflowPath: string) {
+        if (!File_Exists(workflowPath)) {
+            @c { _pollen_v3_set_err("workflow file not found"); }
+            return false
+        }
+        let body: string = File_ReadAll(workflowPath)
+        let parser: JsonParser = new JsonParser(body)
+        let root: JsonValue = parser.ParseTopLevel()
+        if (parser.HasFailed()) {
+            @c { _pollen_v3_set_err("workflow JSON parse error"); }
+            return false
+        }
+        if (!root.IsObject()) {
+            @c { _pollen_v3_set_err("top-level must be a JSON object"); }
+            return false
+        }
+        if (root.Get("schema").AsString() != "pollen/v3") {
+            @c { _pollen_v3_set_err("expected schema = pollen/v3"); }
+            return false
+        }
+
+        @c { _pollen_v3_reload_begin(); }
+
+        let actionsV: JsonValue = root.Get("actions")
+        if (actionsV.IsObject()) {
+            let aks: List<string> = actionsV.Keys()
+            let nA: int = aks.Count()
+            for ai in 0..nA {
+                let an: string = aks.Get(ai)
+                let topic: string = actionsV.Get(an).Get("topic").AsString()
+                var rc: int = 0
+                @c { rc = _pollen_v3_add_action(an, topic); }
+                if (rc < 0) {
+                    var dummy: int = 0
+                    @c { dummy = _pollen_v3_reload_commit(); }
+                    return false
+                }
+            }
+        }
+
+        let entriesV: JsonValue = root.Get("entries")
+        if (!entriesV.IsArray()) {
+            @c { _pollen_v3_set_err("entries[] missing or not an array"); }
+            return false
+        }
+        let entries: List<JsonValue> = entriesV.AsArray()
+        let nE: int = entries.Count()
+        for i in 0..nE {
+            let e: JsonValue = entries.Get(i)
+            if (!e.IsObject()) { continue }
+            let name: string = e.Get("name").AsString()
+            let onTopic: string = e.Get("on").AsString()
+            var eidx: int = -1
+            @c { eidx = _pollen_v3_add_entry(name, onTopic); }
+            if (eidx < 0) {
+                var dummy: int = 0
+                @c { dummy = _pollen_v3_reload_commit(); }
+                return false
+            }
+            let paramsV: JsonValue = e.Get("params")
+            if (paramsV.IsArray()) {
+                let pl: List<JsonValue> = paramsV.AsArray()
+                let nP: int = pl.Count()
+                for pi in 0..nP {
+                    let pn: string = pl.Get(pi).AsString()
+                    var prc: int = 0
+                    @c { prc = _pollen_v3_entry_add_param(eidx, pn); }
+                    if (prc < 0) {
+                        var dummy: int = 0
+                        @c { dummy = _pollen_v3_reload_commit(); }
+                        return false
+                    }
+                }
+            }
+            if (e.Has("returns") && e.Get("returns").IsString()) {
+                let r: string = e.Get("returns").AsString()
+                @c { _pollen_v3_entry_set_returns(eidx, r); }
+            }
+            let doV: JsonValue = e.Get("do")
+            let bodyHead: int = Pollen._v3LoadDoTree(doV, eidx)
+            if (Pollen._v3LoadHadError()) {
+                var dummy: int = 0
+                @c { dummy = _pollen_v3_reload_commit(); }
+                return false
+            }
+            @c { _pollen_v3_entry_set_do_root(eidx, bodyHead); }
+        }
+
+        var ok: int = 0
+        @c { ok = _pollen_v3_reload_commit(); }
+        return ok == 0
+    }
+
+    // Walk a `do` value (single step OR array of steps), produce a
+    // sibling-chained run, return the head AST index. -1 = empty body.
+    private static int _v3LoadDoTree(doV: JsonValue, entryIdx: int) {
+        if (doV.IsNull()) { return -1 }
+        if (doV.IsObject()) {
+            return Pollen._v3LoadStep(doV, entryIdx)
+        }
+        if (!doV.IsArray()) { return -1 }
+        let arr: List<JsonValue> = doV.AsArray()
+        let n: int = arr.Count()
+        if (n == 0) { return -1 }
+        var head: int = -1
+        var prev: int = -1
+        for i in 0..n {
+            let stepV: JsonValue = arr.Get(i)
+            if (!stepV.IsObject()) { continue }
+            let nidx: int = Pollen._v3LoadStep(stepV, entryIdx)
+            if (nidx < 0) {
+                if (Pollen._v3LoadHadError()) { return -1 }
+                continue
+            }
+            if (head < 0) { head = nidx }
+            if (prev >= 0) {
+                @c { _pollen_v3_node_set_next(prev, nidx); }
+            }
+            prev = nidx
+        }
+        return head
+    }
+
+    // Allocate + populate one AST node from a step object.
+    private static int _v3LoadStep(stepV: JsonValue, entryIdx: int) {
+        let kind: string = stepV.Get("type").AsString()
+
+        if (kind == "call") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_CALL); }
+            if (idx < 0) { return -1 }
+            let action: string = stepV.Get("action").AsString()
+            @c { _pollen_v3_node_set_name(idx, action); }
+            if (stepV.Has("mode")) {
+                let m: string = stepV.Get("mode").AsString()
+                var mi: int = 0
+                if (m == "all") { mi = 1 }
+                @c { _pollen_v3_node_set_mode(idx, mi); }
+            }
+            if (stepV.Has("on_error")) {
+                let oe: string = stepV.Get("on_error").AsString()
+                var oi: int = 0
+                if (oe == "fail") { oi = 1 }
+                else if (oe == "drop") { oi = 2 }
+                @c { _pollen_v3_node_set_on_error(idx, oi); }
+            }
+            return idx
+        }
+
+        if (kind == "set") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_SET); }
+            if (idx < 0) { return -1 }
+            let key: string = stepV.Get("key").AsString()
+            let val: string = stepV.Get("value").AsString()
+            @c { _pollen_v3_node_set_name(idx, key); }
+            @c { _pollen_v3_node_set_expr(idx, val); }
+            return idx
+        }
+
+        if (kind == "if") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_IF); }
+            if (idx < 0) { return -1 }
+            let casesV: JsonValue = stepV.Get("cases")
+            if (casesV.IsArray()) {
+                let cs: List<JsonValue> = casesV.AsArray()
+                let nC: int = cs.Count()
+                var caseHead: int = -1
+                var casePrev: int = -1
+                for ci in 0..nC {
+                    let cVal: JsonValue = cs.Get(ci)
+                    if (!cVal.IsObject()) { continue }
+                    var cnode: int = -1
+                    @c { cnode = _pollen_v3_alloc_node(POLLEN_AST_CASE); }
+                    if (cnode < 0) { return -1 }
+                    let isElse: bool = cVal.Has("else") && cVal.Get("else").AsBool()
+                    if (isElse) {
+                        @c { _pollen_v3_node_set_has_else(cnode, 1); }
+                    } else if (cVal.Has("when")) {
+                        let w: string = cVal.Get("when").AsString()
+                        @c { _pollen_v3_node_set_expr(cnode, w); }
+                    }
+                    let cbody: int = Pollen._v3LoadDoTree(cVal.Get("do"), entryIdx)
+                    @c { _pollen_v3_node_set_child0(cnode, cbody); }
+                    if (caseHead < 0) { caseHead = cnode }
+                    if (casePrev >= 0) {
+                        @c { _pollen_v3_node_set_next(casePrev, cnode); }
+                    }
+                    casePrev = cnode
+                }
+                @c { _pollen_v3_node_set_child0(idx, caseHead); }
+            }
+            return idx
+        }
+
+        if (kind == "for") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_FOR); }
+            if (idx < 0) { return -1 }
+            let v: string = stepV.Get("var").AsString()
+            let inE: string = stepV.Get("in").AsString()
+            @c { _pollen_v3_node_set_name(idx, v); }
+            @c { _pollen_v3_node_set_expr(idx, inE); }
+            let body: int = Pollen._v3LoadDoTree(stepV.Get("do"), entryIdx)
+            @c { _pollen_v3_node_set_child0(idx, body); }
+            return idx
+        }
+
+        if (kind == "while") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_WHILE); }
+            if (idx < 0) { return -1 }
+            let cond: string = stepV.Get("cond").AsString()
+            @c { _pollen_v3_node_set_expr(idx, cond); }
+            if (stepV.Has("maxIter") && stepV.Get("maxIter").IsNumber()) {
+                let mi: int = stepV.Get("maxIter").AsInt()
+                @c { _pollen_v3_node_set_max_iter(idx, mi); }
+            }
+            let body: int = Pollen._v3LoadDoTree(stepV.Get("do"), entryIdx)
+            @c { _pollen_v3_node_set_child0(idx, body); }
+            return idx
+        }
+
+        if (kind == "goto") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_GOTO); }
+            if (idx < 0) { return -1 }
+            let tgt: string = stepV.Get("target").AsString()
+            @c { _pollen_v3_node_set_name(idx, tgt); }
+            if (stepV.Has("args") && stepV.Get("args").IsArray()) {
+                let aa: List<JsonValue> = stepV.Get("args").AsArray()
+                let nA: int = aa.Count()
+                var first: int = -1
+                var count: int = 0
+                for ai in 0..nA {
+                    let aV: JsonValue = aa.Get(ai)
+                    if (!aV.IsString()) { continue }
+                    let ae: string = aV.AsString()
+                    var p: int = -1
+                    @c { p = _pollen_v3_push_arg(ae); }
+                    if (p < 0) { return -1 }
+                    if (first < 0) { first = p }
+                    count = count + 1
+                }
+                @c { _pollen_v3_node_set_args(idx, first, count); }
+            }
+            if (stepV.Has("bind")) {
+                let b: string = stepV.Get("bind").AsString()
+                @c { _pollen_v3_node_set_bind(idx, b); }
+            }
+            return idx
+        }
+
+        if (kind == "anchor") {
+            var idx: int = -1
+            @c { idx = _pollen_v3_alloc_node(POLLEN_AST_ANCHOR); }
+            if (idx < 0) { return -1 }
+            let nm: string = stepV.Get("name").AsString()
+            @c { _pollen_v3_node_set_name(idx, nm); }
+            var ar: int = -1
+            @c { ar = _pollen_v3_add_anchor(entryIdx, nm, idx); }
+            if (ar < 0) { return -1 }
+            return idx
+        }
+
+        return -1
+    }
+
+    private static bool _v3LoadHadError() {
+        var rc: int = 0
+        @c { rc = _pollen_v3_has_load_err; }
+        return rc != 0
+    }
+
+    // ── Introspection helpers (tests + dispatcher debug) ─────────
+
+    public static bool WorkflowV3IsActive() {
+        var r: int = 0
+        @c { r = _pollen_v3_is_active(); }
+        return r != 0
+    }
+    public static int WorkflowV3EntryCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_entries(); }
+        return r
+    }
+    public static int WorkflowV3AnchorCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_anchors(); }
+        return r
+    }
+    public static int WorkflowV3ActionCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_actions(); }
+        return r
+    }
+    public static int WorkflowV3NodeCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_count_nodes(); }
+        return r
+    }
+    public static string WorkflowV3LoadErrorMsg() {
+        var s: string = ""
+        @c { s = _pollen_v3_get_load_err(); }
+        return s
+    }
+    public static string WorkflowV3EntryName(eidx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_entry_name(eidx); }
+        return s
+    }
+    public static int WorkflowV3EntryDoRoot(eidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_entry_do_root(eidx); }
+        return r
+    }
+    public static int WorkflowV3NodeKind(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_kind(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeChild0(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_child0(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeNext(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_next(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeGotoKind(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_goto_kind(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeGotoIdx(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_goto_idx(idx); }
+        return r
+    }
+    public static string WorkflowV3NodeName(idx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_name(idx); }
+        return s
+    }
+    public static string WorkflowV3NodeExpr(idx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_expr(idx); }
+        return s
+    }
+    public static string WorkflowV3NodeBind(idx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_bind(idx); }
+        return s
+    }
+    public static int WorkflowV3NodeMode(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_mode(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeOnError(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_on_error(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeMaxIter(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_max_iter(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeHasElse(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_has_else(idx); }
+        return r
+    }
+    public static int WorkflowV3NodeArgsCount(idx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_node_args_count(idx); }
+        return r
+    }
+    public static string WorkflowV3NodeArg(idx: int, i: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_node_arg(idx, i); }
+        return s
+    }
+    public static bool WorkflowV3EntryHasReturns(eidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_entry_has_returns(eidx); }
+        return r != 0
+    }
+    public static string WorkflowV3EntryReturns(eidx: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_entry_returns(eidx); }
+        return s
+    }
+    public static int WorkflowV3EntryParamCount(eidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_entry_param_count(eidx); }
+        return r
+    }
+    public static string WorkflowV3EntryParam(eidx: int, i: int) {
+        var s: string = ""
+        @c { s = _pollen_v3_entry_param(eidx, i); }
+        return s
+    }
+    public static int WorkflowV3AnchorEntryIdx(aidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_anchor_entry_idx_c(aidx); }
+        return r
+    }
+    public static int WorkflowV3AnchorNodeIdx(aidx: int) {
+        var r: int = 0
+        @c { r = _pollen_v3_anchor_node_idx_c(aidx); }
+        return r
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Pollen v3 — tree-walker dispatcher (Phase 3)
+    // ───────────────────────────────────────────────────────────────
+    //
+    // Runs an entry's body against a fresh state blackboard, returns
+    // the resulting state as a JsonValue object. AM-side ; reads the
+    // AST via the WorkflowV3* accessors, evaluates expressions via
+    // CelLexer/CelParser/CelEval (Phase 1).
+    //
+    // Scope this slice :
+    //   ✅ sequence (next_sibling chains)
+    //   ✅ set    — eval value, write to state
+    //   ✅ goto   — push frame, jump to entry/anchor target
+    //   ✅ anchor — fall-through no-op
+    //   ✅ if     — eval each case.when, dispatch first match
+    //   ✅ for    — eval `in`, iterate, bind loop var, dispatch body
+    //   ✅ while  — eval cond, dispatch body, cap by maxIter
+    //   ⏳ call   — STUB this session, no network (logs name only)
+    //
+    // Phase 3b ships `call` LB via the capability registry + bus
+    // forwarding + listener-thread integration. Phase 4 retires the
+    // v2 dispatcher.
+
+    public static int WorkflowV3DispatchEntry(eidx: int,
+                                                msgEnvelopeJson: string) {
+        let disp: PollenDispatcher = new PollenDispatcher()
+        return disp.Run(eidx, msgEnvelopeJson)
+    }
+
+    // Same as WorkflowV3DispatchEntry but returns the final state
+    // blackboard as a JSON-stringifiable JsonValue, for tests.
+    public static JsonValue WorkflowV3DispatchEntryState(eidx: int,
+                                                          msgEnvelopeJson: string) {
+        let disp: PollenDispatcher = new PollenDispatcher()
+        let rc: int = disp.Run(eidx, msgEnvelopeJson)
+        if (rc < 0) {
+            return new JsonValue()
+        }
+        return disp.GetState()
+    }
+
+    // ── Phase 3c — bus-triggered dispatch by topic ──────────────
+    //
+    // Looks up the first entry whose `on:` topic matches, dispatches
+    // its body. -1 if no entry consumes the topic (caller falls back
+    // to v2 routing or drops the message).
+    //
+    // Designed to be called from the listener thread once the topic
+    // has already been extracted from the envelope. Phase 3d will
+    // patch _pollen_listener_worker to invoke this when v3 is active.
+
+    public static int WorkflowV3LookupEntryByTopic(topic: string) {
+        var r: int = -1
+        @c { r = _pollen_v3_lookup_entry_by_topic(topic); }
+        return r
+    }
+
+    public static int WorkflowV3DispatchTopic(topic: string,
+                                                envelopeJson: string) {
+        let eidx: int = Pollen.WorkflowV3LookupEntryByTopic(topic)
+        if (eidx < 0) { return -1 }
+        return Pollen.WorkflowV3DispatchEntry(eidx, envelopeJson)
+    }
+
+    public static JsonValue WorkflowV3DispatchTopicState(topic: string,
+                                                          envelopeJson: string) {
+        let eidx: int = Pollen.WorkflowV3LookupEntryByTopic(topic)
+        if (eidx < 0) { return new JsonValue() }
+        return Pollen.WorkflowV3DispatchEntryState(eidx, envelopeJson)
+    }
+
+    // Phase 3d — counter of listener→dispatcher hops. Bumped each
+    // time _pollen_listener_worker routes a message to the v3
+    // dispatcher. Tests reset before publishing then poll until the
+    // count rises, since the dispatcher runs asynchronously on the
+    // listener thread.
+    public static int WorkflowV3DispatchCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_get_dispatch_count(); }
+        return r
+    }
+    public static void WorkflowV3ResetDispatchCount() {
+        @c { _pollen_v3_reset_dispatch_count(); }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PollenFrame — one call-stack frame (entry invocation context)
+// ─────────────────────────────────────────────────────────────────
+
+public class PollenFrame {
+    public EntryIdx:   int
+    public ParamKeys:  List<string>
+    public ParamVals:  List<CelValue>
+    public BindKey:    string   // where to write our `returns` on pop ; "" if none
+    public CallerIdx:  int      // frame idx in stack of the caller, -1 if root
+
+    public PollenFrame(eidx: int) {
+        this.EntryIdx   = eidx
+        this.ParamKeys  = new List<string>()
+        this.ParamVals  = new List<CelValue>()
+        this.BindKey    = ""
+        this.CallerIdx  = -1
+    }
+
+    public bool HasParam(name: string) {
+        let n: int = this.ParamKeys.Count()
+        for i in 0..n {
+            if (this.ParamKeys.Get(i) == name) { return true }
+        }
+        return false
+    }
+
+    public CelValue GetParam(name: string) {
+        let n: int = this.ParamKeys.Count()
+        for i in 0..n {
+            if (this.ParamKeys.Get(i) == name) { return this.ParamVals.Get(i) }
+        }
+        return CelValue.Null_()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PollenDispatcher — tree-walking interpreter
+// ─────────────────────────────────────────────────────────────────
+
+public class PollenDispatcher {
+
+    // Status codes returned by Run() / DispatchSeq() / DispatchStep().
+    public static int OK()        { return  0 }   // step completed normally
+    public static int RETURN()    { return  1 }   // entry returned (goto pop)
+    public static int ERROR_()    { return -1 }   // fatal — abort dispatch
+
+    // Goto kind constants matching POLLEN_GOTO_*.
+    public static int GOTO_ENTRY()  { return 1 }
+    public static int GOTO_ANCHOR() { return 2 }
+
+    // AST kind constants matching POLLEN_AST_*.
+    public static int K_CALL()   { return 1 }
+    public static int K_IF()     { return 2 }
+    public static int K_FOR()    { return 3 }
+    public static int K_WHILE()  { return 4 }
+    public static int K_SET()    { return 5 }
+    public static int K_GOTO()   { return 6 }
+    public static int K_ANCHOR() { return 7 }
+    public static int K_CASE()   { return 8 }
+
+    public static int MAX_FRAMES() { return 64 }
+
+    private Frames:      List<PollenFrame>
+    private State:       JsonValue       // object — the shared bus-msg blackboard
+    private MsgEnvelope: JsonValue       // bus envelope (parsed once)
+    private Failed:      bool
+    private FailMsg:     string
+
+    public PollenDispatcher() {
+        this.Frames      = new List<PollenFrame>()
+        this.State       = new JsonValue()
+        let k: List<string> = new List<string>()
+        let v: List<JsonValue> = new List<JsonValue>()
+        this.State.SetObject(k, v)
+        this.MsgEnvelope = new JsonValue()
+        this.Failed      = false
+        this.FailMsg     = ""
+    }
+
+    public bool HasFailed()    { return this.Failed }
+    public string ErrorMsg()   { return this.FailMsg }
+    public JsonValue GetState() { return this.State }
+
+    private void Fail(msg: string) {
+        if (this.Failed) { return }
+        this.Failed = true
+        this.FailMsg = msg
+    }
+
+    // Run an entry's body. Returns 0 on success, -1 on fatal error.
+    // Caller supplies a JSON-encoded bus envelope (or "" for a synthetic
+    // dispatch). State + frame stack live for one invocation only.
+    public int Run(eidx: int, envelopeJson: string) {
+        if (eidx < 0 || eidx >= Pollen.WorkflowV3EntryCount()) {
+            this.Fail("invalid entry idx")
+            return -1
+        }
+        if (String_Length(envelopeJson) > 0) {
+            let p: JsonParser = new JsonParser(envelopeJson)
+            this.MsgEnvelope = p.ParseTopLevel()
+            if (p.HasFailed()) {
+                let pe: string = p.ErrorMsg()
+                this.Fail("envelope parse: " + pe)
+                return -1
+            }
+        }
+        let frame: PollenFrame = new PollenFrame(eidx)
+        this.Frames.Add(frame)
+        let root: int = Pollen.WorkflowV3EntryDoRoot(eidx)
+        let rc: int = this.DispatchSeq(root)
+        // Pop the root frame.
+        let popped: int = this.Frames.Count() - 1
+        if (popped >= 0) { this.Frames.RemoveAt(popped) }
+        if (rc < 0) { return -1 }
+        return 0
+    }
+
+    // Walk a sibling-chained sequence starting at head_idx.
+    private int DispatchSeq(headIdx: int) {
+        var cur: int = headIdx
+        while (cur >= 0 && !this.Failed) {
+            let rc: int = this.DispatchStep(cur)
+            if (rc < 0)           { return -1 }
+            if (rc == 1) { return 1 }   // RETURN — bubble up to caller
+            cur = Pollen.WorkflowV3NodeNext(cur)
+        }
+        return 0
+    }
+
+    private int DispatchStep(nodeIdx: int) {
+        if (nodeIdx < 0) { return 0 }
+        let kind: int = Pollen.WorkflowV3NodeKind(nodeIdx)
+        if (kind == PollenDispatcher.K_SET())    { return this.StepSet(nodeIdx) }
+        if (kind == PollenDispatcher.K_GOTO())   { return this.StepGoto(nodeIdx) }
+        if (kind == PollenDispatcher.K_ANCHOR()) { return 0 }    // fall-through
+        if (kind == PollenDispatcher.K_IF())     { return this.StepIf(nodeIdx) }
+        if (kind == PollenDispatcher.K_FOR())    { return this.StepFor(nodeIdx) }
+        if (kind == PollenDispatcher.K_WHILE())  { return this.StepWhile(nodeIdx) }
+        if (kind == PollenDispatcher.K_CALL())   { return this.StepCall(nodeIdx) }
+        // CASE nodes are walked by StepIf directly ; reaching one here
+        // means a malformed AST. Fail loudly so the test catches it.
+        this.Fail("dispatcher: unexpected node kind " + String_FromInt(kind))
+        return -1
+    }
+
+    // ── Step handlers ────────────────────────────────────────────
+
+    private int StepSet(nodeIdx: int) {
+        let key: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let expr: string = Pollen.WorkflowV3NodeExpr(nodeIdx)
+        if (String_Length(key) == 0) {
+            this.Fail("set: empty key")
+            return -1
+        }
+        let v: CelValue = this.EvalExpr(expr)
+        if (this.Failed) { return -1 }
+        this.StateSet(key, v)
+        return 0
+    }
+
+    private int StepGoto(nodeIdx: int) {
+        let gKind: int = Pollen.WorkflowV3NodeGotoKind(nodeIdx)
+        let gIdx:  int = Pollen.WorkflowV3NodeGotoIdx(nodeIdx)
+        if (gKind == 0 || gIdx < 0) {
+            let tgt: string = Pollen.WorkflowV3NodeName(nodeIdx)
+            this.Fail("goto: unresolved target '" + tgt + "'")
+            return -1
+        }
+        if (this.Frames.Count() >= PollenDispatcher.MAX_FRAMES()) {
+            this.Fail("call-stack overflow (POLLEN_CALL_STACK_MAX=64)")
+            return -1
+        }
+
+        var targetEntry: int = -1
+        var targetNode:  int = -1
+        if (gKind == PollenDispatcher.GOTO_ENTRY()) {
+            targetEntry = gIdx
+            targetNode  = Pollen.WorkflowV3EntryDoRoot(gIdx)
+        } else if (gKind == PollenDispatcher.GOTO_ANCHOR()) {
+            targetEntry = Pollen.WorkflowV3AnchorEntryIdx(gIdx)
+            targetNode  = Pollen.WorkflowV3AnchorNodeIdx(gIdx)
+        } else {
+            this.Fail("goto: unknown goto_kind " + String_FromInt(gKind))
+            return -1
+        }
+
+        // Build a new frame, bind params from args[].
+        let frame: PollenFrame = new PollenFrame(targetEntry)
+        frame.CallerIdx = this.Frames.Count() - 1
+        let bind: string = Pollen.WorkflowV3NodeBind(nodeIdx)
+        frame.BindKey = bind
+        let argc: int = Pollen.WorkflowV3NodeArgsCount(nodeIdx)
+        let paramCount: int = Pollen.WorkflowV3EntryParamCount(targetEntry)
+        for i in 0..paramCount {
+            let pn: string = Pollen.WorkflowV3EntryParam(targetEntry, i)
+            var val: CelValue = CelValue.Null_()
+            if (i < argc) {
+                let ae: string = Pollen.WorkflowV3NodeArg(nodeIdx, i)
+                val = this.EvalExpr(ae)
+                if (this.Failed) { return -1 }
+            }
+            frame.ParamKeys.Add(pn)
+            frame.ParamVals.Add(val)
+        }
+        this.Frames.Add(frame)
+
+        let rc: int = this.DispatchSeq(targetNode)
+        // Compute the entry's `returns` value before popping.
+        var retVal: CelValue = CelValue.Null_()
+        if (Pollen.WorkflowV3EntryHasReturns(targetEntry)) {
+            let re: string = Pollen.WorkflowV3EntryReturns(targetEntry)
+            retVal = this.EvalExpr(re)
+            if (this.Failed) { return -1 }
+        }
+        // Pop the callee frame.
+        let last: int = this.Frames.Count() - 1
+        if (last >= 0) { this.Frames.RemoveAt(last) }
+        // Bind into the caller's state if requested.
+        if (String_Length(bind) > 0) {
+            this.StateSet(bind, retVal)
+        }
+        if (rc < 0) { return -1 }
+        return 0
+    }
+
+    private int StepIf(nodeIdx: int) {
+        let firstCase: int = Pollen.WorkflowV3NodeChild0(nodeIdx)
+        var cur: int = firstCase
+        while (cur >= 0 && !this.Failed) {
+            if (Pollen.WorkflowV3NodeKind(cur) != PollenDispatcher.K_CASE()) {
+                this.Fail("if: non-case child")
+                return -1
+            }
+            let isElse: int = Pollen.WorkflowV3NodeHasElse(cur)
+            var fire: bool = false
+            if (isElse != 0) {
+                fire = true
+            } else {
+                let expr: string = Pollen.WorkflowV3NodeExpr(cur)
+                let v: CelValue = this.EvalExpr(expr)
+                if (this.Failed) { return -1 }
+                if (!v.IsBool()) {
+                    this.Fail("if.when: not bool")
+                    return -1
+                }
+                fire = v.B
+            }
+            if (fire) {
+                let body: int = Pollen.WorkflowV3NodeChild0(cur)
+                return this.DispatchSeq(body)
+            }
+            cur = Pollen.WorkflowV3NodeNext(cur)
+        }
+        return 0
+    }
+
+    private int StepFor(nodeIdx: int) {
+        let varName: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let inExpr:  string = Pollen.WorkflowV3NodeExpr(nodeIdx)
+        let body:    int    = Pollen.WorkflowV3NodeChild0(nodeIdx)
+        if (String_Length(varName) == 0) {
+            this.Fail("for: empty var")
+            return -1
+        }
+        let items: CelValue = this.EvalExpr(inExpr)
+        if (this.Failed) { return -1 }
+        if (!items.IsList()) {
+            this.Fail("for.in: not a list")
+            return -1
+        }
+        let n: int = items.Items.Count()
+        let frame: PollenFrame = this.CurrentFrame()
+        for i in 0..n {
+            let v: CelValue = items.Items.Get(i)
+            // Bind/rebind the loop var on the current frame's params.
+            this.FrameSetParam(frame, varName, v)
+            let rc: int = this.DispatchSeq(body)
+            if (rc < 0) { return -1 }
+            if (rc == 1) { return 1 }
+        }
+        // Unbind loop var so subsequent steps don't see it leak.
+        this.FrameUnsetParam(frame, varName)
+        return 0
+    }
+
+    private int StepWhile(nodeIdx: int) {
+        let condExpr: string = Pollen.WorkflowV3NodeExpr(nodeIdx)
+        let body:     int    = Pollen.WorkflowV3NodeChild0(nodeIdx)
+        let maxIter:  int    = Pollen.WorkflowV3NodeMaxIter(nodeIdx)
+        var iter: int = 0
+        // Hard safety cap when no maxIter declared, so a runaway
+        // condition can't lock the dispatcher thread.
+        var cap: int = 100000
+        if (maxIter > 0) { cap = maxIter }
+        while (iter < cap && !this.Failed) {
+            let c: CelValue = this.EvalExpr(condExpr)
+            if (this.Failed) { return -1 }
+            if (!c.IsBool()) {
+                this.Fail("while.cond: not bool")
+                return -1
+            }
+            if (!c.B) { return 0 }
+            let rc: int = this.DispatchSeq(body)
+            if (rc < 0) { return -1 }
+            if (rc == 1) { return 1 }
+            iter = iter + 1
+        }
+        if (iter >= cap && maxIter > 0) {
+            this.Fail("while: maxIter (" + String_FromInt(maxIter) + ") exhausted")
+            return -1
+        }
+        return 0
+    }
+
+    // Resolve action → topic, pick provider(s) via the capability
+    // registry, publish the current state as the envelope data. Audit
+    // every invocation into state.__calls[] so tests can verify the
+    // dispatcher walked the node without needing a live listener.
+    //
+    // on_error policy (per cel-lite.md §"on_error" + AST.on_error byte) :
+    //   0 = log   — 0 providers warn + continue (default)
+    //   1 = fail  — 0 providers abort the dispatch
+    //   2 = drop  — 0 providers silently continue
+    private int StepCall(nodeIdx: int) {
+        let action: string = Pollen.WorkflowV3NodeName(nodeIdx)
+        let mode:   int    = Pollen.WorkflowV3NodeMode(nodeIdx)
+        let onErr:  int    = Pollen.WorkflowV3NodeOnError(nodeIdx)
+
+        // Audit the invocation up-front so tests see EVERY attempted
+        // call, even ones that abort via on_error=fail.
+        let auditKey: string = "__calls"
+        var auditList: CelValue = this.StateGet(auditKey)
+        if (!auditList.IsList()) {
+            let fresh: List<CelValue> = new List<CelValue>()
+            auditList = CelValue.List__(fresh)
+        }
+        auditList.Items.Add(CelValue.Str_(action))
+        this.StateSet(auditKey, auditList)
+
+        // Publish to provider(s). The data payload is the JSON-encoded
+        // state blackboard — Phase 4 may swap this for a per-step
+        // shaped payload once we audit real workflows.
+        let dataJson: string = Json.Encode(this.State)
+        var sent: int = 0
+        @c { sent = _pollen_v3_call_action(action, mode, onErr, dataJson); }
+        if (sent < 0) {
+            this.Fail("call '" + action + "': on_error=fail with no providers")
+            return -1
+        }
+        return 0
+    }
+
+    // ── State + frame helpers ────────────────────────────────────
+
+    private PollenFrame CurrentFrame() {
+        let n: int = this.Frames.Count()
+        if (n == 0) {
+            this.Fail("no current frame")
+            return new PollenFrame(-1)
+        }
+        return this.Frames.Get(n - 1)
+    }
+
+    private void FrameSetParam(frame: PollenFrame, name: string, v: CelValue) {
+        let n: int = frame.ParamKeys.Count()
+        for i in 0..n {
+            if (frame.ParamKeys.Get(i) == name) {
+                frame.ParamVals.Set(i, v)
+                return
+            }
+        }
+        frame.ParamKeys.Add(name)
+        frame.ParamVals.Add(v)
+    }
+
+    private void FrameUnsetParam(frame: PollenFrame, name: string) {
+        let n: int = frame.ParamKeys.Count()
+        for i in 0..n {
+            let j: int = n - 1 - i
+            if (frame.ParamKeys.Get(j) == name) {
+                frame.ParamKeys.RemoveAt(j)
+                frame.ParamVals.RemoveAt(j)
+                return
+            }
+        }
+    }
+
+    // Write a (possibly dotted) key into the state blackboard. The
+    // path is treated as a flat key when there's no dot ; with a dot
+    // we walk into nested objects, creating them on demand.
+    private void StateSet(key: string, v: CelValue) {
+        let parts: List<string> = this.SplitDot(key)
+        let n: int = parts.Count()
+        if (n == 0) { return }
+        if (n == 1) {
+            this.StateRootSet(parts.Get(0), v)
+            return
+        }
+        // Walk/create nested objects, set the leaf.
+        var cur: JsonValue = this.State
+        for i in 0..(n - 1) {
+            let seg: string = parts.Get(i)
+            if (!cur.IsObject()) { return }
+            if (!cur.Has(seg) || !cur.Get(seg).IsObject()) {
+                let fresh: JsonValue = new JsonValue()
+                let k2: List<string> = new List<string>()
+                let v2: List<JsonValue> = new List<JsonValue>()
+                fresh.SetObject(k2, v2)
+                this.JsonObjectSet(cur, seg, fresh)
+            }
+            cur = cur.Get(seg)
+        }
+        let leaf: string = parts.Get(n - 1)
+        this.JsonObjectSet(cur, leaf, this.CelToJson(v))
+    }
+
+    private CelValue StateGet(key: string) {
+        let parts: List<string> = this.SplitDot(key)
+        let n: int = parts.Count()
+        if (n == 0) { return CelValue.Null_() }
+        var cur: JsonValue = this.State
+        for i in 0..n {
+            let seg: string = parts.Get(i)
+            if (!cur.IsObject()) { return CelValue.Null_() }
+            if (!cur.Has(seg)) { return CelValue.Null_() }
+            cur = cur.Get(seg)
+        }
+        return this.JsonToCel(cur)
+    }
+
+    private void StateRootSet(key: string, v: CelValue) {
+        this.JsonObjectSet(this.State, key, this.CelToJson(v))
+    }
+
+    private void JsonObjectSet(obj: JsonValue, key: string, val: JsonValue) {
+        if (!obj.IsObject()) { return }
+        let ks: List<string> = obj.Keys()
+        let n: int = ks.Count()
+        for i in 0..n {
+            if (ks.Get(i) == key) {
+                // Remove old and re-append to preserve key order — JsonValue
+                // doesn't expose a Set, so we round-trip via Append/Remove.
+                // Cheap : object size in workflow state is small.
+                let keys: List<string> = new List<string>()
+                let vals: List<JsonValue> = new List<JsonValue>()
+                for j in 0..n {
+                    let kj: string = ks.Get(j)
+                    if (kj == key) {
+                        keys.Add(kj); vals.Add(val)
+                    } else {
+                        keys.Add(kj); vals.Add(obj.Get(kj))
+                    }
+                }
+                obj.SetObject(keys, vals)
+                return
+            }
+        }
+        obj.AppendEntry(key, val)
+    }
+
+    private List<string> SplitDot(s: string) {
+        let out: List<string> = new List<string>()
+        let n: int = String_Length(s)
+        var cur: string = ""
+        for i in 0..n {
+            let c: string = String_CharAt1(s, i)
+            if (c == ".") {
+                if (String_Length(cur) > 0) { out.Add(cur) }
+                cur = ""
+            } else {
+                cur = cur + c
+            }
+        }
+        if (String_Length(cur) > 0) { out.Add(cur) }
+        return out
+    }
+
+    private JsonValue CelToJson(v: CelValue) {
+        let jv: JsonValue = new JsonValue()
+        if (v.IsNull())  { jv.SetNull();     return jv }
+        if (v.IsBool())  { jv.SetBool(v.B);  return jv }
+        if (v.IsInt())   { jv.SetInt(v.I);   return jv }
+        if (v.IsFloat()) { jv.SetFloat(v.F); return jv }
+        if (v.IsStr())   { jv.SetString(v.S); return jv }
+        if (v.IsList()) {
+            let xs: List<JsonValue> = new List<JsonValue>()
+            let m: int = v.Items.Count()
+            for i in 0..m {
+                xs.Add(this.CelToJson(v.Items.Get(i)))
+            }
+            jv.SetArray(xs)
+            return jv
+        }
+        jv.SetNull()
+        return jv
+    }
+
+    private CelValue JsonToCel(jv: JsonValue) {
+        if (jv.IsNull())   { return CelValue.Null_() }
+        if (jv.IsBool())   { return CelValue.Bool_(jv.AsBool()) }
+        if (jv.IsInt())    { return CelValue.Int_(jv.AsInt()) }
+        if (jv.IsFloat())  { return CelValue.Float_(jv.AsFloat()) }
+        if (jv.IsString()) { return CelValue.Str_(jv.AsString()) }
+        if (jv.IsArray()) {
+            let items: List<JsonValue> = jv.AsArray()
+            let xs: List<CelValue> = new List<CelValue>()
+            let m: int = items.Count()
+            for i in 0..m {
+                xs.Add(this.JsonToCel(items.Get(i)))
+            }
+            return CelValue.List__(xs)
+        }
+        // Objects don't round-trip into CelValue ; expose as Null.
+        return CelValue.Null_()
+    }
+
+    // Build a CelEnv with state / params / msg bound. Includes the
+    // current frame's params + every loop var bound on that frame.
+    private CelEnv BuildEnv() {
+        let env: CelEnv = new CelEnv()
+        env.Bind("state", this.State)
+        // params — pseudo-root: pack the current frame's params into a
+        // synthetic JsonValue object so dotted access works (params.X).
+        let frame: PollenFrame = this.CurrentFrame()
+        let pObj: JsonValue = new JsonValue()
+        let pKeys: List<string> = new List<string>()
+        let pVals: List<JsonValue> = new List<JsonValue>()
+        pObj.SetObject(pKeys, pVals)
+        let np: int = frame.ParamKeys.Count()
+        for i in 0..np {
+            let k: string = frame.ParamKeys.Get(i)
+            let v: CelValue = frame.ParamVals.Get(i)
+            this.JsonObjectSet(pObj, k, this.CelToJson(v))
+        }
+        env.Bind("params", pObj)
+        // Loop vars — also expose each frame param at the top level so
+        // bare `item.X` works (cel-lite.md §4 loop-bound roots).
+        for i in 0..np {
+            let k: string = frame.ParamKeys.Get(i)
+            env.Bind(k, this.CelToJson(frame.ParamVals.Get(i)))
+        }
+        // msg.data — bind the bus envelope if present.
+        if (this.MsgEnvelope.IsObject()) {
+            env.Bind("msg", this.MsgEnvelope)
+        }
+        return env
+    }
+
+    // Lex+parse+eval a single expression against the current env.
+    private CelValue EvalExpr(src: string) {
+        if (String_Length(src) == 0) { return CelValue.Null_() }
+        let lex: CelLexer = new CelLexer(src)
+        let toks: List<CelToken> = lex.Lex()
+        if (lex.HasFailed()) {
+            this.Fail("lex: " + lex.ErrorMsg() + " in '" + src + "'")
+            return CelValue.Null_()
+        }
+        let par: CelParser = new CelParser(toks)
+        let root: int = par.Parse()
+        if (par.HasFailed()) {
+            this.Fail("parse: " + par.ErrorMsg() + " in '" + src + "'")
+            return CelValue.Null_()
+        }
+        let env: CelEnv = this.BuildEnv()
+        let ev: CelEval = new CelEval(par.Nodes, env)
+        let v: CelValue = ev.Eval(root)
+        if (ev.HasFailed()) {
+            this.Fail("eval: " + ev.ErrorMsg() + " in '" + src + "'")
+            return CelValue.Null_()
+        }
+        return v
     }
 }

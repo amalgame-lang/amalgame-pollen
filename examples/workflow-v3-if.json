@@ -1,0 +1,28 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-if-demo",
+  "version": 1,
+  "actions": {
+    "ingest":   { "topic": "order.in" },
+    "enrich":   { "topic": "order.enrich" },
+    "vip":      { "topic": "order.vip" },
+    "standard": { "topic": "order.standard" }
+  },
+  "entries": [
+    {
+      "name": "main",
+      "on":   "order.in",
+      "do":   [
+        { "type": "call", "action": "ingest" },
+        { "type": "call", "action": "enrich" },
+        { "type": "if",
+          "cases": [
+            { "when": "msg.data.amount > 1000",
+              "do":   { "type": "call", "action": "vip" } },
+            { "else": true,
+              "do":   { "type": "call", "action": "standard" } }
+          ] }
+      ]
+    }
+  ]
+}
