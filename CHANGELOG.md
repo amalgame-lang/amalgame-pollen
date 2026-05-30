@@ -2,6 +2,47 @@
 
 ## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
 
+### Added — Pollen v3 bus-triggered dispatch (Phase 3c)
+
+Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher (target)".
+
+Exposes the topic→entry routing surface the listener thread will
+call once Phase 3d patches `_pollen_listener_worker`. Keeping the
+listener change out of this commit because it touches a hot path
+that's currently exercised by every v2 message — wants its own
+slice with dedicated wire-level integration tests.
+
+- C-side `_pollen_v3_lookup_entry_by_topic(topic)` — linear scan
+  over `_pollen_v3_entries[]` matching `on_topic`. Bounded at 256
+  entries (`POLLEN_MAX_ENTRIES`), sub-µs even fully loaded — same
+  pattern as `_pollen_wf_topic_consumed` in the v2 path.
+- AM-side wrappers :
+  - `Pollen.WorkflowV3LookupEntryByTopic(topic) → int`
+  - `Pollen.WorkflowV3DispatchTopic(topic, envelopeJson) → int`
+  - `Pollen.WorkflowV3DispatchTopicState(topic, envelopeJson) → JsonValue`
+- The dispatcher's `BuildEnv` already binds the parsed envelope as
+  `msg`, so CEL-lite paths like `msg.data.user.id` and
+  `msg.data.n * 2` resolve out of the box — no code change needed,
+  just exercised by the new fixture entry.
+
+### Tests
+
+Added `by-topic` entry to the fixture (with `on: tick.hourly` and
+three `set` steps that read msg.data fields). 5 new assertions :
+lookup hit, lookup miss, three msg.data-driven `set` results.
+35 dispatcher assertions total, all green.
+
+### Notes
+
+- Phase 3d will patch `_pollen_listener_worker`'s
+  `if (matched) { do_forward = 1; }` block : when `_pollen_v3_active`
+  and the topic matches a v3 entry, call
+  `Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(topic, envelope)`
+  instead of the v2 routing-table forward. v2 stays the fallback for
+  topics that no v3 entry consumes.
+- Phase 3d will also need an integration smoke test that spins up a
+  real listener + posts an envelope + asserts the dispatcher ran.
+
 ### Added — Pollen v3 `call` step wired to the capability registry (Phase 3b)
 
 Spec : `docs/proposals/pollen-v3.md` §"`call` resolution".

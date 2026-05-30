@@ -105,6 +105,15 @@
       "do": [
         { "type": "call", "action": "store", "mode": "all" }
       ]
+    },
+    {
+      "name":  "by-topic",
+      "on":    "tick.hourly",
+      "do": [
+        { "type": "set", "key": "got_topic", "value": "\"tick.hourly\"" },
+        { "type": "set", "key": "user_id",   "value": "msg.data.user.id" },
+        { "type": "set", "key": "doubled",   "value": "msg.data.n * 2" }
+      ]
     }
   ]
 }

@@ -80,7 +80,7 @@ public class Program {
             return
         }
         p.AssertTrue("v3 active", Pollen.WorkflowV3IsActive())
-        p.AssertInt("entries", Pollen.WorkflowV3EntryCount(), 11)
+        p.AssertInt("entries", Pollen.WorkflowV3EntryCount(), 12)
 
         Console.WriteLine("-- linear (sequence + set + arithmetic)")
         let s1: JsonValue = p.Dispatch("linear")
@@ -159,6 +159,21 @@ public class Program {
         if (c8.IsArray()) {
             p.AssertInt("calls.length = 1", c8.AsArray().Count(), 1)
         }
+
+        Console.WriteLine("-- dispatch-by-topic (Phase 3c)")
+        // Lookup hit
+        let bIdx: int = Pollen.WorkflowV3LookupEntryByTopic("tick.hourly")
+        let byIdx: int = p.LookupEntry("by-topic")
+        p.AssertInt("lookup tick.hourly → by-topic", bIdx, byIdx)
+        // Lookup miss
+        p.AssertInt("lookup unknown → -1",
+                     Pollen.WorkflowV3LookupEntryByTopic("no.such.topic"), -1)
+        // Dispatch with a synthetic envelope carrying msg.data fields.
+        let env: string = "{\"messageId\":\"abc\",\"data\":{\"user\":{\"id\":42},\"n\":21}}"
+        let s9: JsonValue = Pollen.WorkflowV3DispatchTopicState("tick.hourly", env)
+        p.AssertStr("got_topic", s9.Get("got_topic").AsString(), "tick.hourly")
+        p.AssertInt("user_id from msg.data.user.id", s9.Get("user_id").AsInt(), 42)
+        p.AssertInt("doubled = msg.data.n * 2",      s9.Get("doubled").AsInt(), 42)
 
         Console.WriteLine("")
         if (p.Failures == 0) {
