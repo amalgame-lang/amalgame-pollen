@@ -48,6 +48,27 @@ public class Program {
         return nErr == 0
     }
 
+    // Run a negative-test fixture and assert that at least one
+    // diagnostic carries the expected rule tag (e.g. "rule6").
+    public static bool RunNegative(path: string, expectRule: string) {
+        Console.WriteLine("── {path} (NEGATIVE — expect {expectRule})")
+        let diags: List<string> = Pollen.WorkflowValidateV3(path)
+        let n: int = diags.Count()
+        var found: bool = false
+        for i in 0..n {
+            let d: string = diags.Get(i)
+            Console.WriteLine("    " + d)
+            // Diags start "[severity ruleN] ..." — search for expectRule.
+            if (String_IndexOf(d, expectRule) >= 0) { found = true }
+        }
+        if (!found) {
+            Console.WriteLine("  → expected '{expectRule}' diagnostic, NONE found")
+            return false
+        }
+        Console.WriteLine("  → '{expectRule}' diagnostic present")
+        return true
+    }
+
     public static void Main(string[] args) {
         let examples: List<string> = new List<string>()
         examples.Add("examples/workflow-v3-linear.json")
@@ -66,6 +87,10 @@ public class Program {
             let p: string = examples.Get(i)
             if (!Program.RunOne(p)) { allOK = false }
         }
+
+        // ── Negative tests (validator must reject these) ──
+        if (!Program.RunNegative("examples/workflow-v3-cycle-invalid.json",
+                                   "rule6")) { allOK = false }
 
         if (allOK) {
             Console.WriteLine("OK — all v3 examples validate clean")
