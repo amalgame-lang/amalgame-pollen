@@ -2,6 +2,37 @@
 
 ## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
 
+### Added — Pollen v3 Live executions recording + cycle test (Phase 4 partial)
+
+Spec : `docs/proposals/pollen-v3.md` §"Implementation phases" Phase 4.
+
+Two robustness items that were carried as Phase 3d follow-ups :
+
+- **Live executions recorder hooked into v3** — after Phase 3d, v3
+  dispatch hops were invisible to the pollen-manager Live executions
+  panel because `_pollen_wf_record_step` was only fired on the v2
+  path. The listener worker now emits one record per v3-routed
+  message : fresh hop UUID, parent = inbound mid, topic_in = matched
+  topic, n_nexts=1, optional debug-session passthrough. Same shape
+  as the v2 record so the manager renders v2 + v3 hops uniformly.
+- **Negative test for cycle detection (rule 6)** — the validator's
+  DFS strongly-connected-components walk over the goto graph was
+  shipped in the rule 1-7 base but never exercised by a green-build
+  fixture. `examples/workflow-v3-cycle-invalid.json` (2 entries
+  pointing at each other) + a new `RunNegative` helper in
+  `tests/v3_validator_smoke.am` assert that the validator emits an
+  `[error rule6]` for the cycle. Catches a regression class
+  (silently-passing cycles) that would only surface at runtime
+  otherwise.
+
+### Notes
+
+- Runtime depth-cap fuzz (POLLEN_CALL_STACK_MAX=64) would need a
+  65-entry goto chain — verbose for the value, documented as a v4
+  candidate.
+- The v2 → v3 migration tool (~300 LOC per the spec) is still pending,
+  required before existing workflows can move over.
+
 ### Added — Pollen v3 listener → dispatcher integration (Phase 3d)
 
 Spec : `docs/proposals/pollen-v3.md` §"v3 dispatcher (target)".

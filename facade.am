@@ -2491,6 +2491,47 @@ import Amalgame.String
                 if (v3_handled && v3_topic_gc && v3_env_gc) {
                     atomic_fetch_add(&_pollen_msgs_handled, 1);
                     atomic_fetch_add(&_pollen_inflight, 1);
+                    /* Phase 4 — surface the v3 hop in the manager's
+                     * Live executions panel. Generated here (not by
+                     * the dispatcher) so a single hop is recorded
+                     * per inbound message regardless of how many
+                     * inner steps the dispatcher walks. */
+                    if (_pollen_shared_dir[0]) {
+                        char hop_mid[37];
+                        _pollen_gen_uuid(hop_mid);
+                        /* Pull the inbound mid as parent. */
+                        const char* pmp = _pollen_find(rbuf, line_len,
+                                                        MID_KEY, MID_KEY_LEN);
+                        const char* parent3 = 0; size_t parent3_len = 0;
+                        if (pmp) {
+                            const char* pmv = pmp + MID_KEY_LEN;
+                            const char* pmq = memchr(pmv, '"',
+                                line_len - (size_t)(pmv - rbuf));
+                            if (pmq) {
+                                parent3     = pmv;
+                                parent3_len = (size_t)(pmq - pmv);
+                            }
+                        }
+                        /* Optional debug session, same shape as v2. */
+                        const char* dseg = _pollen_find(rbuf, line_len,
+                            "\"debug\":{\"session\":\"", 20);
+                        const char* dsess3 = 0; size_t dsess3_len = 0;
+                        if (dseg) {
+                            const char* dsv = dseg + 20;
+                            const char* dsq = memchr(dsv, '"',
+                                line_len - (size_t)(dsv - rbuf));
+                            if (dsq) {
+                                dsess3     = dsv;
+                                dsess3_len = (size_t)(dsq - dsv);
+                            }
+                        }
+                        _pollen_wf_record_step(hop_mid, 36,
+                            parent3, parent3_len,
+                            v3_topic_gc, strlen(v3_topic_gc),
+                            0 /* topic_out — v3 owns its forwards */,
+                            1 /* n_nexts — count the v3 hop */,
+                            dsess3, dsess3_len);
+                    }
                     (void) Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(
                         (code_string) v3_topic_gc,
                         (code_string) v3_env_gc);
