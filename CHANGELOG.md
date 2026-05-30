@@ -1,6 +1,74 @@
 # Changelog
 
-## v0.2.0-dev — 2026-05-30 (unreleased, on `feat/pollen-v3-phase1`)
+## v0.2.0 — 2026-05-30
+
+### Breaking — v1/v2 dispatcher dropped (Phase 6)
+
+The v2 workflow surface is gone. Workflows now describe themselves
+with the v3 schema (`{schema: "pollen/v3", actions, entries}`) and
+dispatch happens through `PollenDispatcher` (tree-walking interpreter,
+CEL-lite expressions, capability-registry-resolved `call` steps with
+`on_error` policies).
+
+Removed from the public API :
+
+- `WorkflowLoad`, `WorkflowVersion` (v2 loader)
+- `WorkflowReloadBegin` / `Commit` / `AddConsume` / `AddNext` /
+  `SetEmitTopic` (v2 routing setters)
+- `CondBranchOpen` / `AddTarget` / `SetTopic` (v2 cond routing)
+- `SetOpAdd` (v2 set-op storage)
+- `ForSetup` / `AddTarget` / `AddItem` / `SetTopic` (v2 for routing)
+- `WhileSetup` / `AddExit` / `SetExitTopic` / `SetBodyTopic` (v2 while routing)
+- `StateGet` / `StateSet` (v2 per-execution state file)
+- `EvalExpr` / `EvalCond` (v2 expression evaluator — superseded by CEL-lite)
+- `PublishDebug` + the M2.4 debug bridge (`mode=step` / `mode=breakpoint`,
+  manager `:3001` phone-home, mutate-on-pause workflow). The v3-shaped
+  equivalent is unscheduled.
+- `OnMessage` / `OnComplete` / `Forward` Mosaic bridge — was wired into
+  the v2 listener path only. A v3 bridge (per-step callbacks on the
+  AM-side `PollenDispatcher`) is unscheduled.
+
+Retained — every shared infrastructure piece both v3 and any future
+bridge will keep using : `WorkflowSetSharedDir` / `WorkflowSetSelf` /
+`WorkflowActiveRole`, `StartListener`, `StartCapabilityWriter` /
+`StartCapabilityReader` / `SetLoadBalance` / `RegistrySize` /
+`ResolveProvider`, `Publish` / `PublishSync`.
+
+Dropped artefacts :
+
+- 6 `examples/workflow-v2-*.json` fixtures (superseded by `workflow-v3-*.json`)
+- 10 v2-only C-side smoke tests (`cond_set_dispatch_smoke`,
+  `eval_expr_cond_smoke`, `for_while_smoke`, `state_persist_smoke`,
+  `workflow_dispatch_smoke`, `debug_bridge_smoke`, `publish_debug_smoke`,
+  `bridge_smoke`, `lb_smoke`, `recorder_smoke`)
+
+Simplified `_pollen_listener_worker` : the v3 fork (Phase 3d) is now
+the only dispatch path. v2 routing tables + `do_forward` machinery +
+the entire `if (do_forward) { … }` block (debug bridge, OnMessage
+transform, set-ops apply, while/for/cond/forward-all chain, v2
+recorder hop, OnComplete leaf-call) are gone. ~140 LOC out of the
+listener body alone.
+
+Runtime header (`runtime/Amalgame_Pollen.h`) rewritten to declare the
+v3 surface only — 39 public symbols (down from ~38 v2 + some v3 stubs).
+`header_consumer_check.c` rewritten to match.
+
+Net diff : `facade.am` 7376 → 6960 LOC (-416), generated `.c` 10010 →
+9570 lines (-440). Tests: 13 C-side → 4 (`header_consumer_check`,
+`listener_smoke`, `publish_smoke`, `v3_listener_smoke`) + the 4
+AM-side v3 suites.
+
+### Deferred to v0.3.0
+
+The v2 C-side helpers (`_pollen_wf_*` workflow state, `_pollen_cond_*`
+eval, `_pollen_for_*` / `_pollen_while_*` setters + dispatch,
+`_pollen_set_ops_*`, `_pollen_debug_*` bridge, `_pollen_state_*` file
+I/O) are still defined inside `facade.am`'s `@c {}` block. They're
+unreachable from the public API now but bloat the compiled archive.
+Pruning them is mechanical but voluminous (~2000 LOC across many
+sections, with `static` storage scattered through the early TU) — kept
+as a v0.3 cleanup pass so v0.2.0 can ship the API contract change
+without coupling it to a deep refactor.
 
 ### Added — Pollen v3 Live executions recording + cycle test (Phase 4 partial)
 
