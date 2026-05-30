@@ -1,17 +1,24 @@
 /* Amalgame_Pollen.h — runtime header for the amalgame-pollen
  * package. Forward declarations only ; the actual @c {} blocks
- * with the workflow engine implementation live in facade.am
- * (singleton-per-process design, same as pollen-node-tcp.am
- * v0.2).
+ * with the workflow engine implementation live in facade.am.
  *
- * Consumers : the pollen CLI binary, Mosaic web apps that embed
- * Pollen, or any Amalgame program that needs the workflow-tree
- * runtime. They import the package via :
+ * Consumers : Mosaic web apps that embed Pollen, or any
+ * Amalgame program that needs the v3 workflow dispatcher.
+ * They import the package via :
  *
  *   import Amalgame.Pollen
  *
  * which makes the symbols below visible after amc has emitted
  * the #include + linked against the package archive.
+ *
+ * v0.2.0 — the v1/v2 workflow surface (WorkflowLoad,
+ * WorkflowReload* / AddConsume / AddNext / SetEmitTopic /
+ * CondBranch* / For* / While* / SetOpAdd, StateGet / StateSet,
+ * EvalExpr / EvalCond, PublishDebug, OnMessage / OnComplete /
+ * Forward, WorkflowVersion) was retired with the v2 dispatcher.
+ * Workflows now describe themselves with the v3 schema
+ * (`{schema: "pollen/v3", actions, entries}`) and dispatch
+ * happens via the WorkflowV3* entry points below.
  */
 
 #ifndef AMALGAME_POLLEN_H
@@ -29,111 +36,91 @@
 extern "C" {
 #endif
 
-/* The engine is presently a singleton-per-process : v0.1 keeps
- * the same static-global storage used in pollen-node-tcp.am for
- * compat. v0.2 will introduce an opaque AmalgamePollenEngine
- * handle for multi-engine hosting (e.g. a single Mosaic app
- * running two independent workflows on different port ranges). */
+/* The engine is a singleton-per-process : one workflow loaded at a
+ * time, one capability registry, one bus listener. v0.3 may
+ * introduce an opaque AmalgamePollenEngine handle for multi-engine
+ * hosting (e.g. a single Mosaic app running two independent
+ * workflows on different port ranges). */
 
-/* Workflow loading + lifecycle */
-code_bool   Amalgame_Pollen_Pollen_WorkflowLoad(code_string path, code_string nodeName, int64_t actualPort);
+/* === Shared infrastructure ====================================== */
+
+/* Configure sharedDir/state/ + sharedDir/executions/ + sharedDir/
+ * capabilities/ location. */
 void        Amalgame_Pollen_Pollen_WorkflowSetSharedDir(code_string path);
+/* Self identity for the executions/ recorder + capability ad. */
 void        Amalgame_Pollen_Pollen_WorkflowSetSelf(code_string role, code_string host, int64_t port);
-
-/* M2.3c.1 — workflow runtime setters (consumes / nexts / emit topic).
- * Bracket the AddConsume/AddNext/SetEmitTopic calls with the
- * ReloadBegin / ReloadCommit pair — they hold a mutex against the
- * listener dispatch. */
-void        Amalgame_Pollen_Pollen_WorkflowReloadBegin(void);
-void        Amalgame_Pollen_Pollen_WorkflowReloadCommit(void);
-void        Amalgame_Pollen_Pollen_WorkflowAddConsume(code_string topic);
-void        Amalgame_Pollen_Pollen_WorkflowAddNext(code_string host, int64_t port);
-void        Amalgame_Pollen_Pollen_WorkflowSetEmitTopic(code_string topic);
-
-/* M2.3c.2 — cond branches (Phase 5.2 `if`) + set state.X ops (Phase
- * 5.3 `set`). Both fit between ReloadBegin/ReloadCommit alongside
- * the flat-topology setters. */
-void        Amalgame_Pollen_Pollen_CondBranchOpen(code_string condJson);
-void        Amalgame_Pollen_Pollen_CondBranchAddTarget(code_string host, int64_t port);
-/* v0.1.20 — v2 routing : set the current branch's emit topic so it
- * forwards to a registry-resolved provider (power-of-two) instead of
- * static targets. Empty → v1 static-target behaviour. */
-void        Amalgame_Pollen_Pollen_CondBranchSetTopic(code_string topic);
-void        Amalgame_Pollen_Pollen_SetOpAdd(code_string path, code_string valueExpr);
-
-/* M2.3c.2b — for / while loops (Phase 5.4). */
-void        Amalgame_Pollen_Pollen_ForSetup(code_string itemVar);
-void        Amalgame_Pollen_Pollen_ForAddTarget(code_string host, int64_t port);
-void        Amalgame_Pollen_Pollen_ForAddItem(code_string itemLit);
-/* v0.1.21 — v2 routing : per-iteration topic resolved via LB. */
-void        Amalgame_Pollen_Pollen_ForSetTopic(code_string topic);
-void        Amalgame_Pollen_Pollen_WhileSetup(code_string condJson,
-                                                code_string iterKey,
-                                                int64_t maxIter,
-                                                code_string selfHost,
-                                                int64_t selfPort);
-void        Amalgame_Pollen_Pollen_WhileAddExit(code_string host, int64_t port);
-/* v0.1.22 — v2 routing : exit topic resolved via LB. Loop body still
- * uses the self host:port passed to WhileSetup. */
-void        Amalgame_Pollen_Pollen_WhileSetExitTopic(code_string topic);
-/* v0.1.23 — explicit while.body : iteration goes to the body action's
- * topic (LB-resolved) instead of looping to self. */
-void        Amalgame_Pollen_Pollen_WhileSetBodyTopic(code_string topic);
-
-/* Phase 5.3 — per-execution state file under sharedDir/state/<rootMid>.json.
- * StateGet returns the raw JSON literal for the key (or "" if absent).
- * StateSet replace-or-append the key, atomic tmp+rename. */
-code_string Amalgame_Pollen_Pollen_StateGet(code_string rootMid, code_string path);
-code_bool   Amalgame_Pollen_Pollen_StateSet(code_string rootMid, code_string path, code_string jsonLiteral);
-
-/* M2.2 — expression + cond evaluators used by workflow-tree set/if.
- * EvalExpr returns the literal form of the evaluated value.
- * EvalCond evaluates a leaf / composite (and/or/not) / membership
- * (in/not_in) condition against the envelope. */
-code_string Amalgame_Pollen_Pollen_EvalExpr(code_string envelopeJson, code_string exprJson);
-code_bool   Amalgame_Pollen_Pollen_EvalCond(code_string envelopeJson, code_string condJson);
+/* Returns the role set by WorkflowSetSelf (or ""). */
+code_string Amalgame_Pollen_Pollen_WorkflowActiveRole(void);
 
 /* TCP transport */
 void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
-/* Phase 6.1 — capability advertisement (discovery) */
-void        Amalgame_Pollen_Pollen_StartCapabilityWriter(code_string label, code_string host, int64_t port);
 code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
                                             code_string topicUuid, int64_t topicVersion,
                                             code_string dataJson);
 code_string Amalgame_Pollen_Pollen_PublishSync(code_string host, int64_t port,
                                                 code_string topicUuid, int64_t topicVersion,
                                                 code_string dataJson, int64_t timeoutMs);
-code_string Amalgame_Pollen_Pollen_PublishDebug(code_string host, int64_t port,
-                                                 code_string topicUuid, int64_t topicVersion,
-                                                 code_string dataJson,
-                                                 code_string session, code_string mode,
-                                                 code_string breakpointsJson,
-                                                 code_string managerAddr);
 
-/* v0.1.17 — Mosaic bridge hooks. OnMessage/OnComplete take an AM
- * closure (AmalgameClosure*, defined in _runtime.h) invoked on the
- * listener worker thread : OnMessage transforms a consumed message's
- * data before forward (return "" → drop), OnComplete fires when a
- * consumed message terminates at this node. Forward re-emits a
- * message out-of-band keeping the chain (fresh mid, parent = the
- * incoming mid, same rootMessageId, data swapped to newDataJson). */
-void        Amalgame_Pollen_Pollen_OnMessage(AmalgameClosure* handler);
-void        Amalgame_Pollen_Pollen_OnComplete(AmalgameClosure* handler);
-code_string Amalgame_Pollen_Pollen_Forward(code_string envelopeJson, code_string newDataJson);
-
-/* v0.1.18 — Phase 6.2/6.3 capability reader + power-of-two LB.
- * StartCapabilityReader spawns a 2s scan thread building an in-memory
- * registry of live providers. SetLoadBalance toggles load-balanced
- * forwarding (emit topic → power-of-two pick). RegistrySize +
- * ResolveProvider are introspection (tests + manager). */
+/* Capability discovery (Phase 6.1) + power-of-two LB (Phase 6.3).
+ * StartCapabilityWriter advertises this node's actions ; the reader
+ * builds an in-memory registry of live providers ; SetLoadBalance
+ * toggles registry-resolved forwarding ; RegistrySize +
+ * ResolveProvider are introspection. */
+void        Amalgame_Pollen_Pollen_StartCapabilityWriter(code_string label, code_string host, int64_t port);
 void        Amalgame_Pollen_Pollen_StartCapabilityReader(void);
 void        Amalgame_Pollen_Pollen_SetLoadBalance(code_bool on);
 int64_t     Amalgame_Pollen_Pollen_RegistrySize(void);
 code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
 
-/* Introspection */
-int64_t     Amalgame_Pollen_Pollen_WorkflowVersion(void);
-code_string Amalgame_Pollen_Pollen_WorkflowActiveRole(void);
+/* === Pollen v3 — workflow validator + loader =================== */
+
+/* Returns a List<string> of diagnostics ("[severity ruleN] path:
+ * message"). Empty list = clean v3 workflow.json. */
+void*       Amalgame_Pollen_Pollen_WorkflowValidateV3(code_string workflowPath);
+/* Load + resolve a v3 workflow into the runtime AST pools. Returns
+ * true on success ; WorkflowV3LoadErrorMsg holds the last error. */
+code_bool   Amalgame_Pollen_Pollen_WorkflowLoadV3(code_string workflowPath);
+code_string Amalgame_Pollen_Pollen_WorkflowV3LoadErrorMsg(void);
+
+/* === Pollen v3 — introspection (tests + manager) ============== */
+
+code_bool   Amalgame_Pollen_Pollen_WorkflowV3IsActive(void);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3EntryCount(void);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3AnchorCount(void);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3ActionCount(void);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeCount(void);
+code_string Amalgame_Pollen_Pollen_WorkflowV3EntryName(int64_t eidx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3EntryDoRoot(int64_t eidx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeKind(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeChild0(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeNext(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeGotoKind(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeGotoIdx(int64_t idx);
+code_string Amalgame_Pollen_Pollen_WorkflowV3NodeName(int64_t idx);
+code_string Amalgame_Pollen_Pollen_WorkflowV3NodeExpr(int64_t idx);
+code_string Amalgame_Pollen_Pollen_WorkflowV3NodeBind(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeMode(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeOnError(int64_t idx);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3NodeMaxIter(int64_t idx);
+
+/* === Pollen v3 — dispatcher entry points ====================== */
+
+/* Dispatch a workflow entry by index. Returns 0 on OK, non-zero on
+ * abort/error. The *State variant returns the final state blackboard
+ * as a JsonValue for tests + introspection. */
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3DispatchEntry(int64_t eidx, code_string envelopeJson);
+void*       Amalgame_Pollen_Pollen_WorkflowV3DispatchEntryState(int64_t eidx, code_string envelopeJson);
+
+/* Resolve a bus topic to an entry index (or -1 if no entry consumes
+ * it). DispatchTopic is the listener fast-path. */
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3LookupEntryByTopic(code_string topic);
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(code_string topic, code_string envelopeJson);
+void*       Amalgame_Pollen_Pollen_WorkflowV3DispatchTopicState(code_string topic, code_string envelopeJson);
+
+/* Atomic counter bumped each time the listener fork routes to v3.
+ * Reset variant for tests that need a clean baseline. */
+int64_t     Amalgame_Pollen_Pollen_WorkflowV3DispatchCount(void);
+void        Amalgame_Pollen_Pollen_WorkflowV3ResetDispatchCount(void);
 
 #ifdef __cplusplus
 }
