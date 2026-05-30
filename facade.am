@@ -2204,6 +2204,22 @@ import Amalgame.String
      * pthread.h is already included earlier alongside workflow
      * state definitions. */
 
+    /* Phase 3d — forward decls so _pollen_listener_worker can branch
+     * on the v3 storage layer before reaching its definition further
+     * down the @c block. The tentative-definition rule lets these
+     * `static int` lines coexist with the real definitions in the
+     * Phase 2 storage section. */
+    static int _pollen_v3_active;
+    static int _pollen_v3_entry_count;
+    static _Atomic int _pollen_v3_dispatch_count;
+    static int _pollen_v3_lookup_entry_by_topic(const char* topic);
+
+    /* AM-defined v3 dispatcher entry point (Pollen.WorkflowV3DispatchTopic).
+     * Defined later in this TU by the amc codegen ; called from
+     * _pollen_listener_worker after the wf-mutex is released. */
+    extern int64_t Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(
+        code_string topic, code_string envelopeJson);
+
     static void* _pollen_listener_worker(void* arg) {
         int fd = (int)(intptr_t) arg;
         char rbuf[16384];
@@ -2234,8 +2250,49 @@ import Amalgame.String
                  * recorder (set in the matched block below). */
                 const char* topic_in = NULL;
                 size_t topic_in_len = 0;
+                /* Phase 3d — v3 takes precedence over the v2 routing
+                 * tables. If a v3 entry's `on:` matches this topic, we
+                 * mark v3_handled, ACK as if v2 had matched, skip the
+                 * v2 dispatch block, and invoke the AM dispatcher AFTER
+                 * releasing the wf mutex (the dispatcher may call
+                 * Pollen.Publish which would otherwise deadlock). */
+                int v3_handled = 0;
+                const char* v3_topic_gc = 0;
+                const char* v3_env_gc   = 0;
                 pthread_mutex_lock(&_pollen_wf_mutex);
-                if (_pollen_wf_active && _pollen_wf_n_consumes > 0) {
+                if (_pollen_v3_active && _pollen_v3_entry_count > 0) {
+                    const char* tp3 = _pollen_find(rbuf, line_len,
+                                                     TOPIC_KEY, TOPIC_KEY_LEN);
+                    if (tp3) {
+                        tp3 += TOPIC_KEY_LEN;
+                        const char* tq3 = memchr(tp3, '"',
+                                                   line_len - (size_t)(tp3 - rbuf));
+                        if (tq3) {
+                            size_t tlen3 = (size_t)(tq3 - tp3);
+                            char tnt[POLLEN_TOPIC_MAX];
+                            if (tlen3 < sizeof(tnt)) {
+                                memcpy(tnt, tp3, tlen3);
+                                tnt[tlen3] = 0;
+                                if (_pollen_v3_lookup_entry_by_topic(tnt) >= 0) {
+                                    /* GC-dup so the AM call after the
+                                     * unlock has stable storage. */
+                                    char* td = (char*) GC_MALLOC_ATOMIC(tlen3 + 1);
+                                    char* ed = (char*) GC_MALLOC_ATOMIC(line_len + 1);
+                                    if (td && ed) {
+                                        memcpy(td, tp3, tlen3); td[tlen3] = 0;
+                                        memcpy(ed, rbuf, line_len); ed[line_len] = 0;
+                                        v3_topic_gc = td;
+                                        v3_env_gc   = ed;
+                                        v3_handled  = 1;
+                                        topic_in     = tp3;
+                                        topic_in_len = tlen3;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!v3_handled && _pollen_wf_active && _pollen_wf_n_consumes > 0) {
                     const char* tp = _pollen_find(rbuf, line_len,
                                                     TOPIC_KEY, TOPIC_KEY_LEN);
                     int matched = 0;
@@ -2422,6 +2479,24 @@ import Amalgame.String
                     }
                 }
                 pthread_mutex_unlock(&_pollen_wf_mutex);
+
+                /* Phase 3d — v3 dispatch happens AFTER the mutex
+                 * release. The dispatcher walks the AST, evaluates
+                 * CEL-lite expressions, may call Pollen.Publish ;
+                 * all of those allocate GC objects + the publish
+                 * path re-locks the registry mutex. Doing the call
+                 * inside the wf-mutex critical section would risk
+                 * a deadlock if the dispatched workflow re-enters
+                 * via a self-call. */
+                if (v3_handled && v3_topic_gc && v3_env_gc) {
+                    atomic_fetch_add(&_pollen_msgs_handled, 1);
+                    atomic_fetch_add(&_pollen_inflight, 1);
+                    (void) Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(
+                        (code_string) v3_topic_gc,
+                        (code_string) v3_env_gc);
+                    atomic_fetch_add(&_pollen_v3_dispatch_count, 1);
+                    atomic_fetch_sub(&_pollen_inflight, 1);
+                }
 
                 size_t consumed = line_len + 1;
                 memmove(rbuf, rbuf + consumed, rlen - consumed);
@@ -3275,6 +3350,12 @@ import Amalgame.String
     static int _pollen_v3_active;   /* 1 once a v3 workflow has been
                                       * committed ; flipped off only by
                                       * a v2 load or another v3 reload */
+    /* Phase 3d — counter bumped each time the listener thread routes
+     * a message to the v3 dispatcher. Exposed via
+     * Pollen.WorkflowV3DispatchCount so the integration test can
+     * verify the listener → dispatcher fork without needing to
+     * observe per-dispatch state (which is otherwise ephemeral). */
+    static _Atomic int _pollen_v3_dispatch_count = 0;
 
     static void _pollen_v3_set_err(const char* msg) {
         if (_pollen_v3_has_load_err) return;   /* keep first error */
@@ -3540,6 +3621,12 @@ import Amalgame.String
     static int _pollen_v3_count_actions(void) { return _pollen_v3_action_count; }
     static int _pollen_v3_count_nodes(void)   { return _pollen_v3_ast_count; }
     static int _pollen_v3_is_active(void)     { return _pollen_v3_active; }
+    static int _pollen_v3_get_dispatch_count(void) {
+        return atomic_load(&_pollen_v3_dispatch_count);
+    }
+    static void _pollen_v3_reset_dispatch_count(void) {
+        atomic_store(&_pollen_v3_dispatch_count, 0);
+    }
 
     static code_string _pollen_v3_get_load_err(void) {
         if (!_pollen_v3_has_load_err) {
@@ -6655,6 +6742,20 @@ public class Pollen {
         let eidx: int = Pollen.WorkflowV3LookupEntryByTopic(topic)
         if (eidx < 0) { return new JsonValue() }
         return Pollen.WorkflowV3DispatchEntryState(eidx, envelopeJson)
+    }
+
+    // Phase 3d — counter of listener→dispatcher hops. Bumped each
+    // time _pollen_listener_worker routes a message to the v3
+    // dispatcher. Tests reset before publishing then poll until the
+    // count rises, since the dispatcher runs asynchronously on the
+    // listener thread.
+    public static int WorkflowV3DispatchCount() {
+        var r: int = 0
+        @c { r = _pollen_v3_get_dispatch_count(); }
+        return r
+    }
+    public static void WorkflowV3ResetDispatchCount() {
+        @c { _pollen_v3_reset_dispatch_count(); }
     }
 }
 
