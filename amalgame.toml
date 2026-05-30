@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.2.0"
+version           = "0.3.0"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v3 entries over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]

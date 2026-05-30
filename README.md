@@ -9,6 +9,9 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.3.0** — internal cleanup of dead v2 C helpers (~2170 LOC). No
+API change vs v0.2.0.
+
 **v0.2.0** — v3 dispatcher feature-complete. The v1/v2 dispatcher
 (workflow-tree schema, cond branches, debug bridge, Mosaic
 `OnMessage`/`OnComplete`/`Forward` bridge) was retired. Workflows
@@ -133,16 +136,10 @@ for i in 0..n {
 The CEL-lite spec : `docs/proposals/pollen-v3-cel-lite.md`.
 The v3 dispatcher spec + validator rules : `docs/proposals/pollen-v3.md`.
 
-## Limitations (v0.2.x)
+## Limitations (v0.3.x)
 
 - Single-engine per process — multi-engine hosting (one process,
-  two independent workflows on different port ranges) is on the
-  v0.3 roadmap.
-- Dead C-side v2 helpers (`_pollen_wf_*`, `_pollen_cond_*`,
-  `_pollen_for_*`, `_pollen_while_*`, `_pollen_set_ops_*`,
-  `_pollen_debug_*`, `_pollen_state_*`) still ship inside
-  `facade.am`'s `@c {}` block — they're unreachable from the
-  public API but bloat the compiled archive. Deep cleanup in v0.3.
+  two independent workflows on different port ranges) is unscheduled.
 - Mosaic bridge (`OnMessage` / `OnComplete` / `Forward`) was
   v2-only and went with the dispatcher. The v3-shaped equivalent
   (hook into `PollenDispatcher` step callbacks) is unscheduled.
