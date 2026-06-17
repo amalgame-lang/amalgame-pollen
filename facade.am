@@ -1013,6 +1013,78 @@ import Amalgame.String
         return (code_string) out;
     }
 
+    /* M4 — debug-aware publish helper. Builds a MESSAGE envelope
+     * carrying a `debug` field (session / mode / manager / breakpoints)
+     * so a stepping run phones home from each paused hop. Restored in
+     * v0.3.x : the v3 cleanup dropped it, but pollen-manager's
+     * /api/inject still depends on it (the v3-shaped equivalent is
+     * unscheduled). messageId == rootMessageId (originator). */
+    static code_string
+    Amalgame_Pollen_Pollen_PublishDebug_c(code_string host, int64_t port,
+                                            code_string topicUuid, int64_t topicVersion,
+                                            code_string dataJson,
+                                            code_string session, code_string mode,
+                                            code_string breakpointsJson,
+                                            code_string managerAddr) {
+        char* empty = (char*) GC_MALLOC_ATOMIC(1);
+        if (empty) empty[0] = 0;
+        if (!host || !topicUuid || !dataJson) return (code_string) empty;
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return (code_string) empty;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, (const char*) host, &addr.sin_addr) != 1) {
+            close(fd); return (code_string) empty;
+        }
+        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            close(fd); return (code_string) empty;
+        }
+
+        char mid[37];
+        _pollen_gen_uuid(mid);
+        const char* sess = session ? (const char*) session : "";
+        const char* md   = mode ? (const char*) mode : "step";
+        const char* bps  = breakpointsJson ? (const char*) breakpointsJson : "[]";
+        const char* mgr  = managerAddr ? (const char*) managerAddr : "127.0.0.1:3001";
+
+        char envelope[8192];
+        int64_t now = _pollen_now_ms_c();
+        int env_len = snprintf(envelope, sizeof(envelope),
+            "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+             "\"type\":\"MESSAGE\","
+             "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
+             "\"data\":%s,\"timestamp\":%lld,"
+             "\"debug\":{\"session\":\"%s\",\"mode\":\"%s\","
+                        "\"manager\":\"%s\",\"breakpoints\":%s,"
+                        "\"hit_bp\":false}}\n",
+            mid, mid, (const char*) topicUuid, (long long) topicVersion,
+            (const char*) dataJson, (long long) now,
+            sess, md, mgr, bps);
+        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
+            close(fd); return (code_string) empty;
+        }
+        ssize_t sent = 0;
+        while (sent < env_len) {
+            ssize_t n = send(fd, envelope + sent,
+                             (size_t)(env_len - sent), MSG_NOSIGNAL);
+            if (n < 0) { close(fd); return (code_string) empty; }
+            sent += n;
+        }
+        /* drain one ACK line (best-effort, short wait) */
+        struct timeval rtv = { 2, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+        char ackbuf[512];
+        (void) recv(fd, ackbuf, sizeof(ackbuf), 0);
+        close(fd);
+
+        char* out = (char*) GC_MALLOC_ATOMIC(37);
+        if (!out) return (code_string) empty;
+        memcpy(out, mid, 37);
+        return (code_string) out;
+    }
+
     /* === Pollen v3 — runtime AST + name resolver =============
      *
      * Phase 2 of the v3 roadmap (docs/proposals/pollen-v3.md §"v3
@@ -3055,6 +3127,26 @@ public class Pollen {
         @c { mid = Amalgame_Pollen_Pollen_Publish_c(host, (int64_t) port,
                                                       topicUuid, (int64_t) topicVersion,
                                                       dataJson); }
+        return mid
+    }
+
+    // M4 — debug-aware publish. Same as Publish but attaches a
+    // `debug` field (session / mode / manager / breakpoints) so a
+    // stepping run can phone home from each paused hop. Centralises
+    // the envelope pollen-manager's /api/inject used to hand-roll ;
+    // messageId == rootMessageId (the originator). Restored in v0.3.x
+    // because pollen-manager still depends on it (v3 equivalent TBD).
+    public static string PublishDebug(host: string, port: int,
+                                        topicUuid: string, topicVersion: int,
+                                        dataJson: string,
+                                        session: string, mode: string,
+                                        breakpointsJson: string,
+                                        managerAddr: string) {
+        var mid: string = ""
+        @c { mid = Amalgame_Pollen_Pollen_PublishDebug_c(host, (int64_t) port,
+                                                           topicUuid, (int64_t) topicVersion,
+                                                           dataJson, session, mode,
+                                                           breakpointsJson, managerAddr); }
         return mid
     }
 
