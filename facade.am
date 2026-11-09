@@ -85,6 +85,7 @@ import Amalgame.String
         int    (WSAAPI *recv)(SOCKET, char*, int, int);
         int    (WSAAPI *inet_pton)(int, const char*, void*);
         int    (WSAAPI *WSAPoll)(LPWSAPOLLFD, ULONG, INT);
+        int    (WSAAPI *shutdown)(SOCKET, int);
     } _pollen_ws;
     static void _pollen_net_init(void) {
         static volatile LONG done = 0;
@@ -96,6 +97,7 @@ import Amalgame.String
         _POLLEN_WS(setsockopt); _POLLEN_WS(bind);    _POLLEN_WS(listen);
         _POLLEN_WS(accept);     _POLLEN_WS(connect); _POLLEN_WS(send);
         _POLLEN_WS(recv);       _POLLEN_WS(inet_pton); _POLLEN_WS(WSAPoll);
+        _POLLEN_WS(shutdown);
         #undef _POLLEN_WS
         WSADATA wsa;
         if (_pollen_ws.WSAStartup) _pollen_ws.WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -119,6 +121,7 @@ import Amalgame.String
     #define htons(v)                 _pollen_htons((uint16_t)(v))
     #define htonl(v)                 _pollen_htonl((uint32_t)(v))
     static int  _pollen_sock_close(int fd) { return closesocket((SOCKET) fd); }
+    static int  _pollen_sock_shutdown(int fd) { return _pollen_ws.shutdown((SOCKET) fd, SD_BOTH); }
     static int  _pollen_mkdir(const char* p) { return _mkdir(p); }
     static void _pollen_random(void* buf, size_t n) { SystemFunction036(buf, (ULONG) n); }
     static void _pollen_sleep_ms(int ms) { Sleep((DWORD) ms); }
@@ -142,6 +145,7 @@ import Amalgame.String
     #  endif
     static void _pollen_net_init(void) {}
     static int  _pollen_sock_close(int fd) { return close(fd); }
+    static int  _pollen_sock_shutdown(int fd) { return shutdown(fd, SHUT_RDWR); }
     static int  _pollen_mkdir(const char* p) { return mkdir(p, 0755); }
     static void _pollen_random(void* buf, size_t n) {
         /* /dev/urandom is on Linux, macOS and every BSD — getrandom()
@@ -1089,6 +1093,208 @@ import Amalgame.String
         return 1;
     }
 
+    /* === v0.5.0 — connection reuse for Publish / call ===========
+     *
+     * v0.4 opened one TCP connection per Publish : a handshake, a
+     * listener thread spawn on the peer and a TIME_WAIT socket per
+     * message. Now each (host, port) keeps one long-lived connection,
+     * guarded by its own mutex, so messages to one peer go out in
+     * order on one listener worker.
+     *
+     * The peer ACKs every message on that connection. Publish is
+     * fire-and-forget, so a small reader thread per connection reads
+     * and discards the ACKs as they come. Draining only between sends
+     * is not enough : when the sender outpaces the peer, both sides
+     * block in send() (we wait for the peer to read, the peer waits
+     * for us to read its ACKs). The reader also notices a closed or
+     * restarted peer (recv returns 0) and flags the link dead, so the
+     * next Publish reconnects. A failed send is retried once on a
+     * fresh connection.
+     *
+     * Each connection is a heap `pollen_link_t` shared by the sender
+     * and its reader (refcount 2) : whoever lets go last closes the
+     * socket and frees it. The sender lets go with shutdown(), which
+     * wakes the reader's recv().
+     *
+     * TCP_NODELAY : small envelopes back to back would otherwise wait
+     * for the peer's delayed ACK (40 ms on Linux, 200 ms on Windows).
+     *
+     * SetConnectionReuse(false) restores the v0.4 behaviour. */
+    #ifndef _WIN32
+    #  include <netinet/tcp.h>
+    #endif
+    #define POLLEN_POOL_MAX 64
+    typedef struct {
+        int          fd;
+        _Atomic int  dead;
+        _Atomic int  refs;
+    } pollen_link_t;
+    typedef struct {
+        char            host[POLLEN_HOST_MAX];
+        int             port;
+        pollen_link_t*  link;          /* 0 when not connected */
+        pthread_mutex_t mu;
+    } pollen_conn_t;
+    static pollen_conn_t   _pollen_pool[POLLEN_POOL_MAX];
+    static int             _pollen_pool_n = 0;
+    static pthread_mutex_t _pollen_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static _Atomic int     _pollen_pool_on = 1;
+    static _Atomic long    _pollen_pool_connects = 0;
+
+    static pollen_conn_t* _pollen_pool_get(const char* host, int port) {
+        if (strlen(host) >= POLLEN_HOST_MAX) return 0;
+        pollen_conn_t* c = 0;
+        pthread_mutex_lock(&_pollen_pool_mutex);
+        for (int i = 0; i < _pollen_pool_n; i++) {
+            if (_pollen_pool[i].port == port && strcmp(_pollen_pool[i].host, host) == 0) {
+                c = &_pollen_pool[i]; break;
+            }
+        }
+        if (!c && _pollen_pool_n < POLLEN_POOL_MAX) {
+            c = &_pollen_pool[_pollen_pool_n++];
+            strcpy(c->host, host);
+            c->port = port;
+            c->link = 0;
+            pthread_mutex_init(&c->mu, NULL);
+        }
+        pthread_mutex_unlock(&_pollen_pool_mutex);
+        return c;   /* 0 when the pool is full : caller falls back */
+    }
+
+    static void _pollen_link_release(pollen_link_t* l) {
+        if (atomic_fetch_sub(&l->refs, 1) == 1) {
+            _pollen_sock_close(l->fd);
+            free(l);
+        }
+    }
+
+    /* Reader thread : discards ACKs, flags the link dead on EOF or
+     * error. No GC allocation here, so a plain pthread is fine. */
+    static void* _pollen_link_reader(void* arg) {
+        pollen_link_t* l = (pollen_link_t*) arg;
+        char buf[4096];
+        for (;;) {
+            ssize_t n = recv(l->fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+        }
+        atomic_store(&l->dead, 1);
+        _pollen_link_release(l);
+        return NULL;
+    }
+
+    /* Caller holds c->mu. */
+    static void _pollen_pool_drop(pollen_conn_t* c) {
+        pollen_link_t* l = c->link;
+        if (!l) return;
+        c->link = 0;
+        _pollen_sock_shutdown(l->fd);   /* wakes the reader */
+        _pollen_link_release(l);
+    }
+
+    /* Caller holds c->mu. */
+    static int _pollen_pool_connect(pollen_conn_t* c) {
+        int fd = _pollen_socket();
+        if (fd < 0) return 0;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) c->port);
+        if (inet_pton(AF_INET, c->host, &addr.sin_addr) != 1
+            || connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            _pollen_sock_close(fd); return 0;
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof(one));
+        pollen_link_t* l = (pollen_link_t*) malloc(sizeof(pollen_link_t));
+        if (!l) { _pollen_sock_close(fd); return 0; }
+        l->fd = fd;
+        atomic_store(&l->dead, 0);
+        atomic_store(&l->refs, 2);
+        pthread_t th;
+        if (pthread_create(&th, NULL, _pollen_link_reader, l) != 0) {
+            _pollen_sock_close(fd); free(l); return 0;
+        }
+        pthread_detach(th);
+        c->link = l;
+        atomic_fetch_add(&_pollen_pool_connects, 1);
+        return 1;
+    }
+
+    /* Caller holds c->mu. */
+    static int _pollen_pool_send_all(pollen_conn_t* c, const char* buf, int len) {
+        ssize_t sent = 0;
+        while (sent < len) {
+            ssize_t n = send(c->link->fd, buf + sent, (size_t)(len - sent), MSG_NOSIGNAL);
+            if (n <= 0) return 0;
+            sent += n;
+        }
+        return 1;
+    }
+
+    /* Same contract as _pollen_publish_one, over a pooled connection. */
+    static int _pollen_publish_pooled(const char* host, int port,
+                                        const char* topic_uuid,
+                                        int64_t topic_version,
+                                        const char* data_json,
+                                        char* out_mid) {
+        if (!host || !topic_uuid || !data_json || !out_mid) return 0;
+        pollen_conn_t* c = _pollen_pool_get(host, port);
+        if (!c) return _pollen_publish_one(host, port, topic_uuid,
+                                             topic_version, data_json, out_mid);
+        _pollen_gen_uuid(out_mid);
+        char envelope[8192];
+        int64_t now = _pollen_now_ms_c();
+        int env_len = snprintf(envelope, sizeof(envelope),
+            "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+             "\"type\":\"MESSAGE\","
+             "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
+             "\"data\":%s,\"timestamp\":%lld}\n",
+            out_mid, out_mid, topic_uuid,
+            (long long) topic_version, data_json, (long long) now);
+        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) return 0;
+
+        int ok = 0;
+        pthread_mutex_lock(&c->mu);
+        for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+            if (c->link && atomic_load(&c->link->dead)) _pollen_pool_drop(c);
+            if (!c->link && !_pollen_pool_connect(c)) break;
+            if (_pollen_pool_send_all(c, envelope, env_len)) ok = 1;
+            else _pollen_pool_drop(c);
+        }
+        pthread_mutex_unlock(&c->mu);
+        return ok;
+    }
+
+    static void
+    Amalgame_Pollen_Pollen_SetConnectionReuse_c(int on) {
+        atomic_store(&_pollen_pool_on, on ? 1 : 0);
+        if (on) return;
+        pthread_mutex_lock(&_pollen_pool_mutex);
+        for (int i = 0; i < _pollen_pool_n; i++) {
+            pthread_mutex_lock(&_pollen_pool[i].mu);
+            _pollen_pool_drop(&_pollen_pool[i]);
+            pthread_mutex_unlock(&_pollen_pool[i].mu);
+        }
+        pthread_mutex_unlock(&_pollen_pool_mutex);
+    }
+
+    static int64_t
+    Amalgame_Pollen_Pollen_ConnectCount_c(void) {
+        return (int64_t) atomic_load(&_pollen_pool_connects);
+    }
+
+    /* Publish / call path : pooled unless SetConnectionReuse(false). */
+    static int _pollen_publish(const char* host, int port,
+                                 const char* topic_uuid,
+                                 int64_t topic_version,
+                                 const char* data_json,
+                                 char* out_mid) {
+        if (atomic_load(&_pollen_pool_on))
+            return _pollen_publish_pooled(host, port, topic_uuid,
+                                            topic_version, data_json, out_mid);
+        return _pollen_publish_one(host, port, topic_uuid,
+                                     topic_version, data_json, out_mid);
+    }
+
     static code_string
     Amalgame_Pollen_Pollen_Publish_c(code_string host, int64_t port,
                                        code_string topicUuid, int64_t topicVersion,
@@ -1097,7 +1303,7 @@ import Amalgame.String
         if (empty) empty[0] = 0;
         if (!host || !topicUuid || !dataJson) return (code_string) empty;
         char mid[37];
-        if (!_pollen_publish_one((const char*) host, (int) port,
+        if (!_pollen_publish((const char*) host, (int) port,
                                    (const char*) topicUuid,
                                    topicVersion,
                                    (const char*) dataJson,
@@ -1885,7 +2091,7 @@ import Amalgame.String
         int sent = 0;
         for (int i = 0; i < nc; i++) {
             char mid[37];
-            if (_pollen_publish_one(hosts[i], ports[i], topic, 1,
+            if (_pollen_publish(hosts[i], ports[i], topic, 1,
                                       data_json, mid)) {
                 sent++;
             }
@@ -1919,7 +2125,7 @@ import Amalgame.String
             return 0;
         }
         char mid[37];
-        if (!_pollen_publish_one(host, port, topic, 1, data_json, mid)) {
+        if (!_pollen_publish(host, port, topic, 1, data_json, mid)) {
             if (on_error == 1) return -1;
             return 0;
         }
@@ -3333,6 +3539,22 @@ public class Pollen {
     // single-instance setups are unchanged. Requires StartCapabilityReader.
     public static void SetLoadBalance(on: bool) {
         @c { Amalgame_Pollen_Pollen_SetLoadBalance_c(on ? 1 : 0); }
+    }
+
+    // v0.5.0 — Publish and workflow `call` steps keep one TCP
+    // connection per peer (default ON). false closes the pooled
+    // connections and goes back to one connection per message.
+    // PublishSync / PublishDebug always use their own connection.
+    public static void SetConnectionReuse(on: bool) {
+        @c { Amalgame_Pollen_Pollen_SetConnectionReuse_c(on ? 1 : 0); }
+    }
+
+    // v0.5.0 — number of pooled connections opened so far (connects
+    // and reconnects). Introspection for tests.
+    public static int ConnectCount() {
+        var n: int = 0
+        @c { n = (int) Amalgame_Pollen_Pollen_ConnectCount_c(); }
+        return n
     }
 
     // Phase 6.3 — number of live providers currently in the registry

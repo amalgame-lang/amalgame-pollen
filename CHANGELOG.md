@@ -1,6 +1,50 @@
 # Changelog
 
-## v0.4.0 — unreleased
+## v0.5.0 — 2026-11-09
+
+### Changed — `Publish` and `call` reuse one TCP connection per peer
+
+Until v0.4, every `Pollen.Publish` (and every workflow `call` step)
+opened a TCP connection, sent one envelope and closed it : a
+handshake, a worker thread spawned on the peer and a socket in
+TIME_WAIT per message, about 10 ms each on localhost. Now each
+(host, port) keeps one long-lived connection :
+
+- 2000 messages to a local peer : 91 ms, against 20.5 s with one
+  connection per message (Linux, WSL2).
+- Messages to one peer arrive in order (one connection, one
+  listener worker), which a historian or a counter can rely on.
+- The peer ACKs every message on the connection. A reader thread
+  per pooled connection discards those ACKs as they come ; without
+  it, a sender faster than its peer deadlocks (both sides blocked
+  in `send()`). The same thread notices a closed or restarted peer
+  and the next `Publish` reconnects. A failed send is retried once
+  on a fresh connection.
+- `TCP_NODELAY` on pooled sockets, so back-to-back envelopes do not
+  wait for the peer's delayed ACK.
+- `Pollen.SetConnectionReuse(false)` goes back to one connection per
+  message. `PublishSync` and `PublishDebug` keep their own connection.
+- `Pollen.ConnectCount()` — pooled connects so far, for tests.
+
+No wire change : a v0.5 node and a v0.4 node talk to each other
+(the v0.4 listener already read any number of envelopes per
+connection).
+
+### Tests
+
+- `tests/run_am_tests.sh` builds and runs every `tests/*.am` suite
+  against the working tree, staged as a dev package (no tag needed).
+  CI now runs it : before, only the C smokes ran there, and the
+  CEL-lite / v3 / OnTopic suites were run by hand.
+- `tests/conn_reuse_smoke.am` — 2000 publishes over one connection,
+  in order, then reuse off and on again.
+
+### Docs
+
+- `NOTICE.md` described the UDP transport of v0.1 ; the bus is TCP
+  with newline-delimited JSON since the 2026-05-25 rewrite.
+
+## v0.4.0 — 2026-11-09
 
 ### Added — application topic handlers (`Pollen.OnTopic`)
 

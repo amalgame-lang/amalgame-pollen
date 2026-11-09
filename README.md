@@ -9,6 +9,13 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.5.0** — `Publish` and workflow `call` steps keep one TCP
+connection per peer (2000 local messages : 91 ms instead of 20.5 s),
+in order. CI now runs the Amalgame-side suites too.
+
+**v0.4.0** — `Pollen.OnTopic` application handlers ; Windows
+(MinGW-w64) and macOS / BSD support.
+
 **v0.3.0** — internal cleanup of dead v2 C helpers (~2170 LOC). No
 API change vs v0.2.0.
 
@@ -61,14 +68,16 @@ registry (power-of-two LB), and pops frames on `goto` returns.
 | Live executions recorder (manager Live panel hops) | ✅ |
 | `call.on_error` policies (`log` / `fail` / `drop`) | ✅ |
 
-Smoke suites in CI (`tests/run_tests.sh` for C-side, the `tests/build-*-smoke.sh` for AM-side) :
+Smoke suites in CI (`tests/run_tests.sh` for C-side, `tests/run_am_tests.sh` for AM-side) :
 
 - **cel_lite_smoke** — 83 assertions (lex / parse / arithmetic / compare / logical / string / `in` / list indexing / env-backed paths)
 - **v3_validator_smoke** — 9 clean fixtures + 1 negative (cycle detection)
 - **v3_loader_smoke** — 67 assertions (entries / anchors / actions / AST shape)
 - **v3_dispatch_smoke** — 35 assertions (linear / branching / loops / goto+params+returns / call audit + `on_error`)
 - **v3_listener_smoke** — 7 assertions (real TCP socket + topic→entry routing + dispatch count)
-- **header_consumer_check** — 39 public symbols verified
+- **on_topic_smoke** — `OnTopic` handler, ACK, capability advertisement
+- **conn_reuse_smoke** — 2000 publishes over one pooled connection, in order ; reuse off / on
+- **header_consumer_check** — 41 public symbols verified
 - **listener_smoke** + **publish_smoke** — TCP transport baseline
 
 ## API surface
@@ -91,6 +100,11 @@ let mid2: string = Pollen.PublishSync(host, port, topic, ver, data, 5000)
 // Server side — accept loop, one pthread per connection
 Pollen.StartListener(8000)
 ```
+
+`Publish` (and workflow `call` steps) keep one TCP connection per
+peer (v0.5.0) : messages to a peer arrive in order, without a
+handshake each. `Pollen.SetConnectionReuse(false)` goes back to one
+connection per message ; `PublishSync` always uses its own.
 
 ### Capability discovery + load balancer (Phase 6.1-6.3)
 
@@ -161,7 +175,7 @@ isolated in one `#ifdef _WIN32` block at the top of `facade.am`. On
 Windows, Winsock is loaded at runtime from `ws2_32.dll`, so the
 manifest's `libs` stays the same on every OS.
 
-## Limitations (v0.4.x)
+## Limitations (v0.5.x)
 
 - Single-engine per process — multi-engine hosting (one process,
   two independent workflows on different port ranges) is unscheduled.
