@@ -35,17 +35,156 @@ import Amalgame.String
     #include <stdint.h>
     #include <stdlib.h>
     #include <string.h>
-    #include <unistd.h>
     #include <fcntl.h>
     #include <sys/stat.h>
     #include <sys/types.h>
-    #include <sys/socket.h>
-    #include <sys/random.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
     #include <time.h>
-    #include <sys/time.h>
     #include <errno.h>
+
+    /* === v0.4.0 — portability layer ===========================
+     *
+     * Every OS-specific call in this TU goes through one of the
+     * _pollen_* helpers below, so the transport, capability files
+     * and LB work unchanged on Linux, macOS / BSD and Windows
+     * (MinGW-w64). Same shape as the runtime's Amalgame_Net.h :
+     * Winsock2 + one-shot WSAStartup + closesocket on Windows,
+     * plain BSD sockets elsewhere. Link ws2_32 on Windows. */
+    #ifdef _WIN32
+    #  ifndef _WIN32_WINNT
+    #    define _WIN32_WINNT 0x0600   /* inet_pton + WSAPoll */
+    #  endif
+    #  include <winsock2.h>
+    #  include <ws2tcpip.h>
+    #  include <windows.h>
+    #  include <io.h>
+    #  include <direct.h>
+    #  include <process.h>
+    #  include <unistd.h>
+    #  ifndef MSG_NOSIGNAL
+    #    define MSG_NOSIGNAL 0        /* Winsock never raises SIGPIPE */
+    #  endif
+    /* RtlGenRandom — advapi32, linked by default on MinGW. */
+    BOOLEAN NTAPI SystemFunction036(PVOID buf, ULONG len);
+
+    /* Winsock is resolved at runtime from ws2_32.dll : amc's
+     * [stdlib].libs has no per-OS form yet, and adding "ws2_32"
+     * there would break the Linux / macOS link. Every socket call
+     * in this TU goes through _pollen_ws (macros below), and every
+     * code path creates its socket via _pollen_socket() — which
+     * runs _pollen_net_init() — before any other socket call. */
+    static struct {
+        int    (WSAAPI *WSAStartup)(WORD, LPWSADATA);
+        SOCKET (WSAAPI *socket)(int, int, int);
+        int    (WSAAPI *closesocket)(SOCKET);
+        int    (WSAAPI *setsockopt)(SOCKET, int, int, const char*, int);
+        int    (WSAAPI *bind)(SOCKET, const struct sockaddr*, int);
+        int    (WSAAPI *listen)(SOCKET, int);
+        SOCKET (WSAAPI *accept)(SOCKET, struct sockaddr*, int*);
+        int    (WSAAPI *connect)(SOCKET, const struct sockaddr*, int);
+        int    (WSAAPI *send)(SOCKET, const char*, int, int);
+        int    (WSAAPI *recv)(SOCKET, char*, int, int);
+        int    (WSAAPI *inet_pton)(int, const char*, void*);
+        int    (WSAAPI *WSAPoll)(LPWSAPOLLFD, ULONG, INT);
+    } _pollen_ws;
+    static void _pollen_net_init(void) {
+        static volatile LONG done = 0;
+        if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+        HMODULE m = LoadLibraryA("ws2_32.dll");
+        if (!m) return;
+        #define _POLLEN_WS(name) *(FARPROC*) &_pollen_ws.name = GetProcAddress(m, #name)
+        _POLLEN_WS(WSAStartup); _POLLEN_WS(socket);  _POLLEN_WS(closesocket);
+        _POLLEN_WS(setsockopt); _POLLEN_WS(bind);    _POLLEN_WS(listen);
+        _POLLEN_WS(accept);     _POLLEN_WS(connect); _POLLEN_WS(send);
+        _POLLEN_WS(recv);       _POLLEN_WS(inet_pton); _POLLEN_WS(WSAPoll);
+        #undef _POLLEN_WS
+        WSADATA wsa;
+        if (_pollen_ws.WSAStartup) _pollen_ws.WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    /* Byte-order helpers without ws2_32 (x86 / ARM Windows are little-endian). */
+    static uint16_t _pollen_htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+    static uint32_t _pollen_htonl(uint32_t v) {
+        return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+    }
+    #define socket(a, b, c)          _pollen_ws.socket(a, b, c)
+    #define closesocket(s)           _pollen_ws.closesocket(s)
+    #define setsockopt(s, l, o, v, n) _pollen_ws.setsockopt((SOCKET)(s), l, o, (const char*)(v), (int)(n))
+    #define bind(s, a, n)            _pollen_ws.bind((SOCKET)(s), a, (int)(n))
+    #define listen(s, n)             _pollen_ws.listen((SOCKET)(s), n)
+    #define accept(s, a, n)          _pollen_ws.accept((SOCKET)(s), a, n)
+    #define connect(s, a, n)         _pollen_ws.connect((SOCKET)(s), a, (int)(n))
+    #define send(s, b, n, f)         _pollen_ws.send((SOCKET)(s), (const char*)(b), (int)(n), f)
+    #define recv(s, b, n, f)         _pollen_ws.recv((SOCKET)(s), (char*)(b), (int)(n), f)
+    #define inet_pton(f, s, d)       _pollen_ws.inet_pton(f, s, d)
+    #define WSAPoll(p, n, t)         _pollen_ws.WSAPoll(p, n, t)
+    #define htons(v)                 _pollen_htons((uint16_t)(v))
+    #define htonl(v)                 _pollen_htonl((uint32_t)(v))
+    static int  _pollen_sock_close(int fd) { return closesocket((SOCKET) fd); }
+    static int  _pollen_mkdir(const char* p) { return _mkdir(p); }
+    static void _pollen_random(void* buf, size_t n) { SystemFunction036(buf, (ULONG) n); }
+    static void _pollen_sleep_ms(int ms) { Sleep((DWORD) ms); }
+    static int  _pollen_poll_in(int fd, int timeout_ms) {
+        WSAPOLLFD pfd; pfd.fd = (SOCKET) fd; pfd.events = POLLRDNORM; pfd.revents = 0;
+        return WSAPoll(&pfd, 1, timeout_ms);
+    }
+    static void _pollen_set_rcvtimeo(int fd, int ms) {
+        DWORD tv = (DWORD) ms;
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &tv, sizeof(tv));
+    }
+    #else
+    #  include <unistd.h>
+    #  include <sys/socket.h>
+    #  include <netinet/in.h>
+    #  include <arpa/inet.h>
+    #  include <sys/time.h>
+    #  include <poll.h>
+    #  ifndef MSG_NOSIGNAL
+    #    define MSG_NOSIGNAL 0        /* macOS / BSD : SO_NOSIGPIPE below */
+    #  endif
+    static void _pollen_net_init(void) {}
+    static int  _pollen_sock_close(int fd) { return close(fd); }
+    static int  _pollen_mkdir(const char* p) { return mkdir(p, 0755); }
+    static void _pollen_random(void* buf, size_t n) {
+        /* /dev/urandom is on Linux, macOS and every BSD — getrandom()
+         * is Linux-only. Fallback to rand() only if it can't be read. */
+        int fd = open("/dev/urandom", O_RDONLY);
+        size_t got = 0;
+        if (fd >= 0) {
+            while (got < n) {
+                ssize_t r = read(fd, (char*) buf + got, n - got);
+                if (r <= 0) break;
+                got += (size_t) r;
+            }
+            close(fd);
+        }
+        for (; got < n; got++) ((unsigned char*) buf)[got] = (unsigned char) rand();
+    }
+    static void _pollen_sleep_ms(int ms) { usleep((useconds_t) ms * 1000); }
+    static int  _pollen_poll_in(int fd, int timeout_ms) {
+        struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;
+        return poll(&pfd, 1, timeout_ms);
+    }
+    static void _pollen_set_rcvtimeo(int fd, int ms) {
+        struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    #endif
+
+    /* New TCP socket, with the per-OS options every Pollen socket
+     * needs. Returns -1 on failure. */
+    static int _pollen_socket(void) {
+        _pollen_net_init();
+    #ifdef _WIN32
+        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET) return -1;
+        return (int) s;
+    #else
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+    #  ifdef SO_NOSIGPIPE
+        if (s >= 0) { int one = 1; setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
+    #  endif
+        return s;
+    #endif
+    }
     #include <gc.h>
 
     /* Singleton-per-process engine state. v0.1 carries flags only ;
@@ -233,7 +372,7 @@ import Amalgame.String
         _pollen_shared_dir[sizeof(_pollen_shared_dir) - 1] = 0;
         /* best-effort create — EEXIST ok ; sub-dirs (state/, executions/)
          * are created lazily by their respective writers. */
-        mkdir(_pollen_shared_dir, 0755);
+        _pollen_mkdir(_pollen_shared_dir);
     }
 
     static void
@@ -272,7 +411,7 @@ import Amalgame.String
         /* ensure the executions/ dir exists */
         char d[600];
         snprintf(d, sizeof(d), "%s/executions", _pollen_shared_dir);
-        mkdir(d, 0755);
+        _pollen_mkdir(d);
         int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd < 0) return;
         char dbg_suffix[96] = "";
@@ -343,6 +482,49 @@ import Amalgame.String
     extern int64_t Amalgame_Pollen_Pollen_WorkflowV3DispatchTopic(
         code_string topic, code_string envelopeJson);
 
+    /* === v0.4.0 — application topic handlers (Pollen.OnTopic) ===
+     *
+     * Lets a program consume a topic with its own code — e.g. a
+     * historian writing to a database — instead of (or before) a
+     * workflow entry. Registry guarded by the wf mutex ; the closure
+     * pointers live in static storage, which the GC scans as roots.
+     * Registering the same topic twice replaces the handler. */
+    #define POLLEN_HANDLERS_MAX 32
+    typedef struct {
+        char             topic[POLLEN_TOPIC_MAX];
+        AmalgameClosure* fn;
+    } pollen_handler_t;
+    static pollen_handler_t _pollen_handlers[POLLEN_HANDLERS_MAX];
+    static int              _pollen_handler_n = 0;
+    static _Atomic long     _pollen_handler_calls = 0;
+
+    /* Caller holds the wf mutex. */
+    static AmalgameClosure* _pollen_handler_lookup(const char* topic) {
+        for (int i = 0; i < _pollen_handler_n; i++) {
+            if (strcmp(_pollen_handlers[i].topic, topic) == 0) return _pollen_handlers[i].fn;
+        }
+        return 0;
+    }
+
+    static int _pollen_on_topic_c(const char* topic, AmalgameClosure* fn) {
+        if (!topic || !topic[0] || strlen(topic) >= POLLEN_TOPIC_MAX) return 0;
+        int ok = 0;
+        pthread_mutex_lock(&_pollen_wf_mutex);
+        for (int i = 0; i < _pollen_handler_n; i++) {
+            if (strcmp(_pollen_handlers[i].topic, topic) == 0) {
+                _pollen_handlers[i].fn = fn; ok = 1; break;
+            }
+        }
+        if (!ok && _pollen_handler_n < POLLEN_HANDLERS_MAX) {
+            strcpy(_pollen_handlers[_pollen_handler_n].topic, topic);
+            _pollen_handlers[_pollen_handler_n].fn = fn;
+            _pollen_handler_n++;
+            ok = 1;
+        }
+        pthread_mutex_unlock(&_pollen_wf_mutex);
+        return ok;
+    }
+
     static void* _pollen_listener_worker(void* arg) {
         int fd = (int)(intptr_t) arg;
         char rbuf[16384];
@@ -367,12 +549,16 @@ import Amalgame.String
                  *   v3 active + topic matches an entry's `on:` : ACK + dispatch
                  *   v3 active + topic doesn't match           : drop, no ACK
                  *   v3 inactive (no workflow loaded)           : ACK (free-form fallback) */
+                /*   v0.4.0 : a topic with an OnTopic handler is
+                 *   consumed too (ACK + handler call), with or
+                 *   without a loaded workflow. */
                 int do_ack = 1;
                 int v3_handled = 0;
+                AmalgameClosure* app_handler = 0;
                 const char* v3_topic_gc = 0;
                 const char* v3_env_gc   = 0;
                 pthread_mutex_lock(&_pollen_wf_mutex);
-                if (_pollen_v3_active && _pollen_v3_entry_count > 0) {
+                {
                     const char* tp3 = _pollen_find(rbuf, line_len,
                                                      TOPIC_KEY, TOPIC_KEY_LEN);
                     int matched3 = 0;
@@ -386,7 +572,10 @@ import Amalgame.String
                             if (tlen3 < sizeof(tnt)) {
                                 memcpy(tnt, tp3, tlen3);
                                 tnt[tlen3] = 0;
-                                if (_pollen_v3_lookup_entry_by_topic(tnt) >= 0) {
+                                int want_v3 = _pollen_v3_active && _pollen_v3_entry_count > 0
+                                              && _pollen_v3_lookup_entry_by_topic(tnt) >= 0;
+                                AmalgameClosure* h = _pollen_handler_lookup(tnt);
+                                if (want_v3 || h) {
                                     /* GC-dup so the AM call after the
                                      * unlock has stable storage. */
                                     char* td = (char*) GC_MALLOC_ATOMIC(tlen3 + 1);
@@ -396,7 +585,8 @@ import Amalgame.String
                                         memcpy(ed, rbuf, line_len); ed[line_len] = 0;
                                         v3_topic_gc = td;
                                         v3_env_gc   = ed;
-                                        v3_handled  = 1;
+                                        v3_handled  = want_v3;
+                                        app_handler = h;
                                         matched3    = 1;
                                     }
                                 }
@@ -404,9 +594,9 @@ import Amalgame.String
                         }
                     }
                     /* v3 is loaded but this topic isn't consumed by any
-                     * entry → drop silently (no ACK), same shape as the
-                     * v2 dispatcher's "topic not in consumes" branch. */
-                    if (!matched3) {
+                     * entry nor handler → drop silently (no ACK), same
+                     * shape as the v2 "topic not in consumes" branch. */
+                    if (_pollen_v3_active && _pollen_v3_entry_count > 0 && !matched3) {
                         do_ack = 0;
                     }
                 }
@@ -444,6 +634,18 @@ import Amalgame.String
                     }
                 }
                 pthread_mutex_unlock(&_pollen_wf_mutex);
+
+                /* v0.4.0 — application handler (Pollen.OnTopic). Runs
+                 * outside the wf mutex, on this connection's worker
+                 * thread : handlers may run concurrently and may call
+                 * Pollen.Publish. Runs before the v3 entry, if any. */
+                if (app_handler && v3_env_gc) {
+                    atomic_fetch_add(&_pollen_msgs_handled, 1);
+                    atomic_fetch_add(&_pollen_inflight, 1);
+                    (void) AmalgameClosure_call1(app_handler, (void*) v3_env_gc);
+                    atomic_fetch_add(&_pollen_handler_calls, 1);
+                    atomic_fetch_sub(&_pollen_inflight, 1);
+                }
 
                 /* Phase 3d — v3 dispatch happens AFTER the mutex
                  * release. The dispatcher walks the AST, evaluates
@@ -510,23 +712,23 @@ import Amalgame.String
             }
         }
     worker_done:
-        close(fd);
+        _pollen_sock_close(fd);
         return NULL;
     }
 
     static int _pollen_listen_simple(int port) {
-        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        int srv = _pollen_socket();
         if (srv < 0) return -1;
         int one = 1;
-        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*) &one, sizeof(one));
         struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons((uint16_t) port);
         if (bind(srv, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            close(srv); return -1;
+            _pollen_sock_close(srv); return -1;
         }
-        if (listen(srv, 64) < 0) { close(srv); return -1; }
+        if (listen(srv, 64) < 0) { _pollen_sock_close(srv); return -1; }
         for (;;) {
             int conn = accept(srv, NULL, NULL);
             if (conn < 0) continue;
@@ -534,12 +736,12 @@ import Amalgame.String
             if (GC_pthread_create(&th, NULL,
                                 _pollen_listener_worker,
                                 (void*)(intptr_t) conn) != 0) {
-                close(conn); continue;
+                _pollen_sock_close(conn); continue;
             }
             GC_pthread_detach(th);
         }
         /* unreachable until we add a shutdown path */
-        close(srv);
+        _pollen_sock_close(srv);
         return 0;
     }
 
@@ -560,7 +762,7 @@ import Amalgame.String
             if (_pollen_shared_dir[0] && _pollen_cap_instance[0]) {
                 char dir[600];
                 snprintf(dir, sizeof(dir), "%s/capabilities", _pollen_shared_dir);
-                mkdir(dir, 0755);
+                _pollen_mkdir(dir);
 
                 /* actions[] from the v3 entries' `on:` topics — the
                  * topics this node will consume when a bus message
@@ -597,7 +799,7 @@ import Amalgame.String
                     }
                 }
             }
-            sleep(5);
+            _pollen_sleep_ms(5000);
         }
         return NULL;
     }
@@ -723,7 +925,7 @@ import Amalgame.String
                     pthread_mutex_unlock(&_pollen_reg_mutex);
                 }
             }
-            usleep(2000 * 1000);  /* 2s */
+            _pollen_sleep_ms(2000);  /* 2s */
         }
         return NULL;
     }
@@ -748,8 +950,8 @@ import Amalgame.String
             chosen = cand[0];
         } else if (nc >= 2) {
             unsigned int r1 = 0, r2 = 0;
-            getrandom(&r1, sizeof(r1), 0);
-            getrandom(&r2, sizeof(r2), 0);
+            _pollen_random(&r1, sizeof(r1));
+            _pollen_random(&r2, sizeof(r2));
             int i1 = cand[r1 % (unsigned) nc];
             int i2 = cand[r2 % (unsigned) nc];
             if (i1 == i2) i2 = cand[(r2 % (unsigned) nc + 1) % (unsigned) nc];
@@ -814,7 +1016,7 @@ import Amalgame.String
      * `buf` must hold at least 37 bytes (36 + NUL). */
     static void _pollen_gen_uuid(char* buf) {
         unsigned char b[16];
-        getrandom(b, 16, 0);
+        _pollen_random(b, 16);
         b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);
         b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);
         const char* hex = "0123456789abcdef";
@@ -851,16 +1053,16 @@ import Amalgame.String
                                      const char* data_json,
                                      char* out_mid) {
         if (!host || !topic_uuid || !data_json || !out_mid) return 0;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int fd = _pollen_socket();
         if (fd < 0) return 0;
         struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t) port);
         if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-            close(fd); return 0;
+            _pollen_sock_close(fd); return 0;
         }
         if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            close(fd); return 0;
+            _pollen_sock_close(fd); return 0;
         }
         _pollen_gen_uuid(out_mid);
 
@@ -874,16 +1076,16 @@ import Amalgame.String
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
         if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            close(fd); return 0;
+            _pollen_sock_close(fd); return 0;
         }
         ssize_t sent = 0;
         while (sent < env_len) {
             ssize_t n = send(fd, envelope + sent,
                              (size_t)(env_len - sent), MSG_NOSIGNAL);
-            if (n < 0) { close(fd); return 0; }
+            if (n < 0) { _pollen_sock_close(fd); return 0; }
             sent += n;
         }
-        close(fd);
+        _pollen_sock_close(fd);
         return 1;
     }
 
@@ -914,7 +1116,6 @@ import Amalgame.String
      * for the expected mid, 0 on connect/send/recv/timeout failure
      * or mid mismatch. `out_mid` always receives the minted UUID
      * (even on ACK failure) so the caller can log it. */
-    #include <poll.h>
     static int _pollen_publish_sync(const char* host, int port,
                                       const char* topic_uuid,
                                       int64_t topic_version,
@@ -922,16 +1123,16 @@ import Amalgame.String
                                       int timeout_ms,
                                       char* out_mid) {
         if (!host || !topic_uuid || !data_json || !out_mid) return 0;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int fd = _pollen_socket();
         if (fd < 0) return 0;
         struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t) port);
         if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-            close(fd); return 0;
+            _pollen_sock_close(fd); return 0;
         }
         if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            close(fd); return 0;
+            _pollen_sock_close(fd); return 0;
         }
         _pollen_gen_uuid(out_mid);
         char envelope[8192];
@@ -944,13 +1145,13 @@ import Amalgame.String
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
         if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            close(fd); return 0;
+            _pollen_sock_close(fd); return 0;
         }
         ssize_t sent = 0;
         while (sent < env_len) {
             ssize_t n = send(fd, envelope + sent,
                               (size_t)(env_len - sent), MSG_NOSIGNAL);
-            if (n < 0) { close(fd); return 0; }
+            if (n < 0) { _pollen_sock_close(fd); return 0; }
             sent += n;
         }
 
@@ -961,9 +1162,9 @@ import Amalgame.String
         int got_ack = 0;
         int remaining = timeout_ms > 0 ? timeout_ms : 5000;
         while (rlen < sizeof(rbuf) - 1) {
-            struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN;
+            /* readiness wait — _pollen_poll_in (WSAPoll on Windows) */
             int64_t start = _pollen_now_ms_c();
-            int pr = poll(&pfd, 1, remaining);
+            int pr = _pollen_poll_in(fd, remaining);
             if (pr <= 0) break;  /* timeout or error */
             ssize_t n = recv(fd, rbuf + rlen, sizeof(rbuf) - 1 - rlen, 0);
             if (n <= 0) break;
@@ -989,7 +1190,7 @@ import Amalgame.String
             remaining -= (int) elapsed;
             if (remaining <= 0) break;
         }
-        close(fd);
+        _pollen_sock_close(fd);
         return got_ack;
     }
 
@@ -1030,16 +1231,16 @@ import Amalgame.String
         if (empty) empty[0] = 0;
         if (!host || !topicUuid || !dataJson) return (code_string) empty;
 
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int fd = _pollen_socket();
         if (fd < 0) return (code_string) empty;
         struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t) port);
         if (inet_pton(AF_INET, (const char*) host, &addr.sin_addr) != 1) {
-            close(fd); return (code_string) empty;
+            _pollen_sock_close(fd); return (code_string) empty;
         }
         if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            close(fd); return (code_string) empty;
+            _pollen_sock_close(fd); return (code_string) empty;
         }
 
         char mid[37];
@@ -1063,21 +1264,20 @@ import Amalgame.String
             (const char*) dataJson, (long long) now,
             sess, md, mgr, bps);
         if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            close(fd); return (code_string) empty;
+            _pollen_sock_close(fd); return (code_string) empty;
         }
         ssize_t sent = 0;
         while (sent < env_len) {
             ssize_t n = send(fd, envelope + sent,
                              (size_t)(env_len - sent), MSG_NOSIGNAL);
-            if (n < 0) { close(fd); return (code_string) empty; }
+            if (n < 0) { _pollen_sock_close(fd); return (code_string) empty; }
             sent += n;
         }
         /* drain one ACK line (best-effort, short wait) */
-        struct timeval rtv = { 2, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+        _pollen_set_rcvtimeo(fd, 2000);
         char ackbuf[512];
         (void) recv(fd, ackbuf, sizeof(ackbuf), 0);
-        close(fd);
+        _pollen_sock_close(fd);
 
         char* out = (char*) GC_MALLOC_ATOMIC(37);
         if (!out) return (code_string) empty;
@@ -1762,6 +1962,18 @@ import Amalgame.String
         for (int i = 0; i < _pollen_v3_entry_count; i++) {
             const char* t = _pollen_v3_entries[i].on_topic;
             if (!t || !t[0]) continue;
+            int wrote = snprintf(out + off, cap - off,
+                                 "%s\"%s\"", (written == 0 ? "" : ","), t);
+            if (wrote <= 0 || (size_t) wrote >= cap - off) break;
+            off += (size_t) wrote;
+            written++;
+        }
+        /* v0.4.0 — OnTopic handlers are consumed topics too, so a
+         * remote `call` resolves to this node. Skip the ones a v3
+         * entry already advertises. */
+        for (int i = 0; i < _pollen_handler_n; i++) {
+            const char* t = _pollen_handlers[i].topic;
+            if (_pollen_v3_entry_count > 0 && _pollen_v3_lookup_entry_by_topic(t) >= 0) continue;
             int wrote = snprintf(out + off, cap - off,
                                  "%s\"%s\"", (written == 0 ? "" : ","), t);
             if (wrote <= 0 || (size_t) wrote >= cap - off) break;
@@ -3040,14 +3252,57 @@ public class Pollen {
     }
 
     // Block in the current thread, accepting MESSAGE envelopes on
-    // the given port and ACKing each one. One pthread per accepted
-    // connection. Does NOT yet dispatch per the workflow tree —
-    // forwarding lands with M2.3c (LoadWorkflow + tree walker).
-    // STATUS : real since v0.1.5 (M2.3b). For now this is an
-    // ACK-echo listener — useful for benchmarking + as the
-    // downstream-peer half of a publish smoke test.
+    // the given port. One thread per accepted connection. A message
+    // is ACKed and consumed when its topic has an OnTopic handler
+    // and/or a v3 entry (`on:`) ; with no workflow loaded, every
+    // message is ACKed. Unconsumed topics are dropped without ACK
+    // when a workflow is loaded.
     public static void StartListener(port: int) {
         @c { Amalgame_Pollen_Pollen_StartListener_c((int64_t) port); }
+    }
+
+    // v0.4.0 — consume `topic` with application code. The handler
+    // receives the raw envelope JSON line ; use EnvelopeData /
+    // EnvelopeTopic to read it. Called on the connection's worker
+    // thread (handlers can run concurrently — guard shared state),
+    // before the v3 entry for the same topic if there is one. The
+    // topic is advertised by StartCapabilityWriter, so `call` steps
+    // on other nodes resolve to this node. Register before
+    // StartListener. Same topic twice → the handler is replaced.
+    // Returns false if the topic is empty, too long (≥ 128 bytes)
+    // or the 32-handler table is full.
+    public static bool OnTopic(topic: string, handler: Closure<string, int>) {
+        var ok: bool = false
+        @c { ok = _pollen_on_topic_c(topic, (AmalgameClosure*) handler) != 0; }
+        return ok
+    }
+
+    // v0.4.0 — number of OnTopic handler invocations so far
+    // (tests + monitoring).
+    public static int HandlerCallCount() {
+        var n: int = 0
+        @c { n = (int64_t) atomic_load(&_pollen_handler_calls); }
+        return n
+    }
+
+    // v0.4.0 — the `data` payload of an envelope, re-encoded as JSON
+    // ("null" if absent or unparsable).
+    public static string EnvelopeData(envelope: string) {
+        let r: JsonResult = Json.Parse(envelope)
+        if (!r.Ok) { return "null" }
+        let env: JsonValue = r.Value
+        let data: JsonValue = env.Get("data")
+        return Json.Encode(data)
+    }
+
+    // v0.4.0 — the topic of an envelope ("" if absent).
+    public static string EnvelopeTopic(envelope: string) {
+        let r: JsonResult = Json.Parse(envelope)
+        if (!r.Ok) { return "" }
+        let env: JsonValue = r.Value
+        let topic: JsonValue = env.Get("topic")
+        let uuid: JsonValue = topic.Get("uuid")
+        return uuid.AsString()
     }
 
     // Phase 6.1 — advertise this node's capabilities. Spawns a

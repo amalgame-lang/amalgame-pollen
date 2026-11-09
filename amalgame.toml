@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.3.0"
+version           = "0.4.0"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v3 entries over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -119,6 +119,11 @@ EvalCond            = { returns = "code_bool" }
 
 # TCP transport
 StartListener       = { returns = "void" }
+# v0.4.0 — application topic handlers
+OnTopic             = { returns = "code_bool" }
+HandlerCallCount    = { returns = "i64" }
+EnvelopeData        = { returns = "code_string" }
+EnvelopeTopic       = { returns = "code_string" }
 StartCapabilityWriter = { returns = "void" }
 Publish             = { returns = "code_string" }
 PublishSync         = { returns = "code_string" }

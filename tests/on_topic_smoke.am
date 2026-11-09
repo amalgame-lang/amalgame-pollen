@@ -1,0 +1,69 @@
+// tests/on_topic_smoke.am — v0.4.0 Pollen.OnTopic end-to-end.
+//
+// One process : registers an application handler, starts the
+// listener on a worker thread, publishes to itself and checks
+//   1. PublishSync is ACKed for a handled topic
+//   2. the handler runs once with the right topic + data
+//   3. the topic is advertised in the capability file, so a
+//      `call` from another node resolves to this one.
+// Runs on Linux, macOS and Windows (Winsock).
+
+namespace PollenTests
+
+import Amalgame.Pollen
+import Amalgame.Threading
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    public static void Main(string[] args) {
+        let port: int = 18731
+        let ch = Threading.ChannelNew(8)
+
+        let reg: bool = Pollen.OnTopic("smoke.test", (env: string) => {
+            let d: string = Pollen.EnvelopeData(env)
+            let t: string = Pollen.EnvelopeTopic(env)
+            if (t == "smoke.test" && d == "{\"v\":42}") { Threading.ChannelSend(ch, 1) }
+            else { Threading.ChannelSend(ch, 2) }
+            return 0
+        })
+        Program.Check(reg, "OnTopic registers a handler")
+        Program.Check(!Pollen.OnTopic("", (env: string) => { return 0 }), "OnTopic rejects an empty topic")
+
+        Pollen.WorkflowSetSharedDir("./_on_topic_shared")
+        Pollen.WorkflowSetSelf("ontopic-test", "127.0.0.1", port)
+        Pollen.StartCapabilityWriter("ontopic-test", "127.0.0.1", port)
+        Pollen.StartCapabilityReader()
+
+        let listen = (_a: int) => {
+            Pollen.StartListener(port)
+            return 0
+        }
+        Threading.ThreadSpawn(listen, 0)
+        Threading.ThreadSleep(300)
+
+        let mid: string = Pollen.PublishSync("127.0.0.1", port, "smoke.test", 1, "{\"v\":42}", 3000)
+        Program.Check(String_Length(mid) > 0, "PublishSync to a handled topic is ACKed")
+
+        var waited: int = 0
+        while (Pollen.HandlerCallCount() < 1 && waited < 3000) {
+            Threading.ThreadSleep(50)
+            waited = waited + 50
+        }
+        Program.Check(Pollen.HandlerCallCount() == 1, "handler called exactly once")
+        if (Pollen.HandlerCallCount() >= 1) {
+            Program.Check(Threading.ChannelReceive(ch) == 1, "handler sees topic + data")
+        }
+
+        // Capability reader rescans every 2 s.
+        Threading.ThreadSleep(2600)
+        Program.Check(Pollen.ResolveProvider("smoke.test") == "127.0.0.1:" + String_FromInt(port),
+                      "handler topic is advertised and resolvable")
+    }
+}

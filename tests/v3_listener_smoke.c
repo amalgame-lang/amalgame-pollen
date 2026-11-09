@@ -21,6 +21,14 @@
 #include <arpa/inet.h>
 #include "_runtime.h"
 
+/* The listener runs Pollen code that allocates through the GC (the v3
+ * dispatcher, envelope copies) and spawns its workers with
+ * GC_pthread_create : it must itself run on a GC-registered thread,
+ * exactly like Pollen's own threads. A plain pthread_create crashes
+ * on recent libgc (8.2.12, Ubuntu 26.04 CI runners). */
+extern int GC_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+extern int GC_pthread_detach(pthread_t);
+
 extern void        Amalgame_Pollen_Pollen_StartListener(int64_t port);
 extern code_string Amalgame_Pollen_Pollen_Publish(code_string host, int64_t port,
                                                     code_string topicUuid,
@@ -113,11 +121,11 @@ int main(void) {
     static int port_stash;
     port_stash = port;
     pthread_t th;
-    if (pthread_create(&th, NULL, listener_thread, &port_stash) != 0) {
+    if (GC_pthread_create(&th, NULL, listener_thread, &port_stash) != 0) {
         fprintf(stderr, "FAIL : start listener thread\n");
         return 1;
     }
-    pthread_detach(th);
+    GC_pthread_detach(th);
     /* Let the listener bind + accept-loop spin up. */
     msleep(150);
 

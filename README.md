@@ -107,6 +107,24 @@ let n: int = Pollen.RegistrySize()
 let s: string = Pollen.ResolveProvider("data.fetch")  // "host:port" or ""
 ```
 
+### Application handlers (v0.4.0)
+
+Consume a topic with your own code, e.g. a historian writing to a
+database. The handler receives the raw envelope line ; it runs on the
+connection's worker thread (handlers can run concurrently), before
+the v3 entry for the same topic if there is one. Handler topics are
+advertised by `StartCapabilityWriter`, so `call` steps on other nodes
+resolve to this node.
+
+```amalgame
+Pollen.OnTopic("app.historian", (env: string) => {
+    let data: string  = Pollen.EnvelopeData(env)    // `data` as JSON
+    let topic: string = Pollen.EnvelopeTopic(env)
+    return 0
+})
+Pollen.StartListener(7000)
+```
+
 ### v3 dispatcher
 
 ```amalgame
@@ -136,13 +154,21 @@ for i in 0..n {
 The CEL-lite spec : `docs/proposals/pollen-v3-cel-lite.md`.
 The v3 dispatcher spec + validator rules : `docs/proposals/pollen-v3.md`.
 
-## Limitations (v0.3.x)
+## Platforms
+
+Linux, macOS / BSD and Windows (MinGW-w64). OS-specific calls are
+isolated in one `#ifdef _WIN32` block at the top of `facade.am`. On
+Windows, Winsock is loaded at runtime from `ws2_32.dll`, so the
+manifest's `libs` stays the same on every OS.
+
+## Limitations (v0.4.x)
 
 - Single-engine per process — multi-engine hosting (one process,
   two independent workflows on different port ranges) is unscheduled.
-- Mosaic bridge (`OnMessage` / `OnComplete` / `Forward`) was
-  v2-only and went with the dispatcher. The v3-shaped equivalent
-  (hook into `PollenDispatcher` step callbacks) is unscheduled.
+- `OnTopic` covers "run my code on a message". Hooks on individual
+  `PollenDispatcher` steps (the old v2 `OnComplete`) are unscheduled.
+- Payloads are plain JSON over TCP — run on a trusted network until
+  encryption lands.
 
 ## Publishing checklist
 
