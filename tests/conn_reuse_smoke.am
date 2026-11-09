@@ -18,6 +18,24 @@ import Amalgame.Collections
 import Amalgame.String
 import Amalgame.Console
 
+// What the handler saw : Next is the sequence number it expects,
+// InOrder / OutOfOrder count the messages. A class instance, not a
+// Threading channel : amc 0.8.52 stores a captured channel in an i64
+// slot, which gcc 14+ rejects (-Werror=int-conversion). The handler
+// runs on one listener worker at a time here (one pooled connection,
+// or spaced-out one-shot connections), so plain fields are enough.
+public class Seen {
+    public Next: int
+    public InOrder: int
+    public OutOfOrder: int
+
+    public Seen() {
+        this.Next = 0
+        this.InOrder = 0
+        this.OutOfOrder = 0
+    }
+}
+
 public class Program {
     public static void Check(bool ok, string what) {
         if (ok) { Console.WriteLine("[PASS] " + what) }
@@ -37,18 +55,14 @@ public class Program {
     public static void Main(string[] args) {
         let port: int = 18741
         let total: int = 2000
-        // The handler pushes 1 for each message that arrives in
-        // order, 0 otherwise. Messages carry {"i":<seq>}.
-        let ch = Threading.ChannelNew(total + 16)
-        let seq = Threading.ChannelNew(1)
-        Threading.ChannelSend(seq, 0)
+        // Messages carry {"i":<seq>}.
+        let seen: Seen = new Seen()
 
         Pollen.OnTopic("reuse.test", (env: string) => {
-            let want: int = Threading.ChannelReceive(seq)
             let d: string = Pollen.EnvelopeData(env)
-            if (d == "{\"i\":" + String_FromInt(want) + "}") { Threading.ChannelSend(ch, 1) }
-            else { Threading.ChannelSend(ch, 0) }
-            Threading.ChannelSend(seq, want + 1)
+            if (d == "{\"i\":" + String_FromInt(seen.Next) + "}") { seen.InOrder = seen.InOrder + 1 }
+            else { seen.OutOfOrder = seen.OutOfOrder + 1 }
+            seen.Next = seen.Next + 1
             return 0
         })
 
@@ -72,9 +86,7 @@ public class Program {
         Program.Check(Pollen.ConnectCount() - c0 == 1,
                       "one pooled connection for 2000 messages (got "
                       + String_FromInt(Pollen.ConnectCount() - c0) + ")")
-        var inOrder: int = 0
-        for i in 0..total { inOrder = inOrder + Threading.ChannelReceive(ch) }
-        Program.Check(inOrder == total, "messages arrive in order")
+        Program.Check(seen.InOrder == total && seen.OutOfOrder == 0, "messages arrive in order")
 
         // 3 — reuse off : no pooled connect, messages still delivered
         Pollen.SetConnectionReuse(false)
@@ -93,8 +105,6 @@ public class Program {
                        "{\"i\":" + String_FromInt(total + 5) + "}")
         Program.Check(Program.WaitCalls(total + 6), "reuse on again : message delivered")
         Program.Check(Pollen.ConnectCount() == c1 + 1, "reuse on again : one new connection")
-        var tail: int = 0
-        for i in 0..6 { tail = tail + Threading.ChannelReceive(ch) }
-        Program.Check(tail == 6, "later messages in order too")
+        Program.Check(seen.InOrder == total + 6 && seen.OutOfOrder == 0, "later messages in order too")
     }
 }

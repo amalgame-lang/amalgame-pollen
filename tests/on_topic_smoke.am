@@ -16,6 +16,19 @@ import Amalgame.Collections
 import Amalgame.String
 import Amalgame.Console
 
+// What the handler saw. A class instance, not a Threading channel :
+// amc 0.8.52 stores a captured channel in an i64 slot, which gcc 14+
+// rejects (-Werror=int-conversion).
+public class Seen {
+    public Good: int
+    public Bad: int
+
+    public Seen() {
+        this.Good = 0
+        this.Bad = 0
+    }
+}
+
 public class Program {
     public static void Check(bool ok, string what) {
         if (ok) { Console.WriteLine("[PASS] " + what) }
@@ -24,13 +37,13 @@ public class Program {
 
     public static void Main(string[] args) {
         let port: int = 18731
-        let ch = Threading.ChannelNew(8)
+        let seen: Seen = new Seen()
 
         let reg: bool = Pollen.OnTopic("smoke.test", (env: string) => {
             let d: string = Pollen.EnvelopeData(env)
             let t: string = Pollen.EnvelopeTopic(env)
-            if (t == "smoke.test" && d == "{\"v\":42}") { Threading.ChannelSend(ch, 1) }
-            else { Threading.ChannelSend(ch, 2) }
+            if (t == "smoke.test" && d == "{\"v\":42}") { seen.Good = seen.Good + 1 }
+            else { seen.Bad = seen.Bad + 1 }
             return 0
         })
         Program.Check(reg, "OnTopic registers a handler")
@@ -58,7 +71,7 @@ public class Program {
         }
         Program.Check(Pollen.HandlerCallCount() == 1, "handler called exactly once")
         if (Pollen.HandlerCallCount() >= 1) {
-            Program.Check(Threading.ChannelReceive(ch) == 1, "handler sees topic + data")
+            Program.Check(seen.Good == 1 && seen.Bad == 0, "handler sees topic + data")
         }
 
         // Capability reader rescans every 2 s.
