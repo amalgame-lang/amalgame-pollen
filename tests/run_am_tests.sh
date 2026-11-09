@@ -41,7 +41,16 @@ WORK="$(mktemp -d)"
 cd "$WORK"
 cp -r "$ROOT/examples" .
 : > amalgame.toml
-"$AMC" package add threading >/dev/null
+if ! "$AMC" package add threading@v0.1.0 >/dev/null 2>&1; then
+    # Offline (no access to GitHub) : pin the copy already in the cache.
+    cached=$(ls -d "$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-threading/v0.1.0_"* 2>/dev/null | head -1)
+    if [ -z "$cached" ]; then
+        echo "cannot install threading@v0.1.0 (offline, not in the cache)" >&2
+        exit 1
+    fi
+    printf '[dependencies.threading]\ngit = "github.com/amalgame-lang/amalgame-threading"\ntag = "v0.1.0"\n' > amalgame.toml
+    printf '[[package]]\nname = "threading"\ngit  = "github.com/amalgame-lang/amalgame-threading"\ntag  = "v0.1.0"\nrev  = "%s"\n' "${cached##*_}" > amalgame.lock
+fi
 cat >> amalgame.toml <<TOML
 
 [dependencies.pollen]

@@ -1,0 +1,115 @@
+// tests/outbox_smoke.am — v0.6.0 durable outbox (call on_error "buffer").
+//
+// One process. The workflow forwards `outbox.in` to the action `sink`
+// (topic outbox.sink) with on_error "buffer". Checks that
+//   1. with no provider for outbox.sink, 5 dispatched messages wait
+//      in the outbox (nothing lost, nothing sent)
+//   2. once a handler for outbox.sink is registered and advertised,
+//      the 5 messages are delivered, in order, and the outbox empties
+//   3. later messages go through the outbox straight away
+//   4. the validator rejects "buffer" with mode "all"
+// Runs on Linux, macOS and Windows (Winsock).
+
+namespace PollenTests
+
+import Amalgame.Pollen
+import Amalgame.Threading
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+// What the sink saw. A class instance, not a Threading channel :
+// amc 0.8.52 stores a captured channel in an i64 slot (gcc 14+ error).
+public class Seen {
+    public Next: int
+    public InOrder: int
+    public OutOfOrder: int
+
+    public Seen() {
+        this.Next = 0
+        this.InOrder = 0
+        this.OutOfOrder = 0
+    }
+}
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    public static bool WaitFor(n: int, ms: int) {
+        var waited: int = 0
+        while (Pollen.OutboxDelivered() < n && waited < ms) {
+            Threading.ThreadSleep(50)
+            waited = waited + 50
+        }
+        return Pollen.OutboxDelivered() >= n
+    }
+
+    public static void Main(string[] args) {
+        let port: int = 18761
+        let wf: string = "examples/workflow-v3-buffer.json"
+        let diags: List<string> = Pollen.WorkflowValidateV3(wf)
+        for d in diags { Console.WriteLine("  " + d) }
+        Program.Check(diags.Count() == 0, "buffer workflow validates")
+        Program.Check(Pollen.WorkflowLoadV3(wf), "buffer workflow loads")
+
+        Pollen.WorkflowSetSharedDir("./_outbox_shared")
+        Pollen.WorkflowSetSelf("outbox-test", "127.0.0.1", port)
+        Pollen.StartCapabilityWriter("outbox-test", "127.0.0.1", port)
+        Pollen.StartCapabilityReader()
+        let listen = (_a: int) => {
+            Pollen.SetListenAddress("127.0.0.1")
+            Pollen.StartListener(port)
+            return 0
+        }
+        Threading.ThreadSpawn(listen, 0)
+        Threading.ThreadSleep(300)
+
+        // 1 — no provider for outbox.sink yet
+        for i in 0..5 {
+            Pollen.WorkflowV3DispatchTopic("outbox.in", "{\"data\":{\"i\":" + String_FromInt(i) + "}}")
+        }
+        Threading.ThreadSleep(1500)
+        Program.Check(Pollen.OutboxPending() == 5, "5 messages wait in the outbox (got "
+                      + String_FromInt(Pollen.OutboxPending()) + ")")
+        Program.Check(Pollen.OutboxDelivered() == 0, "nothing delivered without a provider")
+
+        // 2 — the provider appears (advertised within ~5 s, read within ~2 s)
+        let seen: Seen = new Seen()
+        Pollen.OnTopic("outbox.sink", (env: string) => {
+            let d: string = Pollen.EnvelopeData(env)
+            if (String_Contains(d, "\"i\":" + String_FromInt(seen.Next) + ",")
+                || String_Contains(d, "\"i\":" + String_FromInt(seen.Next) + "}")) {
+                seen.InOrder = seen.InOrder + 1
+            } else {
+                seen.OutOfOrder = seen.OutOfOrder + 1
+            }
+            seen.Next = seen.Next + 1
+            return 0
+        })
+        Program.Check(Program.WaitFor(5, 15000), "the 5 waiting messages are delivered")
+        Program.Check(Pollen.OutboxPending() == 0, "outbox empty after delivery")
+        Threading.ThreadSleep(200)
+        Program.Check(seen.InOrder == 5 && seen.OutOfOrder == 0, "delivered in order")
+
+        // 3 — with the provider there, straight through
+        for i in 5..8 {
+            Pollen.WorkflowV3DispatchTopic("outbox.in", "{\"data\":{\"i\":" + String_FromInt(i) + "}}")
+        }
+        Program.Check(Program.WaitFor(8, 5000), "later messages delivered")
+        Threading.ThreadSleep(200)
+        Program.Check(seen.InOrder == 8 && seen.OutOfOrder == 0, "later messages in order")
+        Program.Check(Pollen.HandlerCallCount() == 8, "each message handled once (got "
+                      + String_FromInt(Pollen.HandlerCallCount()) + ")")
+
+        // 4 — buffer needs mode one
+        let errs: List<string> = Pollen.WorkflowValidateV3("examples/workflow-v3-buffer-all-invalid.json")
+        var rejected: bool = false
+        for e in errs {
+            if (String_Contains(e, "buffer")) { rejected = true }
+        }
+        Program.Check(rejected, "validator rejects buffer with mode all")
+    }
+}

@@ -381,6 +381,7 @@ Each `call` step accepts an optional `on_error` field:
 | `"log"` *(default)* | Emit a warning to the bus log, continue the message-chain past this step (the step is treated as if completed with no return value). |
 | `"fail"` | Abort the current message-chain immediately, emit an error log with the goto-chain context. The caller frame's `bind` key is left unset. |
 | `"drop"` | Silently skip the step (no log, no abort). For best-effort fan-out where missing providers are expected. |
+| `"buffer"` *(v0.6.0)* | Write the message to the node's durable outbox (`<sharedDir>/outbox/<node>/<topic>/`) and continue. A delivery thread sends it, in order, once a provider is in the registry, and deletes it when the provider ACKs it ; failed or unacknowledged sends are retried every second. At-least-once (consumers dedupe on the messageId). `mode: "one"` only. |
 
 For `mode: "all"` with 0 providers, the same policy applies (a
 broadcast to nobody is treated identically to a unicast that can't

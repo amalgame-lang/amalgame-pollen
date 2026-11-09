@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.6.0 — 2026-11-09
+
+### Added — durable outbox for `call` (`on_error: "buffer"`)
+
+A `call` step dropped its message when no provider was in the
+registry yet (the first seconds of a node), when the provider was
+restarting, or when the network was down. With `on_error: "buffer"`
+the message is written to disk first and deleted only when the
+provider ACKs it :
+
+```json
+{ "type": "call", "action": "historian", "on_error": "buffer" }
+```
+
+- Layout : `<sharedDir>/outbox/<node>/<topic>/<ms>-<seq>-<mid>.msg`,
+  written to a `.tmp` name and renamed. Names sort in creation order,
+  so each topic is a FIFO ; files left by a previous run go first.
+- One delivery thread per node sends each message on its own
+  connection and waits for its ACK (3 s), then deletes the file. The
+  first failure stops that topic until the next round (1 s later), so
+  an absent provider does not hold the other topics.
+- At-least-once : when an ACK is lost the message is sent again with
+  the same messageId. `Pollen.EnvelopeMessageId(env)` lets a consumer
+  drop repeats.
+- The ACK comes from the provider's listener when the message is
+  received, before its handler runs : a consumer that buffers in
+  memory can still lose what it had not stored when it crashes.
+- `buffer` needs `mode: "one"` (one provider ACKs each message) ; the
+  validator rejects it with `mode: "all"`. Without a shared dir, a
+  buffered call is sent directly, as with `log`.
+- `Pollen.OutboxPending()`, `Pollen.OutboxDelivered()`.
+- Measured in the Kairo socle : historian stopped for 8 s during a
+  40 s run, all 41 cycles (369 measures) stored, no duplicate.
+
+### Added — `Pollen.SetListenAddress(host)`
+
+Binds the next `StartListener` to one IPv4 address. Default is every
+interface, as before. `"127.0.0.1"` keeps a node local : nothing
+reachable from the network, and no Windows firewall prompt (which
+needs an administrator). The smoke tests now listen on 127.0.0.1.
+
+### Fixed — capability file never refreshed on Windows
+
+The capability writer renames a `.tmp` file over the previous one
+every 5 s. `rename()` does not replace an existing file on Windows,
+so the file kept its first content : topics registered after the
+first write (an `OnTopic` handler added later, the load figures) were
+never advertised, and `call` steps on other nodes could not resolve
+them. Now `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on Windows.
+
+### Tests
+
+- `tests/outbox_smoke.am` : 5 messages wait while no provider exists,
+  are delivered in order once one appears, later ones go straight
+  through, each handled once ; `buffer` + `mode: "all"` rejected.
+- `tests/run_am_tests.sh` pins `threading@v0.1.0`, and uses the copy
+  already in the amc cache when GitHub cannot be reached.
+
 ## v0.5.0 — 2026-11-09
 
 ### Changed — `Publish` and `call` reuse one TCP connection per peer

@@ -9,6 +9,11 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.6.0** — durable outbox for `call` steps (`on_error: "buffer"`) :
+nothing lost while the provider is absent or restarting, at-least-once
+delivery in order. `SetListenAddress` to keep a node local. Capability
+file refreshed on Windows.
+
 **v0.5.0** — `Publish` and workflow `call` steps keep one TCP
 connection per peer (2000 local messages : 91 ms instead of 20.5 s),
 in order. CI now runs the Amalgame-side suites too.
@@ -77,7 +82,8 @@ Smoke suites in CI (`tests/run_tests.sh` for C-side, `tests/run_am_tests.sh` for
 - **v3_listener_smoke** — 7 assertions (real TCP socket + topic→entry routing + dispatch count)
 - **on_topic_smoke** — `OnTopic` handler, ACK, capability advertisement
 - **conn_reuse_smoke** — 2000 publishes over one pooled connection, in order ; reuse off / on
-- **header_consumer_check** — 41 public symbols verified
+- **outbox_smoke** — buffered `call` waits for a provider, delivered in order, each once ; `buffer` + `mode: "all"` rejected
+- **header_consumer_check** — 45 public symbols verified
 - **listener_smoke** + **publish_smoke** — TCP transport baseline
 
 ## API surface
@@ -98,6 +104,7 @@ let mid: string = Pollen.Publish("127.0.0.1", 8000,
 let mid2: string = Pollen.PublishSync(host, port, topic, ver, data, 5000)
 
 // Server side — accept loop, one pthread per connection
+Pollen.SetListenAddress("127.0.0.1")   // optional (v0.6.0) : local only
 Pollen.StartListener(8000)
 ```
 
@@ -105,6 +112,26 @@ Pollen.StartListener(8000)
 peer (v0.5.0) : messages to a peer arrive in order, without a
 handshake each. `Pollen.SetConnectionReuse(false)` goes back to one
 connection per message ; `PublishSync` always uses its own.
+
+### Durable outbox (v0.6.0)
+
+A `call` step with `on_error: "buffer"` writes its message to
+`<sharedDir>/outbox/<node>/<topic>/` and deletes it only when the
+provider ACKs it. Messages wait while no provider is in the registry,
+while it restarts or while the network is down, and go out in their
+original order, one FIFO per topic ; a restarted node sends what it
+left on disk first.
+
+```json
+{ "type": "call", "action": "historian", "mode": "one", "on_error": "buffer" }
+```
+
+Delivery is at-least-once : a message whose ACK was lost comes again
+with the same messageId, so a consumer that must not count twice
+keeps the recent `Pollen.EnvelopeMessageId(env)` values. The ACK is
+sent when the provider's listener receives the message, before its
+handler runs. `Pollen.OutboxPending()` and `Pollen.OutboxDelivered()`
+give the state of the outbox.
 
 ### Capability discovery + load balancer (Phase 6.1-6.3)
 
@@ -175,7 +202,7 @@ isolated in one `#ifdef _WIN32` block at the top of `facade.am`. On
 Windows, Winsock is loaded at runtime from `ws2_32.dll`, so the
 manifest's `libs` stays the same on every OS.
 
-## Limitations (v0.5.x)
+## Limitations (v0.6.x)
 
 - Single-engine per process — multi-engine hosting (one process,
   two independent workflows on different port ranges) is unscheduled.
