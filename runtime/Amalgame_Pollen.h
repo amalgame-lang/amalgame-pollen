@@ -79,6 +79,11 @@ void        Amalgame_Pollen_Pollen_SetLoadBalance(code_bool on);
 int64_t     Amalgame_Pollen_Pollen_RegistrySize(void);
 code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
 
+/* v0.5.0 — Publish / call keep one TCP connection per peer (default
+ * on) ; ConnectCount counts pooled connects, for tests. */
+void        Amalgame_Pollen_Pollen_SetConnectionReuse(code_bool on);
+int64_t     Amalgame_Pollen_Pollen_ConnectCount(void);
+
 /* === Pollen v3 — workflow validator + loader =================== */
 
 /* Returns a List<string> of diagnostics ("[severity ruleN] path:

@@ -36,6 +36,8 @@ int main(void) {
         (void*) &Amalgame_Pollen_Pollen_SetLoadBalance,
         (void*) &Amalgame_Pollen_Pollen_RegistrySize,
         (void*) &Amalgame_Pollen_Pollen_ResolveProvider,
+        (void*) &Amalgame_Pollen_Pollen_SetConnectionReuse,
+        (void*) &Amalgame_Pollen_Pollen_ConnectCount,
         (void*) &Amalgame_Pollen_Pollen_Publish,
         (void*) &Amalgame_Pollen_Pollen_PublishSync,
         /* v3 validator + loader */

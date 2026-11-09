@@ -44,3 +44,9 @@ jobs:
 
       - name: Run smoke tests
         run: ./tests/run_tests.sh "$AMC"
+
+      # The Amalgame-side suites (CEL-lite, v3 validator / loader /
+      # dispatcher, OnTopic, connection reuse), built against the
+      # working tree staged as a dev package.
+      - name: Run Amalgame smoke tests
+        run: bash ./tests/run_am_tests.sh "$AMC"
