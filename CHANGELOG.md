@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.4.0 — unreleased
+
+### Added — application topic handlers (`Pollen.OnTopic`)
+
+v0.2.0 retired the v2 Mosaic bridge (`OnMessage` / `OnComplete`), so
+since then a node could only consume a topic through a workflow
+entry. A service that must run its own code on a message (a
+historian writing to a database, a bridge to another system) had no
+hook. v0.4.0 adds one, shaped for v3 :
+
+```amalgame
+Pollen.OnTopic("app.historian", (env: string) => {
+    let data: string = Pollen.EnvelopeData(env)   // the `data` payload, as JSON
+    // ... write to DuckDB ...
+    return 0
+})
+Pollen.StartCapabilityWriter("historian", "10.0.0.5", 7000)
+Pollen.StartListener(7000)
+```
+
+- `Pollen.OnTopic(topic, Closure<string, int>) -> bool` — the handler
+  gets the raw envelope line. Runs on the connection's worker thread,
+  outside the wf mutex (handlers may run concurrently and may
+  `Publish`), before the v3 entry for the same topic if there is one.
+  Up to 32 handlers ; re-registering a topic replaces its handler.
+- The listener ACKs a message when its topic has a handler, with or
+  without a loaded workflow (before : dropped without ACK when a
+  workflow was loaded and no entry matched).
+- Handler topics are advertised in the capability file, so a `call`
+  on another node resolves to this one through the registry.
+- `Pollen.EnvelopeData(env)`, `Pollen.EnvelopeTopic(env)`,
+  `Pollen.HandlerCallCount()`.
+- `tests/on_topic_smoke.am` — end-to-end : register, listen, publish
+  to self, ACK, handler payload, capability advertisement + resolve.
+
+### Portability — Windows (MinGW-w64), macOS / BSD
+
+The C side used POSIX sockets and Linux-only calls directly, so the
+package did not compile on Windows. All OS-specific calls now go
+through `_pollen_*` helpers in one `#ifdef _WIN32` block :
+
+- sockets : Winsock2 on Windows, resolved at runtime from
+  `ws2_32.dll` — amc's `[stdlib].libs` has no per-OS form yet, and
+  adding `ws2_32` there would break the Linux / macOS link ;
+  `closesocket`, `WSAPoll`, `DWORD` receive timeout ;
+- `getrandom()` (Linux-only) → `/dev/urandom` on POSIX,
+  `RtlGenRandom` on Windows ;
+- `mkdir(p, 0755)` → `_mkdir` ; `sleep` / `usleep` → `Sleep` ;
+- `SO_NOSIGPIPE` set where it exists (macOS / BSD lack `MSG_NOSIGNAL`).
+
+Verified with amc 0.8.90 on Windows 11 (MinGW-w64 gcc 13.2) and
+Linux (Ubuntu 24.04, gcc 13.3) : `on_topic_smoke` 6/6,
+`cel_lite_smoke`, `v3_validator_smoke`, `v3_loader_smoke`,
+`v3_dispatch_smoke` all green on both. macOS : not run (no host).
+
 ## v0.3.0 — 2026-05-30
 
 ### Internal — deep cleanup of dead v2 C helpers (Phase 6 follow-up)
