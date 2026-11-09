@@ -84,6 +84,14 @@ code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
 void        Amalgame_Pollen_Pollen_SetConnectionReuse(code_bool on);
 int64_t     Amalgame_Pollen_Pollen_ConnectCount(void);
 
+/* v0.6.0 — durable outbox for `call` steps with on_error "buffer" :
+ * messages waiting for a provider's ACK, and delivered since start.
+ * EnvelopeMessageId lets a consumer dedupe a message sent again. */
+void        Amalgame_Pollen_Pollen_SetListenAddress(code_string host);
+int64_t     Amalgame_Pollen_Pollen_OutboxPending(void);
+int64_t     Amalgame_Pollen_Pollen_OutboxDelivered(void);
+code_string Amalgame_Pollen_Pollen_EnvelopeMessageId(code_string envelope);
+
 /* === Pollen v3 — workflow validator + loader =================== */
 
 /* Returns a List<string> of diagnostics ("[severity ruleN] path:

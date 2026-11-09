@@ -1,0 +1,18 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-buffer-demo",
+  "version": 1,
+  "actions": {
+    "sink": { "topic": "outbox.sink" }
+  },
+  "entries": [
+    {
+      "name": "forward",
+      "on":   "outbox.in",
+      "do":   [
+        { "type": "set", "key": "state.i", "value": "msg.data.i" },
+        { "type": "call", "action": "sink", "on_error": "buffer" }
+      ]
+    }
+  ]
+}

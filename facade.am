@@ -121,6 +121,8 @@ import Amalgame.String
     #define htons(v)                 _pollen_htons((uint16_t)(v))
     #define htonl(v)                 _pollen_htonl((uint32_t)(v))
     static int  _pollen_sock_close(int fd) { return closesocket((SOCKET) fd); }
+    /* rename() over an existing file fails on Windows : replace it explicitly. */
+    static int  _pollen_replace(const char* from, const char* to) { return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING) ? 0 : -1; }
     static int  _pollen_sock_shutdown(int fd) { return _pollen_ws.shutdown((SOCKET) fd, SD_BOTH); }
     static int  _pollen_mkdir(const char* p) { return _mkdir(p); }
     static void _pollen_random(void* buf, size_t n) { SystemFunction036(buf, (ULONG) n); }
@@ -145,6 +147,7 @@ import Amalgame.String
     #  endif
     static void _pollen_net_init(void) {}
     static int  _pollen_sock_close(int fd) { return close(fd); }
+    static int  _pollen_replace(const char* from, const char* to) { return rename(from, to); }
     static int  _pollen_sock_shutdown(int fd) { return shutdown(fd, SHUT_RDWR); }
     static int  _pollen_mkdir(const char* p) { return mkdir(p, 0755); }
     static void _pollen_random(void* buf, size_t n) {
@@ -720,6 +723,17 @@ import Amalgame.String
         return NULL;
     }
 
+    /* v0.6.0 — address the listener binds to ("" = every interface).
+     * "127.0.0.1" keeps a node local : no firewall prompt on Windows,
+     * nothing reachable from the network. */
+    static char _pollen_listen_addr[64] = "";
+
+    static void Amalgame_Pollen_Pollen_SetListenAddress_c(const char* host) {
+        if (!host) host = "";
+        strncpy(_pollen_listen_addr, host, sizeof(_pollen_listen_addr) - 1);
+        _pollen_listen_addr[sizeof(_pollen_listen_addr) - 1] = 0;
+    }
+
     static int _pollen_listen_simple(int port) {
         int srv = _pollen_socket();
         if (srv < 0) return -1;
@@ -728,6 +742,10 @@ import Amalgame.String
         struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (_pollen_listen_addr[0] && strcmp(_pollen_listen_addr, "0.0.0.0") != 0
+            && inet_pton(AF_INET, _pollen_listen_addr, &addr.sin_addr) != 1) {
+            _pollen_sock_close(srv); return -1;     /* not an IPv4 address */
+        }
         addr.sin_port = htons((uint16_t) port);
         if (bind(srv, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
             _pollen_sock_close(srv); return -1;
@@ -798,8 +816,7 @@ import Amalgame.String
                     if (fd >= 0) {
                         ssize_t w = write(fd, buf, (size_t) n);
                         close(fd);
-                        if (w == (ssize_t) n) { rename(tmp, path); }
-                        else { unlink(tmp); }
+                        if (w != (ssize_t) n || _pollen_replace(tmp, path) != 0) { unlink(tmp); }
                     }
                 }
             }
@@ -1541,7 +1558,7 @@ import Amalgame.String
     typedef struct {
         uint8_t  kind;
         uint8_t  mode;          /* call.mode : 0=one  1=all */
-        uint8_t  on_error;      /* call.on_error : 0=log 1=fail 2=drop */
+        uint8_t  on_error;      /* call.on_error : 0=log 1=fail 2=drop 3=buffer */
         uint8_t  has_else;      /* CASE node : 1 if `else: true` */
         int32_t  child0;        /* container body head ; CASE → body head */
         int32_t  child1;        /* reserved for future use */
@@ -2099,6 +2116,316 @@ import Amalgame.String
         return sent;
     }
 
+    /* === v0.6.0 — durable outbox for `call` (on_error: "buffer") ===
+     *
+     * A buffered call is written to disk before it is sent, and the
+     * file is deleted only when the provider ACKs it. Nothing is lost
+     * when the provider is absent (not in the registry yet), restarts,
+     * or the network drops, nor when this node restarts : files left
+     * on disk go first. Delivery is at-least-once : if an ACK is lost,
+     * the message is sent again with the same messageId, so consumers
+     * that must not count twice dedupe on it (Pollen.EnvelopeMessageId).
+     *
+     * Layout : <sharedDir>/outbox/<node>/<topic>/<ms>-<seq>-<mid>.msg,
+     * line 1 = topic, line 2 = the envelope. Names sort in creation
+     * order, so each topic directory is a FIFO. Files are written to
+     * a .tmp name and renamed, so a crash never leaves half a message.
+     *
+     * One delivery thread for the node. Each round it walks every
+     * topic directory in order and sends its messages one by one on
+     * its own connection, waiting for each ACK ; the first failure
+     * stops that topic until the next round (1 s later), so one absent
+     * provider does not hold the other topics. The ACK is sent by the
+     * provider's listener when the message is received, before the
+     * provider's handler runs : a consumer that buffers in memory can
+     * still lose what it had not stored when it crashes. */
+    #define POLLEN_OUTBOX_ACK_MS 3000
+    static char            _pollen_outbox_dir[700] = "";
+    static pthread_mutex_t _pollen_outbox_mu = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t  _pollen_outbox_cv = PTHREAD_COND_INITIALIZER;
+    static int             _pollen_outbox_started = 0;
+    static _Atomic long    _pollen_outbox_seq = 0;
+    static _Atomic long    _pollen_outbox_pending = 0;
+    static _Atomic long    _pollen_outbox_delivered = 0;
+
+    /* Topic → directory name : keep [A-Za-z0-9._-], map the rest to '_'. */
+    static void _pollen_outbox_topic_dir(const char* topic, char* out, size_t cap) {
+        size_t n = 0;
+        for (const char* p = topic; *p && n + 1 < cap; p++) {
+            char ch = *p;
+            int ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                  || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+            out[n++] = ok ? ch : '_';
+        }
+        out[n] = 0;
+    }
+
+    /* <sharedDir>/outbox/<node>, created on first use. 0 if no sharedDir. */
+    static int _pollen_outbox_root(void) {
+        if (_pollen_outbox_dir[0]) return 1;
+        if (!_pollen_shared_dir[0]) return 0;
+        char node[80];
+        _pollen_outbox_topic_dir(_pollen_pkg_role[0] ? _pollen_pkg_role : "node", node, sizeof(node));
+        char d[700];
+        snprintf(d, sizeof(d), "%s/outbox", _pollen_shared_dir);
+        _pollen_mkdir(d);
+        snprintf(_pollen_outbox_dir, sizeof(_pollen_outbox_dir), "%s/outbox/%s", _pollen_shared_dir, node);
+        _pollen_mkdir(_pollen_outbox_dir);
+        return 1;
+    }
+
+    static int _pollen_outbox_has_suffix(const char* s, const char* suf) {
+        size_t a = strlen(s), b = strlen(suf);
+        return a >= b && strcmp(s + a - b, suf) == 0;
+    }
+
+    static int _pollen_outbox_cmp(const void* a, const void* b) {
+        return strcmp(*(char* const*) a, *(char* const*) b);
+    }
+
+    /* Sorted names in `dir` : directories when want_dirs, else *.msg
+     * files. Caller frees each name and the array. */
+    static char** _pollen_outbox_list(const char* dir, int want_dirs, int* count) {
+        *count = 0;
+        DIR* d = opendir(dir);
+        if (!d) return 0;
+        int cap = 64, n = 0;
+        char** names = (char**) malloc(sizeof(char*) * cap);
+        struct dirent* e;
+        while (names && (e = readdir(d)) != 0) {
+            if (e->d_name[0] == '.') continue;
+            char full[1024];
+            snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+            struct stat st;
+            if (stat(full, &st) != 0) continue;
+            int is_dir = S_ISDIR(st.st_mode);
+            if (want_dirs ? !is_dir : (is_dir || !_pollen_outbox_has_suffix(e->d_name, ".msg"))) continue;
+            if (n == cap) {
+                cap *= 2;
+                char** grown = (char**) realloc(names, sizeof(char*) * cap);
+                if (!grown) break;
+                names = grown;
+            }
+            names[n] = strdup(e->d_name);
+            if (names[n]) n++;
+        }
+        closedir(d);
+        if (names && n > 1) qsort(names, (size_t) n, sizeof(char*), _pollen_outbox_cmp);
+        *count = n;
+        return names;
+    }
+
+    static void _pollen_outbox_free(char** names, int n) {
+        for (int i = 0; i < n; i++) free(names[i]);
+        free(names);
+    }
+
+    /* Whole file into a malloc'd, NUL-terminated buffer (0 on error). */
+    static char* _pollen_outbox_read(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) return 0;
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char* buf = (len >= 0) ? (char*) malloc((size_t) len + 1) : 0;
+        if (buf && fread(buf, 1, (size_t) len, f) != (size_t) len) { free(buf); buf = 0; }
+        fclose(f);
+        if (buf) buf[len] = 0;
+        return buf;
+    }
+
+    /* The delivery thread's connection. */
+    static int  _pollen_outbox_fd = -1;
+    static char _pollen_outbox_peer[POLLEN_HOST_MAX + 8] = "";
+
+    static void _pollen_outbox_disconnect(void) {
+        if (_pollen_outbox_fd >= 0) { _pollen_sock_close(_pollen_outbox_fd); _pollen_outbox_fd = -1; }
+        _pollen_outbox_peer[0] = 0;
+    }
+
+    /* Send `env` (one line, \n-terminated) to host:port and wait for
+     * the ACK of `mid`. Returns 1 when ACKed. */
+    static int _pollen_outbox_send(const char* host, int port, const char* env, const char* mid) {
+        char peer[POLLEN_HOST_MAX + 8];
+        snprintf(peer, sizeof(peer), "%s:%d", host, port);
+        if (_pollen_outbox_fd >= 0 && strcmp(peer, _pollen_outbox_peer) != 0) _pollen_outbox_disconnect();
+        if (_pollen_outbox_fd < 0) {
+            int fd = _pollen_socket();
+            if (fd < 0) return 0;
+            struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((uint16_t) port);
+            if (inet_pton(AF_INET, host, &addr.sin_addr) != 1
+                || connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+                _pollen_sock_close(fd); return 0;
+            }
+            int one = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof(one));
+            _pollen_outbox_fd = fd;
+            strcpy(_pollen_outbox_peer, peer);
+        }
+        size_t len = strlen(env), sent = 0;
+        while (sent < len) {
+            ssize_t w = send(_pollen_outbox_fd, env + sent, len - sent, MSG_NOSIGNAL);
+            if (w <= 0) { _pollen_outbox_disconnect(); return 0; }
+            sent += (size_t) w;
+        }
+        /* Read lines until the ACK of `mid` (a late ACK of an earlier
+         * attempt may come first) or the deadline. */
+        char rbuf[4096];
+        size_t rlen = 0;
+        int64_t deadline = _pollen_now_ms_c() + POLLEN_OUTBOX_ACK_MS;
+        for (;;) {
+            int left = (int) (deadline - _pollen_now_ms_c());
+            if (left <= 0 || _pollen_poll_in(_pollen_outbox_fd, left) <= 0) break;
+            ssize_t n = recv(_pollen_outbox_fd, rbuf + rlen, sizeof(rbuf) - 1 - rlen, 0);
+            if (n <= 0) break;
+            rlen += (size_t) n;
+            rbuf[rlen] = 0;
+            char* nl;
+            while ((nl = memchr(rbuf, '\n', rlen)) != 0) {
+                size_t line_len = (size_t) (nl - rbuf);
+                const char* mp = _pollen_find(rbuf, line_len, "\"messageId\":\"", 13);
+                int match = mp && (size_t) (mp + 13 - rbuf) + 36 <= line_len && memcmp(mp + 13, mid, 36) == 0;
+                memmove(rbuf, nl + 1, rlen - line_len - 1);
+                rlen -= line_len + 1;
+                if (match) return 1;
+            }
+            if (rlen >= sizeof(rbuf) - 1) rlen = 0;   /* oversize line : drop */
+        }
+        _pollen_outbox_disconnect();   /* timeout or closed : start clean next time */
+        return 0;
+    }
+
+    /* Deliver the messages of one topic directory, in order. Returns
+     * the number delivered ; stops at the first failure. */
+    static int _pollen_outbox_drain_topic(const char* tdir) {
+        int n = 0, done = 0;
+        char** files = _pollen_outbox_list(tdir, 0, &n);
+        for (int i = 0; i < n; i++) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", tdir, files[i]);
+            char* content = _pollen_outbox_read(path);
+            char* nl = content ? strchr(content, '\n') : 0;
+            if (!nl) {                                   /* unreadable : skip it */
+                free(content); remove(path);
+                atomic_fetch_sub(&_pollen_outbox_pending, 1);
+                continue;
+            }
+            *nl = 0;
+            const char* topic = content;
+            const char* env = nl + 1;
+            /* messageId = the 36 chars after the second '-' of the name. */
+            const char* mid = strchr(files[i], '-');
+            mid = mid ? strchr(mid + 1, '-') : 0;
+            char host[POLLEN_HOST_MAX]; int port = 0;
+            int ok = mid && strlen(mid + 1) >= 36
+                  && _pollen_lb_pick(topic, host, sizeof(host), &port)
+                  && _pollen_outbox_send(host, port, env, mid + 1);
+            free(content);
+            if (!ok) break;
+            remove(path);
+            atomic_fetch_sub(&_pollen_outbox_pending, 1);
+            atomic_fetch_add(&_pollen_outbox_delivered, 1);
+            done++;
+        }
+        _pollen_outbox_free(files, n);
+        return done;
+    }
+
+    /* Messages left on disk by a previous run. Called once, before the
+     * delivery thread starts and before this run writes anything. */
+    static long _pollen_outbox_count_left_over(void) {
+        int nt = 0;
+        char** topics = _pollen_outbox_list(_pollen_outbox_dir, 1, &nt);
+        long left_over = 0;
+        for (int t = 0; t < nt; t++) {
+            char tdir[1024]; int nf = 0;
+            snprintf(tdir, sizeof(tdir), "%s/%s", _pollen_outbox_dir, topics[t]);
+            char** files = _pollen_outbox_list(tdir, 0, &nf);
+            left_over += nf;
+            _pollen_outbox_free(files, nf);
+        }
+        _pollen_outbox_free(topics, nt);
+        return left_over;
+    }
+
+    static void* _pollen_outbox_thread(void* arg) {
+        (void) arg;
+        int nt = 0;
+        char** topics = 0;
+        for (;;) {
+            if (atomic_load(&_pollen_outbox_pending) > 0) {
+                topics = _pollen_outbox_list(_pollen_outbox_dir, 1, &nt);
+                for (int t = 0; t < nt; t++) {
+                    char tdir[1024];
+                    snprintf(tdir, sizeof(tdir), "%s/%s", _pollen_outbox_dir, topics[t]);
+                    (void) _pollen_outbox_drain_topic(tdir);
+                }
+                _pollen_outbox_free(topics, nt);
+            }
+            /* Sleep until a new message or 1 s (retry of what failed). */
+            pthread_mutex_lock(&_pollen_outbox_mu);
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 1;
+            pthread_cond_timedwait(&_pollen_outbox_cv, &_pollen_outbox_mu, &until);
+            pthread_mutex_unlock(&_pollen_outbox_mu);
+        }
+        return NULL;
+    }
+
+    /* Write one buffered call to disk and wake the delivery thread.
+     * Returns 1 on success, 0 when there is no sharedDir or the write
+     * failed (the caller then sends directly). */
+    static int _pollen_outbox_put(const char* topic, const char* data_json) {
+        pthread_mutex_lock(&_pollen_outbox_mu);
+        int ok = _pollen_outbox_root();
+        if (ok && !_pollen_outbox_started) {
+            atomic_fetch_add(&_pollen_outbox_pending, _pollen_outbox_count_left_over());
+            pthread_t th;
+            if (pthread_create(&th, NULL, _pollen_outbox_thread, NULL) == 0) {
+                pthread_detach(th);
+                _pollen_outbox_started = 1;
+            } else ok = 0;
+        }
+        pthread_mutex_unlock(&_pollen_outbox_mu);
+        if (!ok) return 0;
+
+        char tname[POLLEN_TOPIC_MAX], tdir[1024];
+        _pollen_outbox_topic_dir(topic, tname, sizeof(tname));
+        snprintf(tdir, sizeof(tdir), "%s/%s", _pollen_outbox_dir, tname);
+        _pollen_mkdir(tdir);
+
+        char mid[37];
+        _pollen_gen_uuid(mid);
+        int64_t now = _pollen_now_ms_c();
+        long seq = atomic_fetch_add(&_pollen_outbox_seq, 1) % 1000000;
+        char name[1100], tmp[1110];
+        snprintf(name, sizeof(name), "%s/%013lld-%06ld-%s.msg", tdir, (long long) now, seq, mid);
+        snprintf(tmp, sizeof(tmp), "%s.tmp", name);
+        FILE* f = fopen(tmp, "wb");
+        if (!f) return 0;
+        int w = fprintf(f, "%s\n{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+                           "\"type\":\"MESSAGE\",\"topic\":{\"uuid\":\"%s\",\"version\":1},"
+                           "\"data\":%s,\"timestamp\":%lld}\n",
+                        topic, mid, mid, topic, data_json, (long long) now);
+        int closed = fclose(f);
+        if (w <= 0 || closed != 0 || rename(tmp, name) != 0) { remove(tmp); return 0; }
+        atomic_fetch_add(&_pollen_outbox_pending, 1);
+        pthread_mutex_lock(&_pollen_outbox_mu);
+        pthread_cond_signal(&_pollen_outbox_cv);
+        pthread_mutex_unlock(&_pollen_outbox_mu);
+        return 1;
+    }
+
+    static int64_t Amalgame_Pollen_Pollen_OutboxPending_c(void) {
+        return (int64_t) atomic_load(&_pollen_outbox_pending);
+    }
+    static int64_t Amalgame_Pollen_Pollen_OutboxDelivered_c(void) {
+        return (int64_t) atomic_load(&_pollen_outbox_delivered);
+    }
+
     /* Top-level entry point invoked by the AM StepCall handler. */
     static int _pollen_v3_call_action(const char* action_name,
                                         int mode, int on_error,
@@ -2110,6 +2437,11 @@ import Amalgame.String
             if (on_error == 1) return -1;
             return 0;
         }
+
+        /* v0.6.0 — on_error=buffer : to the durable outbox. The
+         * validator rejects buffer with mode=all. Without a sharedDir
+         * (or if the write fails) fall back to a direct send. */
+        if (on_error == 3 && mode == 0 && _pollen_outbox_put(topic, data_json)) return 1;
 
         if (mode == 1) {
             /* mode=all */
@@ -3467,6 +3799,13 @@ public class Pollen {
         @c { Amalgame_Pollen_Pollen_StartListener_c((int64_t) port); }
     }
 
+    // v0.6.0 — bind the next StartListener to one IPv4 address.
+    // Default "" (every interface). "127.0.0.1" keeps the node local :
+    // nothing reachable from the network, no firewall prompt on Windows.
+    public static void SetListenAddress(host: string) {
+        @c { Amalgame_Pollen_Pollen_SetListenAddress_c((const char*) host); }
+    }
+
     // v0.4.0 — consume `topic` with application code. The handler
     // receives the raw envelope JSON line ; use EnvelopeData /
     // EnvelopeTopic to read it. Called on the connection's worker
@@ -3509,6 +3848,31 @@ public class Pollen {
         let topic: JsonValue = env.Get("topic")
         let uuid: JsonValue = topic.Get("uuid")
         return uuid.AsString()
+    }
+
+    // v0.6.0 — the messageId of an envelope ("" if absent). A message
+    // sent again by the outbox keeps its messageId : dedupe on it.
+    public static string EnvelopeMessageId(envelope: string) {
+        let r: JsonResult = Json.Parse(envelope)
+        if (!r.Ok) { return "" }
+        let env: JsonValue = r.Value
+        let mid: JsonValue = env.Get("messageId")
+        return mid.AsString()
+    }
+
+    // v0.6.0 — messages of `call` steps with on_error "buffer" written
+    // to the outbox and not yet ACKed by a provider (this node).
+    public static int OutboxPending() {
+        var n: int = 0
+        @c { n = (int) Amalgame_Pollen_Pollen_OutboxPending_c(); }
+        return n
+    }
+
+    // v0.6.0 — outbox messages delivered (ACKed) since start.
+    public static int OutboxDelivered() {
+        var n: int = 0
+        @c { n = (int) Amalgame_Pollen_Pollen_OutboxDelivered_c(); }
+        return n
     }
 
     // Phase 6.1 — advertise this node's capabilities. Spawns a
@@ -4207,8 +4571,15 @@ public class Pollen {
             }
             if (stepV.Has("on_error")) {
                 let oe: string = stepV.Get("on_error").AsString()
-                if (oe != "log" && oe != "fail" && oe != "drop") {
-                    diags.Add("[error shape] " + path + ".on_error: must be \"log\"/\"fail\"/\"drop\", got \"" + oe + "\"")
+                if (oe != "log" && oe != "fail" && oe != "drop" && oe != "buffer") {
+                    diags.Add("[error shape] " + path + ".on_error: must be \"log\"/\"fail\"/\"drop\"/\"buffer\", got \"" + oe + "\"")
+                }
+                // v0.6.0 — the outbox waits for ONE provider's ACK.
+                if (oe == "buffer" && stepV.Has("mode")) {
+                    let bm: string = stepV.Get("mode").AsString()
+                    if (bm == "all") {
+                        diags.Add("[error shape] " + path + ".on_error: \"buffer\" needs mode \"one\" (one provider ACKs each message)")
+                    }
                 }
             }
             return
@@ -4506,6 +4877,7 @@ public class Pollen {
                 var oi: int = 0
                 if (oe == "fail") { oi = 1 }
                 else if (oe == "drop") { oi = 2 }
+                else if (oe == "buffer") { oi = 3 }
                 @c { _pollen_v3_node_set_on_error(idx, oi); }
             }
             return idx

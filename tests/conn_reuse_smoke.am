@@ -67,6 +67,7 @@ public class Program {
         })
 
         let listen = (_a: int) => {
+            Pollen.SetListenAddress("127.0.0.1")
             Pollen.StartListener(port)
             return 0
         }

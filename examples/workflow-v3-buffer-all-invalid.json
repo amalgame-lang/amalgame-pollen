@@ -1,0 +1,17 @@
+{
+  "schema": "pollen/v3",
+  "name": "v3-buffer-all-invalid",
+  "version": 1,
+  "actions": {
+    "sink": { "topic": "outbox.sink" }
+  },
+  "entries": [
+    {
+      "name": "forward",
+      "on":   "outbox.in",
+      "do":   [
+        { "type": "call", "action": "sink", "mode": "all", "on_error": "buffer" }
+      ]
+    }
+  ]
+}
