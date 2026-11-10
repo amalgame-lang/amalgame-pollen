@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.7.0 — 2026-11-10
+
+### Added — mutual TLS on the bus (`Pollen.SetTls`)
+
+Until v0.6 every Pollen connection was clear TCP, and any process that
+could reach a port could publish, or write a capability file and pose
+as a provider. `Pollen.SetTls(ca, cert, key)` turns on mutual TLS for
+every connection of the process :
+
+```amalgame
+Pollen.SetTls("pki/site-ca.pem", "pki/edge-1.pem", "pki/edge-1.key")
+Pollen.StartListener(7001)
+```
+
+- The listener only accepts peers whose certificate is signed by the
+  site CA (`SSL_VERIFY_FAIL_IF_NO_PEER_CERT`) ; outgoing connections
+  present the node's certificate and verify the listener's against the
+  same CA. A fake capability file gets the impostor a refused
+  handshake, not the messages.
+- TLS 1.2 minimum (1.3 when both sides have it). Handshakes are bounded
+  to 5 s, so a peer that stalls cannot pin a listener worker.
+- Every path is covered : listener, pooled `Publish` / `call`,
+  `PublishSync`, `PublishDebug`, the durable outbox.
+- Pooled connections under TLS have no reader thread (an OpenSSL
+  session must not be used by two threads at once) : the socket is
+  non-blocking and the sender drains the ACKs itself, before each
+  message and while it waits to write — which also keeps the v0.5
+  deadlock fix. Clear connections are unchanged.
+- `Pollen.TlsLastError()`, `Pollen.TlsName()` (CN of the node's
+  certificate), `Pollen.TlsRejectedCount()` (connections refused).
+- Without `SetTls`, nothing changes : clear TCP, as in v0.6.
+- OpenSSL 3 (or 1.1.1) : `libs` now has `ssl` and `crypto`. Linux :
+  `libssl-dev` ; macOS : `openssl@3` ; Windows : shipped with the
+  Amalgame toolchain (`libssl-3-x64.dll`, `libcrypto-3-x64.dll` must be
+  next to the program at run time).
+
+### Tests
+
+- `tests/tls_smoke.am` (13 checks) with a test PKI in `tests/certs`
+  (site CA, two nodes, an intruder signed by another CA ; test keys,
+  public on purpose) : bad files reported, PublishSync and 300 pooled
+  publishes over TLS on one connection, a second process with a node
+  certificate accepted, a certificate from another CA and clear TCP
+  refused and counted, nothing from them handled. Runs the test binary
+  again as the second process, since TLS is per process.
+- C smokes link with `-lssl -lcrypto`.
+
 ## v0.6.0 — 2026-11-09
 
 ### Added — durable outbox for `call` (`on_error: "buffer"`)

@@ -9,6 +9,9 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.7.0** — mutual TLS on every connection (`SetTls`) : only nodes
+with a certificate from the site CA can publish or be reached.
+
 **v0.6.0** — durable outbox for `call` steps (`on_error: "buffer"`) :
 nothing lost while the provider is absent or restarting, at-least-once
 delivery in order. `SetListenAddress` to keep a node local. Capability
@@ -83,7 +86,8 @@ Smoke suites in CI (`tests/run_tests.sh` for C-side, `tests/run_am_tests.sh` for
 - **on_topic_smoke** — `OnTopic` handler, ACK, capability advertisement
 - **conn_reuse_smoke** — 2000 publishes over one pooled connection, in order ; reuse off / on
 - **outbox_smoke** — buffered `call` waits for a provider, delivered in order, each once ; `buffer` + `mode: "all"` rejected
-- **header_consumer_check** — 45 public symbols verified
+- **tls_smoke** — mutual TLS : PublishSync and pooled publishes over TLS, another node accepted, a foreign certificate and clear TCP refused
+- **header_consumer_check** — 49 public symbols verified
 - **listener_smoke** + **publish_smoke** — TCP transport baseline
 
 ## API surface
@@ -112,6 +116,23 @@ Pollen.StartListener(8000)
 peer (v0.5.0) : messages to a peer arrive in order, without a
 handshake each. `Pollen.SetConnectionReuse(false)` goes back to one
 connection per message ; `PublishSync` always uses its own.
+
+### Mutual TLS (v0.7.0)
+
+```amalgame
+// Before StartListener and before the first Publish.
+let ok: bool = Pollen.SetTls("pki/site-ca.pem", "pki/edge-1.pem", "pki/edge-1.key")
+if (!ok) { Console.WriteError(Pollen.TlsLastError()) }
+```
+
+Every connection of the process then runs TLS (1.2 minimum) with a
+certificate on both sides : the listener refuses peers whose
+certificate is not signed by the site CA, and outgoing connections
+check the listener's certificate against it. One CA per site, one
+certificate per node ; the node's identity is the certificate's common
+name (`Pollen.TlsName()`). `Pollen.TlsRejectedCount()` counts the
+connections the listener refused. Without `SetTls`, Pollen stays on
+clear TCP.
 
 ### Durable outbox (v0.6.0)
 
@@ -202,14 +223,16 @@ isolated in one `#ifdef _WIN32` block at the top of `facade.am`. On
 Windows, Winsock is loaded at runtime from `ws2_32.dll`, so the
 manifest's `libs` stays the same on every OS.
 
-## Limitations (v0.6.x)
+## Limitations (v0.7.x)
 
 - Single-engine per process — multi-engine hosting (one process,
   two independent workflows on different port ranges) is unscheduled.
 - `OnTopic` covers "run my code on a message". Hooks on individual
   `PollenDispatcher` steps (the old v2 `OnComplete`) are unscheduled.
-- Payloads are plain JSON over TCP — run on a trusted network until
-  encryption lands.
+- Without `SetTls`, payloads are plain JSON over TCP.
+- TLS authenticates nodes (any certificate from the site CA) ; there is
+  no per-topic authorisation yet (which node may publish what), and no
+  certificate revocation list : remove a node by re-issuing the CA.
 
 ## Publishing checklist
 
