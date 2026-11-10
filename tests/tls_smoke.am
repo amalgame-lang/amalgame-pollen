@@ -1,0 +1,125 @@
+// tests/tls_smoke.am — v0.7.0 mutual TLS on the bus.
+//
+// The test process is node-a (certificate from the site CA in
+// tests/certs). It listens on 127.0.0.1 and checks that
+//   1. SetTls loads the CA / certificate / key and reports bad files
+//   2. a PublishSync to itself is ACKed over TLS
+//   3. 300 pooled Publish calls are delivered over one TLS connection
+//      (the sender drains the ACKs itself : no reader thread)
+//   4. another process with node-b (same CA) is accepted
+//   5. a process with a certificate from another CA is refused
+//   6. a process speaking clear TCP is refused
+// TLS is per process, so 4-6 run this same binary again as a client
+// ("tls_smoke client <legit|intruder|clear> <port>").
+// The certificates in tests/certs are for tests only.
+
+namespace PollenTests
+
+import Amalgame.Pollen
+import Amalgame.Threading
+import Amalgame.Process
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Seen {
+    public Count: int
+    public FromB: int
+
+    public Seen() {
+        this.Count = 0
+        this.FromB = 0
+    }
+}
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    public static bool WaitCalls(int n) {
+        var waited: int = 0
+        while (Pollen.HandlerCallCount() < n && waited < 10000) {
+            Threading.ThreadSleep(20)
+            waited = waited + 20
+        }
+        return Pollen.HandlerCallCount() >= n
+    }
+
+    // Child : one PublishSync to the parent ; exit 0 if ACKed.
+    public static void Client(mode: string, port: int) {
+        if (mode == "legit") { Pollen.SetTls("certs/ca.pem", "certs/node-b.pem", "certs/node-b.key") }
+        if (mode == "intruder") { Pollen.SetTls("certs/ca.pem", "certs/intruder.pem", "certs/intruder.key") }
+        let mid: string = Pollen.PublishSync("127.0.0.1", port, "tls.test", 1, "{\"from\":\"" + mode + "\"}", 3000)
+        if (String_Length(mid) > 0) { Exit_Set(0) } else { Exit_Set(1) }
+    }
+
+    // This binary, as a shell command (".\x" on Windows, "./x" elsewhere).
+    public static string Self() {
+        var exe: string = Args_Get(0)
+        @c {
+        #ifdef _WIN32
+            char* w = (char*) GC_MALLOC_ATOMIC(strlen(exe) + 1);
+            strcpy(w, exe);
+            for (char* p = w; *p; p++) if (*p == '/') *p = '\\';
+            exe = w;
+        #endif
+        }
+        return exe
+    }
+
+    public static void Main(string[] args) {
+        if (Args_Count() > 3 && Args_Get(1) == "client") {
+            Program.Client(Args_Get(2), String_ToInt(Args_Get(3)))
+            return
+        }
+        let port: int = 18771
+
+        Program.Check(!Pollen.SetTls("certs/ca.pem", "certs/missing.pem", "certs/node-a.key"), "SetTls refuses a missing certificate")
+        Program.Check(String_Length(Pollen.TlsLastError()) > 0, "and says why : " + Pollen.TlsLastError())
+        Program.Check(Pollen.SetTls("certs/ca.pem", "certs/node-a.pem", "certs/node-a.key"), "SetTls loads CA, certificate and key")
+        Program.Check(Pollen.TlsName() == "node-a", "TlsName is the certificate's CN")
+
+        let seen: Seen = new Seen()
+        Pollen.OnTopic("tls.test", (env: string) => {
+            seen.Count = seen.Count + 1
+            if (String_Contains(Pollen.EnvelopeData(env), "legit")) { seen.FromB = seen.FromB + 1 }
+            return 0
+        })
+        let listen = (_a: int) => {
+            Pollen.SetListenAddress("127.0.0.1")
+            Pollen.StartListener(port)
+            return 0
+        }
+        Threading.ThreadSpawn(listen, 0)
+        Threading.ThreadSleep(300)
+
+        // 2 — to itself over TLS
+        let mid: string = Pollen.PublishSync("127.0.0.1", port, "tls.test", 1, "{\"from\":\"self\"}", 3000)
+        Program.Check(String_Length(mid) > 0, "PublishSync over TLS is ACKed")
+
+        // 3 — pooled, 300 messages
+        let c0: int = Pollen.ConnectCount()
+        var failed: int = 0
+        for i in 0..300 {
+            let m: string = Pollen.Publish("127.0.0.1", port, "tls.test", 1, "{\"i\":" + String_FromInt(i) + "}")
+            if (String_Length(m) == 0) { failed = failed + 1 }
+        }
+        Program.Check(failed == 0 && Program.WaitCalls(301), "300 pooled publishes delivered over TLS")
+        Program.Check(Pollen.ConnectCount() - c0 == 1, "on one TLS connection")
+
+        // 4-6 — other processes
+        let self: string = Program.Self() + " client "
+        let p: string = " " + String_FromInt(port)
+        Program.Check(Process.RunTimeout(self + "legit" + p, 15000) == 0, "node-b (same CA) is accepted")
+        Program.Check(Program.WaitCalls(302) && seen.FromB == 1, "node-b's message is handled")
+        let r0: int = Pollen.TlsRejectedCount()
+        Program.Check(Process.RunTimeout(self + "intruder" + p, 15000) != 0, "a certificate from another CA is refused")
+        Program.Check(Process.RunTimeout(self + "clear" + p, 15000) != 0, "clear TCP is refused")
+        Threading.ThreadSleep(300)
+        Program.Check(Pollen.TlsRejectedCount() - r0 == 2, "the listener counted 2 refused connections (got "
+                      + String_FromInt(Pollen.TlsRejectedCount() - r0) + ")")
+        Program.Check(seen.Count == 302, "no message from the refused peers (got " + String_FromInt(seen.Count) + ")")
+    }
+}

@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.6.0"
+version           = "0.7.0"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v3 entries over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -77,8 +77,10 @@ namespace = "Amalgame.Pollen"
 facade    = "facade.am"
 
 # pthread for the per-connection worker threads ; libgc is already
-# in the runtime's default linkage.
-libs       = ["pthread"]
+# in the runtime's default linkage. ssl / crypto : OpenSSL for the
+# mutual TLS of v0.7.0 (libssl-dev on Linux, openssl@3 on macOS ; the
+# Amalgame toolchain ships it on Windows).
+libs       = ["pthread", "ssl", "crypto"]
 
 [stdlib.functions]
 # Workflow loader
@@ -120,6 +122,11 @@ EvalCond            = { returns = "code_bool" }
 # TCP transport
 StartListener       = { returns = "void" }
 SetListenAddress    = { returns = "void" }
+# v0.7.0 — mutual TLS
+SetTls              = { returns = "code_bool" }
+TlsLastError        = { returns = "code_string" }
+TlsName             = { returns = "code_string" }
+TlsRejectedCount    = { returns = "i64" }
 # v0.4.0 — application topic handlers
 OnTopic             = { returns = "code_bool" }
 HandlerCallCount    = { returns = "i64" }

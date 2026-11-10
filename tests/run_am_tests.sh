@@ -40,6 +40,7 @@ WORK="$(mktemp -d)"
 [ -n "${KEEP:-}" ] && echo "work dir : $WORK"
 cd "$WORK"
 cp -r "$ROOT/examples" .
+cp -r "$ROOT/tests/certs" .
 : > amalgame.toml
 if ! "$AMC" package add threading@v0.1.0 >/dev/null 2>&1; then
     # Offline (no access to GitHub) : pin the copy already in the cache.

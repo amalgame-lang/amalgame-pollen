@@ -88,6 +88,12 @@ int64_t     Amalgame_Pollen_Pollen_ConnectCount(void);
  * messages waiting for a provider's ACK, and delivered since start.
  * EnvelopeMessageId lets a consumer dedupe a message sent again. */
 void        Amalgame_Pollen_Pollen_SetListenAddress(code_string host);
+
+/* v0.7.0 — mutual TLS : site CA, node certificate and key (PEM). */
+code_bool   Amalgame_Pollen_Pollen_SetTls(code_string ca, code_string cert, code_string key);
+code_string Amalgame_Pollen_Pollen_TlsLastError(void);
+code_string Amalgame_Pollen_Pollen_TlsName(void);
+int64_t     Amalgame_Pollen_Pollen_TlsRejectedCount(void);
 int64_t     Amalgame_Pollen_Pollen_OutboxPending(void);
 int64_t     Amalgame_Pollen_Pollen_OutboxDelivered(void);
 code_string Amalgame_Pollen_Pollen_EnvelopeMessageId(code_string envelope);

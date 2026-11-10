@@ -52,7 +52,7 @@ for c in tests/*.c; do
     echo "== compiling $c"
     gcc -O2 -I"$RUNTIME_DIR" -I./runtime "$c" \
         -Wl,--start-group "$ARCHIVE" "$LIBAMALGAME" -Wl,--end-group \
-        -lgc -lm -lpthread -o "$out"
+        -lgc -lm -lpthread -lssl -lcrypto -o "$out"
     echo "== running $name"
     if ! "$out"; then
         echo "FAIL $name"

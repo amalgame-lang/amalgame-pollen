@@ -86,6 +86,7 @@ import Amalgame.String
         int    (WSAAPI *inet_pton)(int, const char*, void*);
         int    (WSAAPI *WSAPoll)(LPWSAPOLLFD, ULONG, INT);
         int    (WSAAPI *shutdown)(SOCKET, int);
+        int    (WSAAPI *ioctlsocket)(SOCKET, long, u_long*);
     } _pollen_ws;
     static void _pollen_net_init(void) {
         static volatile LONG done = 0;
@@ -97,7 +98,7 @@ import Amalgame.String
         _POLLEN_WS(setsockopt); _POLLEN_WS(bind);    _POLLEN_WS(listen);
         _POLLEN_WS(accept);     _POLLEN_WS(connect); _POLLEN_WS(send);
         _POLLEN_WS(recv);       _POLLEN_WS(inet_pton); _POLLEN_WS(WSAPoll);
-        _POLLEN_WS(shutdown);
+        _POLLEN_WS(shutdown);   _POLLEN_WS(ioctlsocket);
         #undef _POLLEN_WS
         WSADATA wsa;
         if (_pollen_ws.WSAStartup) _pollen_ws.WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -142,6 +143,7 @@ import Amalgame.String
     #  include <arpa/inet.h>
     #  include <sys/time.h>
     #  include <poll.h>
+    #  include <netinet/tcp.h>
     #  ifndef MSG_NOSIGNAL
     #    define MSG_NOSIGNAL 0        /* macOS / BSD : SO_NOSIGPIPE below */
     #  endif
@@ -191,6 +193,180 @@ import Amalgame.String
     #  endif
         return s;
     #endif
+    }
+
+    /* Non-blocking mode, and a poll on read and/or write readiness.
+     * _pollen_poll_io returns a mask : 1 readable, 2 writable, 4 error
+     * or hang-up ; 0 on timeout. */
+    static void _pollen_set_nonblock(int fd) {
+    #ifdef _WIN32
+        u_long on = 1;
+        if (_pollen_ws.ioctlsocket) _pollen_ws.ioctlsocket((SOCKET) fd, FIONBIO, &on);
+    #else
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    #endif
+    }
+    static int _pollen_poll_io(int fd, int want_out, int timeout_ms) {
+    #ifdef _WIN32
+        WSAPOLLFD p; p.fd = (SOCKET) fd; p.events = POLLRDNORM | (want_out ? POLLWRNORM : 0); p.revents = 0;
+        if (WSAPoll(&p, 1, timeout_ms) <= 0) return 0;
+        return ((p.revents & POLLRDNORM) ? 1 : 0) | ((p.revents & POLLWRNORM) ? 2 : 0)
+             | ((p.revents & (POLLERR | POLLHUP | POLLNVAL)) ? 4 : 0);
+    #else
+        struct pollfd p; p.fd = fd; p.events = POLLIN | (want_out ? POLLOUT : 0); p.revents = 0;
+        if (poll(&p, 1, timeout_ms) <= 0) return 0;
+        return ((p.revents & POLLIN) ? 1 : 0) | ((p.revents & POLLOUT) ? 2 : 0)
+             | ((p.revents & (POLLERR | POLLHUP | POLLNVAL)) ? 4 : 0);
+    #endif
+    }
+    /* Bound a blocking handshake (0 = no limit). */
+    static void _pollen_set_io_timeouts(int fd, int ms) {
+    #ifdef _WIN32
+        DWORD tv = (DWORD) ms;
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &tv, sizeof(tv));
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_SNDTIMEO, (const char*) &tv, sizeof(tv));
+    #else
+        struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    #endif
+    }
+
+    /* === v0.7.0 — mutual TLS on every Pollen connection ==========
+     *
+     * Pollen.SetTls(ca, cert, key) turns it on for the whole process :
+     * the listener only accepts peers whose certificate is signed by
+     * `ca`, and every outgoing connection presents `cert` and checks
+     * the listener's certificate against `ca`. One CA per site, one
+     * certificate per node : a node without a certificate from the
+     * site CA can neither publish nor pose as a provider (a fake
+     * capability file only gets it a refused handshake).
+     *
+     * OpenSSL 3 (or 1.1.1). On Windows, the Amalgame toolchain ships
+     * it (gcc/include/openssl, libssl-3-x64.dll). An SSL object is
+     * never used by two threads at once : the listener worker, the
+     * one-shot publishes and the outbox each own theirs, and pooled
+     * connections drop their reader thread under TLS (see the pool). */
+    #include <openssl/ssl.h>
+    #include <openssl/err.h>
+    #include <openssl/x509.h>
+    #include <stdatomic.h>
+    #ifndef _WIN32
+    #  include <signal.h>
+    #endif
+
+    #define POLLEN_TLS_HANDSHAKE_MS 5000
+
+    static SSL_CTX* _pollen_tls_srv = 0;
+    static SSL_CTX* _pollen_tls_cli = 0;
+    static char     _pollen_tls_err[256] = "";
+    static char     _pollen_tls_name[128] = "";      /* CN of our certificate */
+    static _Atomic long _pollen_tls_rejected;        /* refused handshakes (listener) */
+
+    static void _pollen_tls_seterr(const char* what) {
+        char buf[200] = "";
+        unsigned long e = ERR_get_error();
+        if (e) ERR_error_string_n(e, buf, sizeof(buf));
+        snprintf(_pollen_tls_err, sizeof(_pollen_tls_err), "%s%s%s", what, buf[0] ? " : " : "", buf);
+        ERR_clear_error();
+    }
+
+    static SSL_CTX* _pollen_tls_ctx(int server, const char* ca, const char* cert, const char* key) {
+        SSL_CTX* ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
+        if (!ctx) { _pollen_tls_seterr("SSL_CTX_new"); return 0; }
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {
+            _pollen_tls_seterr("certificate"); SSL_CTX_free(ctx); return 0;
+        }
+        if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1 || SSL_CTX_check_private_key(ctx) != 1) {
+            _pollen_tls_seterr("private key"); SSL_CTX_free(ctx); return 0;
+        }
+        if (SSL_CTX_load_verify_locations(ctx, ca, NULL) != 1) {
+            _pollen_tls_seterr("CA certificate"); SSL_CTX_free(ctx); return 0;
+        }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | (server ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0), NULL);
+        SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+        if (server) SSL_CTX_set_session_id_context(ctx, (const unsigned char*) "pollen", 6);
+        return ctx;
+    }
+
+    static int Amalgame_Pollen_Pollen_SetTls_c(const char* ca, const char* cert, const char* key) {
+        _pollen_tls_err[0] = 0;
+        if (!ca || !cert || !key || !ca[0] || !cert[0] || !key[0]) {
+            snprintf(_pollen_tls_err, sizeof(_pollen_tls_err), "ca, cert and key are required");
+            return 0;
+        }
+        SSL_CTX* srv = _pollen_tls_ctx(1, ca, cert, key);
+        if (!srv) return 0;
+        SSL_CTX* cli = _pollen_tls_ctx(0, ca, cert, key);
+        if (!cli) { SSL_CTX_free(srv); return 0; }
+        X509* own = SSL_CTX_get0_certificate(srv);
+        _pollen_tls_name[0] = 0;
+        if (own) X509_NAME_get_text_by_NID(X509_get_subject_name(own), NID_commonName,
+                                           _pollen_tls_name, sizeof(_pollen_tls_name));
+    #ifndef _WIN32
+        /* SSL_write uses plain send() : a peer that closes must not kill us. */
+        signal(SIGPIPE, SIG_IGN);
+    #endif
+        _pollen_tls_srv = srv;
+        _pollen_tls_cli = cli;
+        return 1;
+    }
+
+    /* A connection : the socket, plus the TLS session when TLS is on. */
+    typedef struct { int fd; SSL* ssl; } pollen_io_t;
+
+    /* Client / server handshake on a connected, blocking socket.
+     * Without TLS, just records the fd. Returns 1 on success ; on
+     * failure the socket is closed. */
+    static int _pollen_io_open(pollen_io_t* io, int fd, int server) {
+        io->fd = fd; io->ssl = 0;
+        SSL_CTX* ctx = server ? _pollen_tls_srv : _pollen_tls_cli;
+        if (!ctx) return 1;
+        SSL* s = SSL_new(ctx);
+        if (!s) { _pollen_tls_seterr("SSL_new"); _pollen_sock_close(fd); return 0; }
+        SSL_set_fd(s, fd);
+        _pollen_set_io_timeouts(fd, POLLEN_TLS_HANDSHAKE_MS);
+        int r = server ? SSL_accept(s) : SSL_connect(s);
+        _pollen_set_io_timeouts(fd, 0);
+        if (r != 1) {
+            _pollen_tls_seterr(server ? "handshake refused (listener)" : "handshake refused");
+            if (server) atomic_fetch_add(&_pollen_tls_rejected, 1);
+            SSL_free(s); _pollen_sock_close(fd); io->fd = -1;
+            return 0;
+        }
+        io->ssl = s;
+        return 1;
+    }
+
+    static void _pollen_io_close(pollen_io_t* io) {
+        if (io->ssl) { SSL_free(io->ssl); io->ssl = 0; }
+        if (io->fd >= 0) { _pollen_sock_close(io->fd); io->fd = -1; }
+    }
+
+    /* Blocking reads and writes. recv returns <= 0 when closed. */
+    static long _pollen_io_recv(pollen_io_t* io, char* buf, size_t n) {
+        if (!io->ssl) return (long) recv(io->fd, buf, n, 0);
+        int r = SSL_read(io->ssl, buf, (int) n);
+        return r > 0 ? r : -1;
+    }
+    static int _pollen_io_send_all(pollen_io_t* io, const char* buf, size_t n) {
+        size_t sent = 0;
+        while (sent < n) {
+            long w = io->ssl ? SSL_write(io->ssl, buf + sent, (int) (n - sent))
+                             : (long) send(io->fd, buf + sent, n - sent, MSG_NOSIGNAL);
+            if (w <= 0) return 0;
+            sent += (size_t) w;
+        }
+        return 1;
+    }
+    /* Wait until something can be read : data already decrypted in
+     * the TLS buffer counts. Returns > 0 if readable, 0 on timeout. */
+    static int _pollen_io_wait_in(pollen_io_t* io, int timeout_ms) {
+        if (io->ssl && SSL_pending(io->ssl) > 0) return 1;
+        return _pollen_poll_in(io->fd, timeout_ms);
     }
     #include <gc.h>
 
@@ -533,7 +709,10 @@ import Amalgame.String
     }
 
     static void* _pollen_listener_worker(void* arg) {
-        int fd = (int)(intptr_t) arg;
+        pollen_io_t io;
+        /* v0.7.0 : TLS handshake first when SetTls is on ; a peer
+         * without a certificate from the site CA stops here. */
+        if (!_pollen_io_open(&io, (int)(intptr_t) arg, 1)) return NULL;
         char rbuf[16384];
         size_t rlen = 0;
         char ack[256];
@@ -544,7 +723,7 @@ import Amalgame.String
 
         for (;;) {
             if (rlen >= sizeof(rbuf)) break;  /* oversize line — drop */
-            ssize_t n = recv(fd, rbuf + rlen, sizeof(rbuf) - rlen, 0);
+            long n = _pollen_io_recv(&io, rbuf + rlen, sizeof(rbuf) - rlen);
             if (n <= 0) break;
             rlen += (size_t) n;
             for (;;) {
@@ -623,16 +802,7 @@ import Amalgame.String
                                  "\"timestamp\":%lld}\n",
                                 (int) midlen, mp, (long long) now);
                             if (alen > 0 && alen < (int) sizeof(ack)) {
-                                ssize_t sent = 0;
-                                int sock_dead = 0;
-                                while (sent < alen) {
-                                    ssize_t w = send(fd, ack + sent,
-                                                     (size_t)(alen - sent),
-                                                     MSG_NOSIGNAL);
-                                    if (w <= 0) { sock_dead = 1; break; }
-                                    sent += w;
-                                }
-                                if (sock_dead) {
+                                if (!_pollen_io_send_all(&io, ack, (size_t) alen)) {
                                     pthread_mutex_unlock(&_pollen_wf_mutex);
                                     goto worker_done;
                                 }
@@ -719,7 +889,7 @@ import Amalgame.String
             }
         }
     worker_done:
-        _pollen_sock_close(fd);
+        _pollen_io_close(&io);
         return NULL;
     }
 
@@ -1068,23 +1238,31 @@ import Amalgame.String
      * buffer) receives the freshly minted messageId on success.
      *
      * Returns 1 on success, 0 on socket / connect / send failure. */
+    /* Connect to host:port and, when SetTls is on, run the client
+     * handshake. Returns 1 with `io` open, 0 on failure. */
+    static int _pollen_connect_io(const char* host, int port, pollen_io_t* io) {
+        int fd = _pollen_socket();
+        if (fd < 0) return 0;
+        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t) port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1
+            || connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
+            _pollen_sock_close(fd); return 0;
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof(one));
+        return _pollen_io_open(io, fd, 0);
+    }
+
     static int _pollen_publish_one(const char* host, int port,
                                      const char* topic_uuid,
                                      int64_t topic_version,
                                      const char* data_json,
                                      char* out_mid) {
         if (!host || !topic_uuid || !data_json || !out_mid) return 0;
-        int fd = _pollen_socket();
-        if (fd < 0) return 0;
-        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t) port);
-        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-            _pollen_sock_close(fd); return 0;
-        }
-        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            _pollen_sock_close(fd); return 0;
-        }
+        pollen_io_t io;
+        if (!_pollen_connect_io(host, port, &io)) return 0;
         _pollen_gen_uuid(out_mid);
 
         char envelope[8192];
@@ -1097,17 +1275,11 @@ import Amalgame.String
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
         if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            _pollen_sock_close(fd); return 0;
+            _pollen_io_close(&io); return 0;
         }
-        ssize_t sent = 0;
-        while (sent < env_len) {
-            ssize_t n = send(fd, envelope + sent,
-                             (size_t)(env_len - sent), MSG_NOSIGNAL);
-            if (n < 0) { _pollen_sock_close(fd); return 0; }
-            sent += n;
-        }
-        _pollen_sock_close(fd);
-        return 1;
+        int ok = _pollen_io_send_all(&io, envelope, (size_t) env_len);
+        _pollen_io_close(&io);
+        return ok;
     }
 
     /* === v0.5.0 — connection reuse for Publish / call ===========
@@ -1143,6 +1315,7 @@ import Amalgame.String
     #define POLLEN_POOL_MAX 64
     typedef struct {
         int          fd;
+        SSL*         ssl;          /* v0.7.0 : TLS session, 0 in clear */
         _Atomic int  dead;
         _Atomic int  refs;
     } pollen_link_t;
@@ -1180,6 +1353,7 @@ import Amalgame.String
 
     static void _pollen_link_release(pollen_link_t* l) {
         if (atomic_fetch_sub(&l->refs, 1) == 1) {
+            if (l->ssl) SSL_free(l->ssl);
             _pollen_sock_close(l->fd);
             free(l);
         }
@@ -1210,34 +1384,65 @@ import Amalgame.String
 
     /* Caller holds c->mu. */
     static int _pollen_pool_connect(pollen_conn_t* c) {
-        int fd = _pollen_socket();
-        if (fd < 0) return 0;
-        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t) c->port);
-        if (inet_pton(AF_INET, c->host, &addr.sin_addr) != 1
-            || connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            _pollen_sock_close(fd); return 0;
-        }
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof(one));
+        pollen_io_t io;
+        if (!_pollen_connect_io(c->host, c->port, &io)) return 0;
         pollen_link_t* l = (pollen_link_t*) malloc(sizeof(pollen_link_t));
-        if (!l) { _pollen_sock_close(fd); return 0; }
-        l->fd = fd;
+        if (!l) { _pollen_io_close(&io); return 0; }
+        l->fd = io.fd;
+        l->ssl = io.ssl;
         atomic_store(&l->dead, 0);
-        atomic_store(&l->refs, 2);
-        pthread_t th;
-        if (pthread_create(&th, NULL, _pollen_link_reader, l) != 0) {
-            _pollen_sock_close(fd); free(l); return 0;
+        if (l->ssl) {
+            /* TLS : no reader thread, the sender drains (see below). */
+            _pollen_set_nonblock(l->fd);
+            atomic_store(&l->refs, 1);
+        } else {
+            atomic_store(&l->refs, 2);
+            pthread_t th;
+            if (pthread_create(&th, NULL, _pollen_link_reader, l) != 0) {
+                _pollen_io_close(&io); free(l); return 0;
+            }
+            pthread_detach(th);
         }
-        pthread_detach(th);
         c->link = l;
         atomic_fetch_add(&_pollen_pool_connects, 1);
         return 1;
     }
 
+    /* v0.7.0 — TLS pooled link. An SSL object must not be used by two
+     * threads at once, so there is no reader thread : the socket is
+     * non-blocking and the sender reads (and discards) the ACKs itself,
+     * before each message and while it waits for the socket to take
+     * more data — which also avoids the both-sides-blocked-in-send
+     * deadlock the reader thread solves in clear. Caller holds c->mu.
+     * Returns 0 when the peer closed the connection or it failed. */
+    static int _pollen_pool_tls_drain(pollen_link_t* l) {
+        char buf[4096];
+        for (;;) {
+            int r = SSL_read(l->ssl, buf, (int) sizeof(buf));
+            if (r > 0) continue;
+            int e = SSL_get_error(l->ssl, r);
+            ERR_clear_error();
+            return e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE;
+        }
+    }
+    static int _pollen_pool_tls_write(pollen_link_t* l, const char* buf, int len) {
+        int64_t deadline = _pollen_now_ms_c() + 10000;
+        for (;;) {
+            int w = SSL_write(l->ssl, buf, len);       /* whole record or nothing */
+            if (w > 0) return 1;
+            int e = SSL_get_error(l->ssl, w);
+            ERR_clear_error();
+            if (e != SSL_ERROR_WANT_WRITE && e != SSL_ERROR_WANT_READ) return 0;
+            int left = (int) (deadline - _pollen_now_ms_c());
+            if (left <= 0) return 0;
+            int m = _pollen_poll_io(l->fd, 1, left > 200 ? 200 : left);
+            if ((m & 1) && !_pollen_pool_tls_drain(l)) return 0;
+        }
+    }
+
     /* Caller holds c->mu. */
     static int _pollen_pool_send_all(pollen_conn_t* c, const char* buf, int len) {
+        if (c->link->ssl) return _pollen_pool_tls_write(c->link, buf, len);
         ssize_t sent = 0;
         while (sent < len) {
             ssize_t n = send(c->link->fd, buf + sent, (size_t)(len - sent), MSG_NOSIGNAL);
@@ -1272,6 +1477,7 @@ import Amalgame.String
         int ok = 0;
         pthread_mutex_lock(&c->mu);
         for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+            if (c->link && c->link->ssl && !_pollen_pool_tls_drain(c->link)) atomic_store(&c->link->dead, 1);
             if (c->link && atomic_load(&c->link->dead)) _pollen_pool_drop(c);
             if (!c->link && !_pollen_pool_connect(c)) break;
             if (_pollen_pool_send_all(c, envelope, env_len)) ok = 1;
@@ -1346,17 +1552,8 @@ import Amalgame.String
                                       int timeout_ms,
                                       char* out_mid) {
         if (!host || !topic_uuid || !data_json || !out_mid) return 0;
-        int fd = _pollen_socket();
-        if (fd < 0) return 0;
-        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t) port);
-        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-            _pollen_sock_close(fd); return 0;
-        }
-        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            _pollen_sock_close(fd); return 0;
-        }
+        pollen_io_t io;
+        if (!_pollen_connect_io(host, port, &io)) return 0;
         _pollen_gen_uuid(out_mid);
         char envelope[8192];
         int64_t now = _pollen_now_ms_c();
@@ -1368,15 +1565,9 @@ import Amalgame.String
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
         if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            _pollen_sock_close(fd); return 0;
+            _pollen_io_close(&io); return 0;
         }
-        ssize_t sent = 0;
-        while (sent < env_len) {
-            ssize_t n = send(fd, envelope + sent,
-                              (size_t)(env_len - sent), MSG_NOSIGNAL);
-            if (n < 0) { _pollen_sock_close(fd); return 0; }
-            sent += n;
-        }
+        if (!_pollen_io_send_all(&io, envelope, (size_t) env_len)) { _pollen_io_close(&io); return 0; }
 
         /* Wait for one newline-terminated line and verify it ACKs
          * our mid. poll() bounds the wait by timeout_ms. */
@@ -1387,9 +1578,9 @@ import Amalgame.String
         while (rlen < sizeof(rbuf) - 1) {
             /* readiness wait — _pollen_poll_in (WSAPoll on Windows) */
             int64_t start = _pollen_now_ms_c();
-            int pr = _pollen_poll_in(fd, remaining);
+            int pr = _pollen_io_wait_in(&io, remaining);
             if (pr <= 0) break;  /* timeout or error */
-            ssize_t n = recv(fd, rbuf + rlen, sizeof(rbuf) - 1 - rlen, 0);
+            long n = _pollen_io_recv(&io, rbuf + rlen, sizeof(rbuf) - 1 - rlen);
             if (n <= 0) break;
             rlen += (size_t) n;
             rbuf[rlen] = 0;
@@ -1413,7 +1604,7 @@ import Amalgame.String
             remaining -= (int) elapsed;
             if (remaining <= 0) break;
         }
-        _pollen_sock_close(fd);
+        _pollen_io_close(&io);
         return got_ack;
     }
 
@@ -1454,17 +1645,8 @@ import Amalgame.String
         if (empty) empty[0] = 0;
         if (!host || !topicUuid || !dataJson) return (code_string) empty;
 
-        int fd = _pollen_socket();
-        if (fd < 0) return (code_string) empty;
-        struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t) port);
-        if (inet_pton(AF_INET, (const char*) host, &addr.sin_addr) != 1) {
-            _pollen_sock_close(fd); return (code_string) empty;
-        }
-        if (connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-            _pollen_sock_close(fd); return (code_string) empty;
-        }
+        pollen_io_t io;
+        if (!_pollen_connect_io((const char*) host, (int) port, &io)) return (code_string) empty;
 
         char mid[37];
         _pollen_gen_uuid(mid);
@@ -1487,20 +1669,13 @@ import Amalgame.String
             (const char*) dataJson, (long long) now,
             sess, md, mgr, bps);
         if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            _pollen_sock_close(fd); return (code_string) empty;
+            _pollen_io_close(&io); return (code_string) empty;
         }
-        ssize_t sent = 0;
-        while (sent < env_len) {
-            ssize_t n = send(fd, envelope + sent,
-                             (size_t)(env_len - sent), MSG_NOSIGNAL);
-            if (n < 0) { _pollen_sock_close(fd); return (code_string) empty; }
-            sent += n;
-        }
+        if (!_pollen_io_send_all(&io, envelope, (size_t) env_len)) { _pollen_io_close(&io); return (code_string) empty; }
         /* drain one ACK line (best-effort, short wait) */
-        _pollen_set_rcvtimeo(fd, 2000);
         char ackbuf[512];
-        (void) recv(fd, ackbuf, sizeof(ackbuf), 0);
-        _pollen_sock_close(fd);
+        if (_pollen_io_wait_in(&io, 2000) > 0) (void) _pollen_io_recv(&io, ackbuf, sizeof(ackbuf));
+        _pollen_io_close(&io);
 
         char* out = (char*) GC_MALLOC_ATOMIC(37);
         if (!out) return (code_string) empty;
@@ -2235,11 +2410,11 @@ import Amalgame.String
     }
 
     /* The delivery thread's connection. */
-    static int  _pollen_outbox_fd = -1;
+    static pollen_io_t _pollen_outbox_io = { -1, 0 };
     static char _pollen_outbox_peer[POLLEN_HOST_MAX + 8] = "";
 
     static void _pollen_outbox_disconnect(void) {
-        if (_pollen_outbox_fd >= 0) { _pollen_sock_close(_pollen_outbox_fd); _pollen_outbox_fd = -1; }
+        _pollen_io_close(&_pollen_outbox_io);
         _pollen_outbox_peer[0] = 0;
     }
 
@@ -2248,28 +2423,12 @@ import Amalgame.String
     static int _pollen_outbox_send(const char* host, int port, const char* env, const char* mid) {
         char peer[POLLEN_HOST_MAX + 8];
         snprintf(peer, sizeof(peer), "%s:%d", host, port);
-        if (_pollen_outbox_fd >= 0 && strcmp(peer, _pollen_outbox_peer) != 0) _pollen_outbox_disconnect();
-        if (_pollen_outbox_fd < 0) {
-            int fd = _pollen_socket();
-            if (fd < 0) return 0;
-            struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons((uint16_t) port);
-            if (inet_pton(AF_INET, host, &addr.sin_addr) != 1
-                || connect(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
-                _pollen_sock_close(fd); return 0;
-            }
-            int one = 1;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof(one));
-            _pollen_outbox_fd = fd;
+        if (_pollen_outbox_io.fd >= 0 && strcmp(peer, _pollen_outbox_peer) != 0) _pollen_outbox_disconnect();
+        if (_pollen_outbox_io.fd < 0) {
+            if (!_pollen_connect_io(host, port, &_pollen_outbox_io)) { _pollen_outbox_io.fd = -1; return 0; }
             strcpy(_pollen_outbox_peer, peer);
         }
-        size_t len = strlen(env), sent = 0;
-        while (sent < len) {
-            ssize_t w = send(_pollen_outbox_fd, env + sent, len - sent, MSG_NOSIGNAL);
-            if (w <= 0) { _pollen_outbox_disconnect(); return 0; }
-            sent += (size_t) w;
-        }
+        if (!_pollen_io_send_all(&_pollen_outbox_io, env, strlen(env))) { _pollen_outbox_disconnect(); return 0; }
         /* Read lines until the ACK of `mid` (a late ACK of an earlier
          * attempt may come first) or the deadline. */
         char rbuf[4096];
@@ -2277,8 +2436,8 @@ import Amalgame.String
         int64_t deadline = _pollen_now_ms_c() + POLLEN_OUTBOX_ACK_MS;
         for (;;) {
             int left = (int) (deadline - _pollen_now_ms_c());
-            if (left <= 0 || _pollen_poll_in(_pollen_outbox_fd, left) <= 0) break;
-            ssize_t n = recv(_pollen_outbox_fd, rbuf + rlen, sizeof(rbuf) - 1 - rlen, 0);
+            if (left <= 0 || _pollen_io_wait_in(&_pollen_outbox_io, left) <= 0) break;
+            long n = _pollen_io_recv(&_pollen_outbox_io, rbuf + rlen, sizeof(rbuf) - 1 - rlen);
             if (n <= 0) break;
             rlen += (size_t) n;
             rbuf[rlen] = 0;
@@ -3804,6 +3963,40 @@ public class Pollen {
     // nothing reachable from the network, no firewall prompt on Windows.
     public static void SetListenAddress(host: string) {
         @c { Amalgame_Pollen_Pollen_SetListenAddress_c((const char*) host); }
+    }
+
+    // v0.7.0 — mutual TLS on every Pollen connection of this process.
+    // `ca` : the site CA certificate (PEM) ; `cert` / `key` : this
+    // node's certificate, signed by that CA, and its private key.
+    // Call before StartListener and before the first Publish. The
+    // listener then refuses peers without a certificate from the CA,
+    // and outgoing connections check the listener's certificate.
+    // Returns false (see TlsLastError) if a file cannot be loaded.
+    public static bool SetTls(ca: string, cert: string, key: string) {
+        var ok: bool = false
+        @c { ok = Amalgame_Pollen_Pollen_SetTls_c((const char*) ca, (const char*) cert, (const char*) key) != 0; }
+        return ok
+    }
+
+    // v0.7.0 — last TLS error ("" if none) : bad file, refused handshake.
+    public static string TlsLastError() {
+        var s: string = ""
+        @c { s = _pollen_tls_err; }
+        return s
+    }
+
+    // v0.7.0 — common name of this node's certificate ("" without TLS).
+    public static string TlsName() {
+        var s: string = ""
+        @c { s = _pollen_tls_name; }
+        return s
+    }
+
+    // v0.7.0 — connections the listener refused (no or bad certificate).
+    public static int TlsRejectedCount() {
+        var n: int = 0
+        @c { n = (int) atomic_load(&_pollen_tls_rejected); }
+        return n
     }
 
     // v0.4.0 — consume `topic` with application code. The handler
