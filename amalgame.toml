@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.8.0"
+version           = "0.9.0"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v3 entries over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -132,6 +132,9 @@ TlsDeniedCount      = { returns = "i64" }
 TlsLastDenied       = { returns = "code_string" }
 PeerName            = { returns = "code_string" }
 PeerClaim           = { returns = "code_string" }
+# v0.9.0 — ACK after the handler
+SetAckAfterHandler  = { returns = "void" }
+HandlerRefusedCount = { returns = "i64" }
 # v0.4.0 — application topic handlers
 OnTopic             = { returns = "code_bool" }
 HandlerCallCount    = { returns = "i64" }

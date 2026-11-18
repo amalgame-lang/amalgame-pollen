@@ -99,6 +99,9 @@ int64_t     Amalgame_Pollen_Pollen_TlsDeniedCount(void);
 code_string Amalgame_Pollen_Pollen_TlsLastDenied(void);
 code_string Amalgame_Pollen_Pollen_PeerName(void);
 code_string Amalgame_Pollen_Pollen_PeerClaim(code_string prefix);
+/* v0.9.0 — ACK after the OnTopic handler returned 0. */
+void        Amalgame_Pollen_Pollen_SetAckAfterHandler(code_bool on);
+int64_t     Amalgame_Pollen_Pollen_HandlerRefusedCount(void);
 int64_t     Amalgame_Pollen_Pollen_OutboxPending(void);
 int64_t     Amalgame_Pollen_Pollen_OutboxDelivered(void);
 code_string Amalgame_Pollen_Pollen_EnvelopeMessageId(code_string envelope);

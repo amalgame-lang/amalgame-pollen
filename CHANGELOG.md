@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.9.0 — 2026-11-18
+
+### Added — acknowledge after the handler (`Pollen.SetAckAfterHandler`)
+
+Until now a message was acknowledged as soon as the listener read it,
+before the `OnTopic` handler ran. A consumer that stores messages (a
+historian) could therefore lose what it had acknowledged but not yet
+stored, if it stopped at that moment. With `Pollen.SetAckAfterHandler(true)` :
+
+- a message consumed only by an `OnTopic` handler is acknowledged once
+  the handler returned **0** ("stored") ;
+- a non-zero return means "not stored" : no ACK, and a sender using the
+  durable outbox (`on_error: "buffer"`) keeps the message and sends it
+  again ;
+- `Pollen.HandlerRefusedCount()` counts those messages.
+
+A handler should return 0 for a message that can never be stored (bad
+data) and log it : refusing it would keep it at the head of the
+sender's outbox. Off by default : nothing changes without the call.
+Topics dispatched by a v3 workflow are still acknowledged on receipt.
+
+Measured in Kairos (historian killed with SIGKILL 12 times while an
+edge publishes one cycle per second) : no second missing from the
+history, where the previous historian lost seconds in 2 runs out of 3.
+
+### Fixed
+
+- Test runner on Windows : the compiled-facade cache in `<drive>:\tmp`
+  was not removed (a `/[a-z]/tmp` glob does not list the drive roots in
+  Git Bash), so tests could link the previous facade.
+
+### Tests
+
+- `tests/ack_after_smoke.am` : the ACK leaves before a slow handler by
+  default and after it with `SetAckAfterHandler` ; a refused message
+  gets no ACK and is counted ; a sender trying again is acknowledged
+  once the handler stores it. Green on Linux and Windows.
+
 ## v0.8.0 — 2026-11-18
 
 ### Added — publish rights carried by the certificate

@@ -833,6 +833,30 @@ import Amalgame.String
         return ok;
     }
 
+    /* v0.9.0 — ACK after the handler (SetAckAfterHandler) : a message
+     * consumed by an OnTopic handler is acknowledged only once the
+     * handler returned 0. A handler that could not store the message
+     * returns non-zero : no ACK, and the sender's durable outbox keeps
+     * it and sends it again. Without it, the ACK leaves on receipt. */
+    static _Atomic int  _pollen_ack_after_handler;
+    static _Atomic long _pollen_handler_refused;
+
+    /* Send the ACK of the envelope line `line` (its messageId) on io.
+     * Returns 0 when the connection is gone. */
+    static int _pollen_send_ack(pollen_io_t* io, const char* line, size_t line_len) {
+        const char* MID_KEY = "\"messageId\":\"";
+        const char* mp = _pollen_find(line, line_len, MID_KEY, 13);
+        if (!mp) return 1;
+        mp += 13;
+        const char* mq = memchr(mp, '"', line_len - (size_t)(mp - line));
+        if (!mq) return 1;
+        char ack[256];
+        int alen = snprintf(ack, sizeof(ack), "{\"type\":\"ACK\",\"messageId\":\"%.*s\",\"timestamp\":%lld}\n",
+                            (int)(mq - mp), mp, (long long) _pollen_now_ms_c());
+        if (alen <= 0 || alen >= (int) sizeof(ack)) return 1;
+        return _pollen_io_send_all(io, ack, (size_t) alen);
+    }
+
     static void* _pollen_listener_worker(void* arg) {
         pollen_io_t io;
         /* v0.7.0 : TLS handshake first when SetTls is on ; a peer
@@ -844,7 +868,6 @@ import Amalgame.String
         _pollen_cur_peer = &peer;
         char rbuf[16384];
         size_t rlen = 0;
-        char ack[256];
         const char* MID_KEY   = "\"messageId\":\"";
         const size_t MID_KEY_LEN = 13;
         const char* TOPIC_KEY = "\"topic\":{\"uuid\":\"";
@@ -927,28 +950,13 @@ import Amalgame.String
                     }
                 }
 
-                if (do_ack) {
-                    const char* mp = _pollen_find(rbuf, line_len,
-                                                    MID_KEY, MID_KEY_LEN);
-                    if (mp) {
-                        mp += MID_KEY_LEN;
-                        const char* mq = memchr(mp, '"',
-                                                  line_len - (size_t)(mp - rbuf));
-                        if (mq) {
-                            size_t midlen = (size_t)(mq - mp);
-                            int64_t now = _pollen_now_ms_c();
-                            int alen = snprintf(ack, sizeof(ack),
-                                "{\"type\":\"ACK\",\"messageId\":\"%.*s\","
-                                 "\"timestamp\":%lld}\n",
-                                (int) midlen, mp, (long long) now);
-                            if (alen > 0 && alen < (int) sizeof(ack)) {
-                                if (!_pollen_io_send_all(&io, ack, (size_t) alen)) {
-                                    pthread_mutex_unlock(&_pollen_wf_mutex);
-                                    goto worker_done;
-                                }
-                            }
-                        }
-                    }
+                /* v0.9.0 : with SetAckAfterHandler, a message only an
+                 * OnTopic handler consumes is acknowledged after it. */
+                int defer_ack = do_ack && app_handler && v3_env_gc && !v3_handled
+                                && atomic_load(&_pollen_ack_after_handler);
+                if (do_ack && !defer_ack && !_pollen_send_ack(&io, rbuf, line_len)) {
+                    pthread_mutex_unlock(&_pollen_wf_mutex);
+                    goto worker_done;
                 }
                 pthread_mutex_unlock(&_pollen_wf_mutex);
 
@@ -959,9 +967,13 @@ import Amalgame.String
                 if (app_handler && v3_env_gc) {
                     atomic_fetch_add(&_pollen_msgs_handled, 1);
                     atomic_fetch_add(&_pollen_inflight, 1);
-                    (void) AmalgameClosure_call1(app_handler, (void*) v3_env_gc);
+                    int rc = (int)(intptr_t) AmalgameClosure_call1(app_handler, (void*) v3_env_gc);
                     atomic_fetch_add(&_pollen_handler_calls, 1);
                     atomic_fetch_sub(&_pollen_inflight, 1);
+                    if (defer_ack) {
+                        if (rc != 0) atomic_fetch_add(&_pollen_handler_refused, 1);
+                        else if (!_pollen_send_ack(&io, v3_env_gc, strlen(v3_env_gc))) goto worker_done;
+                    }
                 }
 
                 /* Phase 3d — v3 dispatch happens AFTER the mutex
@@ -4141,6 +4153,22 @@ public class Pollen {
     public static int TlsRejectedCount() {
         var n: int = 0
         @c { n = (int) atomic_load(&_pollen_tls_rejected); }
+        return n
+    }
+
+    // v0.9.0 — acknowledge a message consumed by an OnTopic handler only
+    // once the handler returned 0 ("stored"). A non-zero return means
+    // "not stored" : no ACK, so a sender using the durable outbox keeps
+    // the message and sends it again. Off by default (ACK on receipt).
+    public static void SetAckAfterHandler(on: bool) {
+        @c { atomic_store(&_pollen_ack_after_handler, on ? 1 : 0); }
+    }
+
+    // v0.9.0 — messages left unacknowledged because their handler
+    // returned non-zero (with SetAckAfterHandler).
+    public static int HandlerRefusedCount() {
+        var n: int = 0
+        @c { n = (int) atomic_load(&_pollen_handler_refused); }
         return n
     }
 

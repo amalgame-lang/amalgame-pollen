@@ -47,6 +47,8 @@ int main(void) {
         (void*) &Amalgame_Pollen_Pollen_TlsLastDenied,
         (void*) &Amalgame_Pollen_Pollen_PeerName,
         (void*) &Amalgame_Pollen_Pollen_PeerClaim,
+        (void*) &Amalgame_Pollen_Pollen_SetAckAfterHandler,
+        (void*) &Amalgame_Pollen_Pollen_HandlerRefusedCount,
         (void*) &Amalgame_Pollen_Pollen_OutboxPending,
         (void*) &Amalgame_Pollen_Pollen_OutboxDelivered,
         (void*) &Amalgame_Pollen_Pollen_EnvelopeMessageId,

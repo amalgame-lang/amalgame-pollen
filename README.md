@@ -9,6 +9,11 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.9.0** — acknowledge after the handler (`SetAckAfterHandler`) : a
+consumer that stores messages acknowledges them once stored, so a
+crash between receipt and storage loses nothing (the sender's durable
+outbox sends them again).
+
 **v0.8.0** — publish rights carried by the certificate : under TLS a
 node only publishes on the topics its certificate grants
 (`URI:pollen:publish:<topic>`), checked by every listener, with nothing
@@ -92,6 +97,7 @@ Smoke suites in CI (`tests/run_tests.sh` for C-side, `tests/run_am_tests.sh` for
 - **on_topic_smoke** — `OnTopic` handler, ACK, capability advertisement
 - **conn_reuse_smoke** — 2000 publishes over one pooled connection, in order ; reuse off / on
 - **outbox_smoke** — buffered `call` waits for a provider, delivered in order, each once ; `buffer` + `mode: "all"` rejected
+- **ack_after_smoke** — ACK on receipt by default, after the handler with `SetAckAfterHandler` ; refused message not acknowledged and counted ; retry acknowledged once stored
 - **tls_smoke** — mutual TLS : PublishSync and pooled publishes over TLS, another node accepted, a foreign certificate and clear TCP refused ; publish rights (wrong topic, no right, prefix boundary refused and counted), `PeerName` / `PeerClaim` in a handler
 - **header_consumer_check** — 53 public symbols verified
 - **listener_smoke** + **publish_smoke** — TCP transport baseline
@@ -139,6 +145,23 @@ certificate per node ; the node's identity is the certificate's common
 name (`Pollen.TlsName()`). `Pollen.TlsRejectedCount()` counts the
 connections the listener refused. Without `SetTls`, Pollen stays on
 clear TCP.
+
+### Acknowledge after the handler (v0.9.0)
+
+```amalgame
+Pollen.SetAckAfterHandler(true)
+Pollen.OnTopic("historian.in", (env: string) => {
+    if (!db.Insert(rowsOf(env))) { return 1 }    // not stored : no ACK, the sender sends it again
+    return 0                                     // stored : ACK
+})
+```
+
+A message consumed only by an `OnTopic` handler is acknowledged once the
+handler returned 0. A non-zero return leaves it unacknowledged
+(`Pollen.HandlerRefusedCount()`), so a sender using the durable outbox
+keeps it and sends it again : at-least-once delivery **to storage**, not
+just to the process. Return 0 for a message that can never be stored
+(and log it), or it would stay at the head of the sender's outbox.
 
 ### Publish rights in the certificate (v0.8.0)
 

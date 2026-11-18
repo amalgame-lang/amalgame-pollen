@@ -1,0 +1,95 @@
+// tests/ack_after_smoke.am — v0.9.0 Pollen.SetAckAfterHandler.
+//
+// One process, one handler that "stores" a message (returns 0) unless
+// its data says "refuse" (returns 1, as a database write that failed).
+//   1. without SetAckAfterHandler, a refused message is still ACKed (v0.8 behaviour)
+//   2. with it, a stored message is ACKed only after the handler returned :
+//      the handler takes 400 ms, the ACK comes after it
+//   3. a refused message gets no ACK, and is counted
+//   4. a sender that tries again (as the durable outbox does) gets its
+//      ACK once the handler stores it (here : at the third try)
+
+namespace PollenTests
+
+import Amalgame.Pollen
+import Amalgame.Threading
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Store {
+    public Stored: int
+    public Refusals: int     // the "flaky" topic refuses this many times first
+    public Flaky: int
+
+    public Store() {
+        this.Stored = 0
+        this.Refusals = 0
+        this.Flaky = 2
+    }
+}
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    public static void Main(string[] args) {
+        let port: int = 18791
+        let st: Store = new Store()
+        Pollen.OnTopic("ack.test", (env: string) => {
+            let d: string = Pollen.EnvelopeData(env)
+            if (String_Contains(d, "refuse")) { return 1 }
+            if (String_Contains(d, "slow")) { Threading.ThreadSleep(400) }
+            st.Stored = st.Stored + 1
+            return 0
+        })
+        // A store that fails twice before working (database briefly locked).
+        Pollen.OnTopic("ack.flaky", (env: string) => {
+            if (st.Refusals < st.Flaky) {
+                st.Refusals = st.Refusals + 1
+                return 1
+            }
+            st.Stored = st.Stored + 1
+            return 0
+        })
+        let listen = (_a: int) => {
+            Pollen.SetListenAddress("127.0.0.1")
+            Pollen.StartListener(port)
+            return 0
+        }
+        Threading.ThreadSpawn(listen, 0)
+        Threading.ThreadSleep(300)
+
+        // 1 — default : ACK on receipt, before the (slow) handler is done
+        let s00: int = st.Stored
+        let m0: string = Pollen.PublishSync("127.0.0.1", port, "ack.test", 1, "{\"v\":\"slow\"}", 2000)
+        Program.Check(String_Length(m0) > 0 && st.Stored == s00, "without SetAckAfterHandler, the ACK leaves before the handler has stored the message")
+        Threading.ThreadSleep(600)
+        let m1: string = Pollen.PublishSync("127.0.0.1", port, "ack.test", 1, "{\"v\":\"refuse\"}", 2000)
+        Program.Check(String_Length(m1) > 0, "without SetAckAfterHandler, a refused message is ACKed on receipt (v0.8 behaviour)")
+
+        Pollen.SetAckAfterHandler(true)
+        // 2 — stored : ACK after the handler
+        let s0: int = st.Stored
+        let m2: string = Pollen.PublishSync("127.0.0.1", port, "ack.test", 1, "{\"v\":\"slow\"}", 3000)
+        Program.Check(String_Length(m2) > 0, "with SetAckAfterHandler, a stored message is ACKed")
+        Program.Check(st.Stored == s0 + 1, "the ACK comes after the handler stored it (the handler takes 400 ms)")
+
+        // 3 — refused : no ACK
+        let r0: int = Pollen.HandlerRefusedCount()
+        let m3: string = Pollen.PublishSync("127.0.0.1", port, "ack.test", 1, "{\"v\":\"refuse\"}", 1500)
+        Program.Check(String_Length(m3) == 0, "a message its handler did not store gets no ACK")
+        Program.Check(Pollen.HandlerRefusedCount() - r0 == 1, "and is counted (HandlerRefusedCount)")
+
+        // 4 — the sender retries until the handler stores it
+        var tries: int = 0
+        var mid: string = ""
+        while (String_Length(mid) == 0 && tries < 5) {
+            mid = Pollen.PublishSync("127.0.0.1", port, "ack.flaky", 1, "{\"v\":1}", 1500)
+            tries = tries + 1
+        }
+        Program.Check(String_Length(mid) > 0 && tries == 3 && st.Refusals == 2, "refused twice, stored and ACKed at the third try (" + String_FromInt(tries) + " tries)")
+    }
+}
