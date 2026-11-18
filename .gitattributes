@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.pem text eol=lf
+*.key text eol=lf
+LICENSE -text

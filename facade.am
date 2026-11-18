@@ -251,6 +251,7 @@ import Amalgame.String
     #include <openssl/ssl.h>
     #include <openssl/err.h>
     #include <openssl/x509.h>
+    #include <openssl/x509v3.h>
     #include <stdatomic.h>
     #ifndef _WIN32
     #  include <signal.h>
@@ -289,6 +290,10 @@ import Amalgame.String
         SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
         SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
         if (server) SSL_CTX_set_session_id_context(ctx, (const unsigned char*) "pollen", 6);
+        /* v0.8.0 : no TLS 1.3 session tickets (no session cache anyway).
+         * A ticket arriving after the handshake made poll() report data
+         * that SSL_read consumed before blocking on the socket. */
+        if (server) SSL_CTX_set_num_tickets(ctx, 0);
         return ctx;
     }
 
@@ -424,6 +429,126 @@ import Amalgame.String
     #define POLLEN_HOST_MAX     64
 
     static pthread_mutex_t _pollen_wf_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    /* === v0.8.0 — publish rights carried by the certificate ======
+     *
+     * The site CA writes what a node may publish into the node's
+     * certificate, as subjectAltName URIs :
+     *     URI:pollen:publish:<topic>      that exact topic
+     *     URI:pollen:publish:<prefix>.*   every topic under <prefix>.
+     *     URI:pollen:publish:*            every topic
+     * Under TLS the listener only takes a message whose topic one of
+     * them matches ; a certificate without any right publishes
+     * nothing. Nothing to configure or keep in sync on the receivers :
+     * the right travels with the identity, and cannot be changed
+     * without the CA key. Every SAN URI is also kept as a claim the
+     * application reads while it handles the message (PeerClaim). */
+    #define POLLEN_RIGHTS_MAX  32
+    #define POLLEN_CLAIMS_MAX  2048
+    typedef struct {
+        int  tls;                                   /* rights enforced */
+        char cn[128];
+        int  n_pub;
+        char pub[POLLEN_RIGHTS_MAX][POLLEN_TOPIC_MAX];
+        char claims[POLLEN_CLAIMS_MAX];             /* SAN URIs, '\n' after each */
+        int  warned;                                /* first denial printed */
+    } pollen_peer_t;
+
+    static _Atomic long _pollen_topic_denied;
+    static char _pollen_last_denied[300] = "";
+    static pthread_mutex_t _pollen_denied_mu = PTHREAD_MUTEX_INITIALIZER;
+    /* The peer whose message this thread handles : OnTopic handlers
+     * and the v3 dispatch run on the listener worker of the connection. */
+    static _Thread_local const pollen_peer_t* _pollen_cur_peer = 0;
+
+    static void _pollen_peer_load(pollen_peer_t* p, SSL* ssl) {
+        memset(p, 0, sizeof(*p));
+        if (!ssl) return;
+        p->tls = 1;
+    #if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        X509* c = SSL_get1_peer_certificate(ssl);
+    #else
+        X509* c = SSL_get_peer_certificate(ssl);
+    #endif
+        if (!c) return;
+        X509_NAME_get_text_by_NID(X509_get_subject_name(c), NID_commonName, p->cn, sizeof(p->cn));
+        GENERAL_NAMES* gens = (GENERAL_NAMES*) X509_get_ext_d2i(c, NID_subject_alt_name, NULL, NULL);
+        const char* PUB = "pollen:publish:";
+        size_t pl = strlen(PUB), used = 0;
+        for (int i = 0; gens && i < sk_GENERAL_NAME_num(gens); i++) {
+            const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i);
+            if (g->type != GEN_URI) continue;
+            const char* s = (const char*) ASN1_STRING_get0_data(g->d.uniformResourceIdentifier);
+            int len = ASN1_STRING_length(g->d.uniformResourceIdentifier);
+            if (!s || len <= 0 || memchr(s, 0, (size_t) len) || memchr(s, '\n', (size_t) len)) continue;
+            if (used + (size_t) len + 1 < sizeof(p->claims)) {
+                memcpy(p->claims + used, s, (size_t) len);
+                used += (size_t) len;
+                p->claims[used++] = '\n';
+                p->claims[used] = 0;
+            }
+            if ((size_t) len > pl && strncmp(s, PUB, pl) == 0
+                && (size_t) len - pl < POLLEN_TOPIC_MAX && p->n_pub < POLLEN_RIGHTS_MAX) {
+                memcpy(p->pub[p->n_pub], s + pl, (size_t) len - pl);
+                p->pub[p->n_pub][(size_t) len - pl] = 0;
+                p->n_pub++;
+            }
+        }
+        if (gens) GENERAL_NAMES_free(gens);
+        X509_free(c);
+    }
+
+    /* "a.b" : a.b only ; "a.*" : a.<anything non-empty> ; "*" : all. */
+    static int _pollen_topic_match(const char* pat, const char* topic) {
+        if (strcmp(pat, "*") == 0) return topic[0] != 0;
+        size_t n = strlen(pat);
+        if (n >= 2 && pat[n - 1] == '*' && pat[n - 2] == '.')
+            return strncmp(topic, pat, n - 1) == 0 && topic[n - 1] != 0;
+        return strcmp(pat, topic) == 0;
+    }
+
+    static int _pollen_peer_may_publish(const pollen_peer_t* p, const char* topic) {
+        if (!p->tls) return 1;                      /* clear bus : no rights */
+        for (int i = 0; i < p->n_pub; i++)
+            if (_pollen_topic_match(p->pub[i], topic)) return 1;
+        return 0;
+    }
+
+    static void _pollen_peer_denied(pollen_peer_t* p, const char* topic) {
+        atomic_fetch_add(&_pollen_topic_denied, 1);
+        const char* who = p->cn[0] ? p->cn : "?";
+        const char* what = topic[0] ? topic : "(no topic)";
+        pthread_mutex_lock(&_pollen_denied_mu);
+        snprintf(_pollen_last_denied, sizeof(_pollen_last_denied), "%s -> %s", who, what);
+        pthread_mutex_unlock(&_pollen_denied_mu);
+        if (!p->warned) {                           /* once per connection */
+            p->warned = 1;
+            fprintf(stderr, "[pollen] refused : %s may not publish on %s (%s)\n", who, what,
+                    p->n_pub ? "not in the pollen:publish rights of its certificate"
+                             : "its certificate has no pollen:publish right");
+        }
+    }
+
+    /* First claim of the current peer starting with prefix, prefix
+     * removed ; "" outside a handler, on a clear bus, or if none. */
+    static const char* _pollen_peer_claim(const char* prefix) {
+        const pollen_peer_t* p = _pollen_cur_peer;
+        if (!p || !prefix) return "";
+        size_t pl = strlen(prefix);
+        for (const char* s = p->claims; *s; ) {
+            const char* e = strchr(s, '\n');
+            if (!e) break;
+            if ((size_t)(e - s) >= pl && strncmp(s, prefix, pl) == 0) {
+                size_t n = (size_t)(e - s) - pl;
+                char* r = (char*) GC_MALLOC_ATOMIC(n + 1);
+                if (!r) return "";
+                memcpy(r, s + pl, n); r[n] = 0;
+                return r;
+            }
+            s = e + 1;
+        }
+        return "";
+    }
 
 
     /* === Phase 6.2/6.3 — capability registry + load balancer ====
@@ -713,6 +838,10 @@ import Amalgame.String
         /* v0.7.0 : TLS handshake first when SetTls is on ; a peer
          * without a certificate from the site CA stops here. */
         if (!_pollen_io_open(&io, (int)(intptr_t) arg, 1)) return NULL;
+        /* v0.8.0 : who the peer is and what it may publish. */
+        pollen_peer_t peer;
+        _pollen_peer_load(&peer, io.ssl);
+        _pollen_cur_peer = &peer;
         char rbuf[16384];
         size_t rlen = 0;
         char ack[256];
@@ -743,6 +872,10 @@ import Amalgame.String
                 AmalgameClosure* app_handler = 0;
                 const char* v3_topic_gc = 0;
                 const char* v3_env_gc   = 0;
+                /* v0.8.0 : under TLS, refused unless the topic is in
+                 * the peer's rights (no topic : refused too). */
+                int denied = peer.tls;
+                char denied_topic[POLLEN_TOPIC_MAX] = "";
                 pthread_mutex_lock(&_pollen_wf_mutex);
                 {
                     const char* tp3 = _pollen_find(rbuf, line_len,
@@ -758,10 +891,12 @@ import Amalgame.String
                             if (tlen3 < sizeof(tnt)) {
                                 memcpy(tnt, tp3, tlen3);
                                 tnt[tlen3] = 0;
+                                memcpy(denied_topic, tnt, tlen3 + 1);
+                                if (_pollen_peer_may_publish(&peer, tnt)) denied = 0;
                                 int want_v3 = _pollen_v3_active && _pollen_v3_entry_count > 0
                                               && _pollen_v3_lookup_entry_by_topic(tnt) >= 0;
                                 AmalgameClosure* h = _pollen_handler_lookup(tnt);
-                                if (want_v3 || h) {
+                                if (!denied && (want_v3 || h)) {
                                     /* GC-dup so the AM call after the
                                      * unlock has stable storage. */
                                     char* td = (char*) GC_MALLOC_ATOMIC(tlen3 + 1);
@@ -784,6 +919,11 @@ import Amalgame.String
                      * shape as the v2 "topic not in consumes" branch. */
                     if (_pollen_v3_active && _pollen_v3_entry_count > 0 && !matched3) {
                         do_ack = 0;
+                    }
+                    /* v0.8.0 : no ACK, no handler, no dispatch. */
+                    if (denied) {
+                        do_ack = 0;
+                        _pollen_peer_denied(&peer, denied_topic);
                     }
                 }
 
@@ -889,6 +1029,7 @@ import Amalgame.String
             }
         }
     worker_done:
+        _pollen_cur_peer = 0;
         _pollen_io_close(&io);
         return NULL;
     }
@@ -1575,6 +1716,10 @@ import Amalgame.String
         size_t rlen = 0;
         int got_ack = 0;
         int remaining = timeout_ms > 0 ? timeout_ms : 5000;
+        /* v0.8.0 : under TLS, poll() readiness does not mean a whole
+         * record (or any application data) is there : SSL_read could
+         * block past the deadline. Bound the socket reads too. */
+        if (io.ssl) _pollen_set_io_timeouts(io.fd, remaining);
         while (rlen < sizeof(rbuf) - 1) {
             /* readiness wait — _pollen_poll_in (WSAPoll on Windows) */
             int64_t start = _pollen_now_ms_c();
@@ -3997,6 +4142,55 @@ public class Pollen {
         var n: int = 0
         @c { n = (int) atomic_load(&_pollen_tls_rejected); }
         return n
+    }
+
+    // v0.8.0 — messages the listener refused because the topic is not
+    // in the sender's rights (URI:pollen:publish:... in its certificate).
+    // A refused message gets no ACK, no handler call, no dispatch.
+    public static int TlsDeniedCount() {
+        var n: int = 0
+        @c { n = (int) atomic_load(&_pollen_topic_denied); }
+        return n
+    }
+
+    // v0.8.0 — the last refusal, "<sender CN> -> <topic>" ("" if none).
+    public static string TlsLastDenied() {
+        var s: string = ""
+        @c {
+            pthread_mutex_lock(&_pollen_denied_mu);
+            size_t n = strlen(_pollen_last_denied);
+            char* r = (char*) GC_MALLOC_ATOMIC(n + 1);
+            if (r) { memcpy(r, _pollen_last_denied, n + 1); s = r; }
+            pthread_mutex_unlock(&_pollen_denied_mu);
+        }
+        return s
+    }
+
+    // v0.8.0 — common name of the certificate of the node that sent the
+    // message being handled. Call it from an OnTopic handler (or a step
+    // of the v3 dispatch) ; "" elsewhere and on a clear bus.
+    public static string PeerName() {
+        var s: string = ""
+        @c {
+            /* Copy : the peer lives on the worker's stack, gone with the connection. */
+            if (_pollen_cur_peer) {
+                size_t n = strlen(_pollen_cur_peer->cn);
+                char* r = (char*) GC_MALLOC_ATOMIC(n + 1);
+                if (r) { memcpy(r, _pollen_cur_peer->cn, n + 1); s = r; }
+            }
+        }
+        return s
+    }
+
+    // v0.8.0 — a claim of the sender's certificate : its first
+    // subjectAltName URI that starts with `prefix`, prefix removed ;
+    // "" if none. With URI:kairos:site:acme/lyon in the certificate,
+    // PeerClaim("kairos:site:") is "acme/lyon", so a handler can check
+    // that a node only writes data of its own site. Same scope as PeerName.
+    public static string PeerClaim(prefix: string) {
+        var s: string = ""
+        @c { s = (code_string) _pollen_peer_claim((const char*) prefix); }
+        return s
     }
 
     // v0.4.0 — consume `topic` with application code. The handler

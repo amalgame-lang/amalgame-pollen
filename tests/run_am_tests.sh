@@ -31,6 +31,8 @@ DEV_DIR="$PKG_ROOT/${DEV_TAG}_${DEV_REV}"
 # Stage the working tree. Drop amc's compiled-facade cache so the
 # staged facade.am is what gets compiled.
 rm -rf "$DEV_DIR" /tmp/amc-pkg-Pollen*
+# On Windows amc keeps it in <drive>:\tmp instead (Git Bash : /<drive>/tmp).
+for d in /[a-z]/tmp; do [ -d "$d" ] && rm -rf "$d"/amc-pkg-Pollen*; done
 mkdir -p "$DEV_DIR"
 cp "$ROOT/facade.am" "$ROOT/amalgame.toml" "$DEV_DIR/"
 cp -r "$ROOT/runtime" "$DEV_DIR/runtime"

@@ -9,6 +9,12 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.8.0** — publish rights carried by the certificate : under TLS a
+node only publishes on the topics its certificate grants
+(`URI:pollen:publish:<topic>`), checked by every listener, with nothing
+to configure on the receivers. `PeerName` / `PeerClaim` tell a handler
+who sent the message and what its certificate claims.
+
 **v0.7.0** — mutual TLS on every connection (`SetTls`) : only nodes
 with a certificate from the site CA can publish or be reached.
 
@@ -86,8 +92,8 @@ Smoke suites in CI (`tests/run_tests.sh` for C-side, `tests/run_am_tests.sh` for
 - **on_topic_smoke** — `OnTopic` handler, ACK, capability advertisement
 - **conn_reuse_smoke** — 2000 publishes over one pooled connection, in order ; reuse off / on
 - **outbox_smoke** — buffered `call` waits for a provider, delivered in order, each once ; `buffer` + `mode: "all"` rejected
-- **tls_smoke** — mutual TLS : PublishSync and pooled publishes over TLS, another node accepted, a foreign certificate and clear TCP refused
-- **header_consumer_check** — 49 public symbols verified
+- **tls_smoke** — mutual TLS : PublishSync and pooled publishes over TLS, another node accepted, a foreign certificate and clear TCP refused ; publish rights (wrong topic, no right, prefix boundary refused and counted), `PeerName` / `PeerClaim` in a handler
+- **header_consumer_check** — 53 public symbols verified
 - **listener_smoke** + **publish_smoke** — TCP transport baseline
 
 ## API surface
@@ -133,6 +139,49 @@ certificate per node ; the node's identity is the certificate's common
 name (`Pollen.TlsName()`). `Pollen.TlsRejectedCount()` counts the
 connections the listener refused. Without `SetTls`, Pollen stays on
 clear TCP.
+
+### Publish rights in the certificate (v0.8.0)
+
+What a node may publish is written by the site CA into the node's
+certificate, as subjectAltName URIs :
+
+| URI | The node may publish on |
+|---|---|
+| `pollen:publish:plant.line1.raw` | that exact topic |
+| `pollen:publish:plant.line1.*` | every topic under `plant.line1.` |
+| `pollen:publish:*` | every topic |
+
+```bash
+# openssl x509 -req ... -extfile node.ext, with node.ext :
+subjectAltName=DNS:edge-1,URI:pollen:publish:plant.line1.raw,URI:pollen:publish:historian.in,URI:acme:site:plant/line1
+```
+
+Under TLS every listener checks the topic of each message against the
+sender's rights. **A certificate without any right publishes nothing.**
+A refused message gets no ACK, no handler call and no dispatch ; the
+listener prints the first refusal of each connection, and
+`Pollen.TlsDeniedCount()` / `Pollen.TlsLastDenied()` (`"<CN> -> <topic>"`)
+report them. There is nothing to configure or keep in sync on the
+receivers : the right travels with the node's identity and cannot be
+changed without the CA key. Changing a node's rights means issuing its
+certificate again.
+
+Inside an `OnTopic` handler (or a step of the v3 dispatch), the
+application knows who sent the message :
+
+```amalgame
+Pollen.OnTopic("historian.in", (env: string) => {
+    let who: string = Pollen.PeerName()                // CN of the sender
+    let site: string = Pollen.PeerClaim("acme:site:")  // "plant/line1"
+    // e.g. refuse data the sender claims for another site
+    return 0
+})
+```
+
+`PeerClaim(prefix)` returns the first SAN URI of the sender's
+certificate that starts with `prefix`, prefix removed ; both are `""`
+outside a handler and on a clear bus. Pollen gives the claims, the
+application decides what they mean.
 
 ### Durable outbox (v0.6.0)
 
@@ -223,16 +272,21 @@ isolated in one `#ifdef _WIN32` block at the top of `facade.am`. On
 Windows, Winsock is loaded at runtime from `ws2_32.dll`, so the
 manifest's `libs` stays the same on every OS.
 
-## Limitations (v0.7.x)
+## Limitations (v0.8.x)
 
 - Single-engine per process — multi-engine hosting (one process,
   two independent workflows on different port ranges) is unscheduled.
 - `OnTopic` covers "run my code on a message". Hooks on individual
   `PollenDispatcher` steps (the old v2 `OnComplete`) are unscheduled.
 - Without `SetTls`, payloads are plain JSON over TCP.
-- TLS authenticates nodes (any certificate from the site CA) ; there is
-  no per-topic authorisation yet (which node may publish what), and no
-  certificate revocation list : remove a node by re-issuing the CA.
+- Rights cover publishing. Receiving needs no right : a node only
+  receives what is sent to it, and the sender checks the listener's
+  certificate against the site CA.
+- No certificate revocation list yet : remove a node by re-issuing the
+  CA, or keep certificate lifetimes short.
+- A refused message gets no ACK : a sender using the durable outbox
+  keeps it on disk and retries. That is a configuration error to fix
+  (the listener prints it), not a transient one.
 
 ## Publishing checklist
 

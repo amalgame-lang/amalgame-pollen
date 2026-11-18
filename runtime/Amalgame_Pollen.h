@@ -94,6 +94,11 @@ code_bool   Amalgame_Pollen_Pollen_SetTls(code_string ca, code_string cert, code
 code_string Amalgame_Pollen_Pollen_TlsLastError(void);
 code_string Amalgame_Pollen_Pollen_TlsName(void);
 int64_t     Amalgame_Pollen_Pollen_TlsRejectedCount(void);
+/* v0.8.0 — publish rights carried by the certificate, peer identity. */
+int64_t     Amalgame_Pollen_Pollen_TlsDeniedCount(void);
+code_string Amalgame_Pollen_Pollen_TlsLastDenied(void);
+code_string Amalgame_Pollen_Pollen_PeerName(void);
+code_string Amalgame_Pollen_Pollen_PeerClaim(code_string prefix);
 int64_t     Amalgame_Pollen_Pollen_OutboxPending(void);
 int64_t     Amalgame_Pollen_Pollen_OutboxDelivered(void);
 code_string Amalgame_Pollen_Pollen_EnvelopeMessageId(code_string envelope);

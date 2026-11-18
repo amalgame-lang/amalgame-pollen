@@ -9,8 +9,15 @@
 //   4. another process with node-b (same CA) is accepted
 //   5. a process with a certificate from another CA is refused
 //   6. a process speaking clear TCP is refused
-// TLS is per process, so 4-6 run this same binary again as a client
-// ("tls_smoke client <legit|intruder|clear> <port>").
+// v0.8.0 — publish rights carried by the certificate :
+//   7. in a handler, PeerName / PeerClaim give node-b's CN and claims
+//   8. node-c (same CA, rights on other.*) is refused on tls.test
+//   9. node-none (same CA, no right) is refused
+//  10. node-b on a topic outside its rights (tls.other) is refused
+//  11. "tls.*" does not cover "tlsx.test"
+//  12. the refusals are counted, the last one named, nothing handled
+// TLS is per process, so 4-10 run this same binary again as a client
+// ("tls_smoke client <legit|intruder|clear|wrongtopic|norights|outside> <port>").
 // The certificates in tests/certs are for tests only.
 
 namespace PollenTests
@@ -25,10 +32,20 @@ import Amalgame.Console
 public class Seen {
     public Count: int
     public FromB: int
+    public Peer: string
+    public Site: string
+    public Role: string
+    public Missing: string
+    public SelfPeer: string
 
     public Seen() {
         this.Count = 0
         this.FromB = 0
+        this.Peer = ""
+        this.Site = ""
+        this.Role = ""
+        this.Missing = "unset"
+        this.SelfPeer = ""
     }
 }
 
@@ -51,7 +68,12 @@ public class Program {
     public static void Client(mode: string, port: int) {
         if (mode == "legit") { Pollen.SetTls("certs/ca.pem", "certs/node-b.pem", "certs/node-b.key") }
         if (mode == "intruder") { Pollen.SetTls("certs/ca.pem", "certs/intruder.pem", "certs/intruder.key") }
-        let mid: string = Pollen.PublishSync("127.0.0.1", port, "tls.test", 1, "{\"from\":\"" + mode + "\"}", 3000)
+        if (mode == "wrongtopic") { Pollen.SetTls("certs/ca.pem", "certs/node-c.pem", "certs/node-c.key") }
+        if (mode == "norights") { Pollen.SetTls("certs/ca.pem", "certs/node-none.pem", "certs/node-none.key") }
+        if (mode == "outside") { Pollen.SetTls("certs/ca.pem", "certs/node-b.pem", "certs/node-b.key") }
+        var topic: string = "tls.test"
+        if (mode == "outside") { topic = "tls.other" }
+        let mid: string = Pollen.PublishSync("127.0.0.1", port, topic, 1, "{\"from\":\"" + mode + "\"}", 3000)
         if (String_Length(mid) > 0) { Exit_Set(0) } else { Exit_Set(1) }
     }
 
@@ -84,7 +106,15 @@ public class Program {
         let seen: Seen = new Seen()
         Pollen.OnTopic("tls.test", (env: string) => {
             seen.Count = seen.Count + 1
-            if (String_Contains(Pollen.EnvelopeData(env), "legit")) { seen.FromB = seen.FromB + 1 }
+            let data: string = Pollen.EnvelopeData(env)
+            if (String_Contains(data, "legit")) {
+                seen.FromB = seen.FromB + 1
+                seen.Peer = Pollen.PeerName()
+                seen.Site = Pollen.PeerClaim("test:site:")
+                seen.Role = Pollen.PeerClaim("test:role:")
+                seen.Missing = Pollen.PeerClaim("test:zone:")
+            }
+            if (String_Contains(data, "self")) { seen.SelfPeer = Pollen.PeerName() }
             return 0
         })
         let listen = (_a: int) => {
@@ -121,5 +151,25 @@ public class Program {
         Program.Check(Pollen.TlsRejectedCount() - r0 == 2, "the listener counted 2 refused connections (got "
                       + String_FromInt(Pollen.TlsRejectedCount() - r0) + ")")
         Program.Check(seen.Count == 302, "no message from the refused peers (got " + String_FromInt(seen.Count) + ")")
+
+        // 7 — who sent it, from the certificate
+        Program.Check(seen.SelfPeer == "node-a", "PeerName in a handler is the sender's CN (self : " + seen.SelfPeer + ")")
+        Program.Check(seen.Peer == "node-b", "PeerName for node-b's message (got " + seen.Peer + ")")
+        Program.Check(seen.Site == "beta" && seen.Role == "edge", "PeerClaim reads the certificate's claims (site " + seen.Site + ", role " + seen.Role + ")")
+        Program.Check(seen.Missing == "", "PeerClaim of a missing claim is empty")
+        Program.Check(Pollen.PeerName() == "" && Pollen.PeerClaim("test:site:") == "", "PeerName / PeerClaim are empty outside a handler")
+
+        // 8-11 — publish rights
+        let d0: int = Pollen.TlsDeniedCount()
+        Program.Check(Process.RunTimeout(self + "wrongtopic" + p, 15000) != 0, "node-c (rights on other.*) is refused on tls.test")
+        Program.Check(Process.RunTimeout(self + "norights" + p, 15000) != 0, "node-none (no right in its certificate) is refused")
+        Program.Check(Process.RunTimeout(self + "outside" + p, 15000) != 0, "node-b is refused on tls.other (its right is tls.test only)")
+        let m2: string = Pollen.PublishSync("127.0.0.1", port, "tlsx.test", 1, "{\"from\":\"prefix\"}", 2000)
+        Program.Check(String_Length(m2) == 0, "tls.* does not cover tlsx.test")
+        Threading.ThreadSleep(300)
+        Program.Check(Pollen.TlsDeniedCount() - d0 == 4, "4 messages refused for rights (got " + String_FromInt(Pollen.TlsDeniedCount() - d0) + ")")
+        Program.Check(Pollen.TlsLastDenied() == "node-a -> tlsx.test", "TlsLastDenied names sender and topic (" + Pollen.TlsLastDenied() + ")")
+        Program.Check(Pollen.TlsRejectedCount() - r0 == 2, "a refused topic is not a refused connection")
+        Program.Check(seen.Count == 302, "no refused message reached the handler (got " + String_FromInt(seen.Count) + ")")
     }
 }

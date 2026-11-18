@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.8.0 — 2026-11-18
+
+### Added — publish rights carried by the certificate
+
+v0.7 authenticated nodes, but any node with a certificate from the site
+CA could publish on any topic. The site CA now writes what a node may
+publish into its certificate, as subjectAltName URIs :
+`pollen:publish:<topic>`, `pollen:publish:<prefix>.*`, `pollen:publish:*`.
+
+- Under TLS every listener checks the topic of each message against
+  the sender's rights. A refused message gets no ACK, no `OnTopic`
+  handler call and no v3 dispatch. The first refusal of a connection
+  is printed (`[pollen] refused : <CN> may not publish on <topic>`).
+- `Pollen.TlsDeniedCount()`, `Pollen.TlsLastDenied()` (`"<CN> -> <topic>"`).
+- `Pollen.PeerName()` and `Pollen.PeerClaim(prefix)` : in a handler, the
+  sender's CN and any claim of its certificate (first SAN URI starting
+  with `prefix`), so the application can check content against identity
+  (e.g. a node only writes data of the site it claims).
+- Nothing to configure on the receivers : the rights travel with the
+  identity and cannot be changed without the CA key.
+
+### Breaking
+
+- **Under TLS, a certificate without any `pollen:publish` right
+  publishes nothing.** Certificates issued for v0.7 must be issued
+  again with their rights. Without `SetTls`, nothing changes.
+
+### Fixed
+
+- `PublishSync` over TLS could block past its timeout when no ACK came :
+  the TLS 1.3 session ticket sent after the handshake made `poll()`
+  report data, then `SSL_read` blocked on the socket. The listener no
+  longer sends session tickets (there is no session cache), and
+  `PublishSync` bounds its TLS reads by the remaining timeout.
+- Test runner : drops amc's compiled-facade cache in `<drive>:\tmp` on
+  Windows too, so the working tree is what gets compiled.
+- Line endings : `.gitattributes` keeps LF in the working tree on
+  Windows (`core.autocrlf=true` broke the shell scripts under WSL).
+
+### Tests
+
+- `tests/tls_smoke.am` : 26 checks. New : `PeerName` / `PeerClaim` in a
+  handler (and empty outside), a node with rights on another topic, a
+  node without rights, a node outside its own rights, and `tls.*` not
+  covering `tlsx.test` are refused, counted and named ; a refused topic
+  is not counted as a refused connection. `tests/certs/make-rights.sh`
+  re-issues the test certificates with their rights (`node-c`,
+  `node-none` added). Green on Linux (Ubuntu 24.04) and Windows 11.
+
 ## v0.7.0 — 2026-11-10
 
 ### Added — mutual TLS on the bus (`Pollen.SetTls`)
