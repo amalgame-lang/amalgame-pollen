@@ -168,9 +168,24 @@ import Amalgame.String
         for (; got < n; got++) ((unsigned char*) buf)[got] = (unsigned char) rand();
     }
     static void _pollen_sleep_ms(int ms) { usleep((useconds_t) ms * 1000); }
+    /* v0.9.1 : the GC stops the world with signals ; poll() then returns
+     * EINTR. Wait again for the time left (monotonic clock) instead of
+     * reporting a timeout that did not happen. */
     static int  _pollen_poll_in(int fd, int timeout_ms) {
-        struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;
-        return poll(&pfd, 1, timeout_ms);
+        struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN;
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            pfd.revents = 0;
+            int left = timeout_ms;
+            if (timeout_ms > 0) {
+                struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+                long el = (long) (t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000;
+                left = timeout_ms - (int) el;
+                if (left <= 0) return 0;
+            }
+            int r = poll(&pfd, 1, left);
+            if (r >= 0 || errno != EINTR) return r;
+        }
     }
     static void _pollen_set_rcvtimeo(int fd, int ms) {
         struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
@@ -323,6 +338,25 @@ import Amalgame.String
     /* A connection : the socket, plus the TLS session when TLS is on. */
     typedef struct { int fd; SSL* ssl; } pollen_io_t;
 
+    /* v0.9.1 : a read or write interrupted by a signal (the GC's
+     * stop-the-world, EINTR) is tried again, not taken for a closed
+     * connection. Under TLS, OpenSSL reports it as WANT_READ, WANT_WRITE
+     * or SYSCALL with errno EINTR. A SO_RCVTIMEO timeout (EAGAIN) still
+     * ends the read. */
+    static int _pollen_eintr(pollen_io_t* io, int r) {
+    #ifdef _WIN32
+        (void) io; (void) r;
+        return 0;
+    #else
+        if (errno != EINTR) return 0;
+        if (!io->ssl) return 1;
+        int e = SSL_get_error(io->ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SYSCALL) { ERR_clear_error(); return 1; }
+        return 0;
+    #endif
+    }
+
+
     /* Client / server handshake on a connected, blocking socket.
      * Without TLS, just records the fd. Returns 1 on success ; on
      * failure the socket is closed. */
@@ -334,7 +368,19 @@ import Amalgame.String
         if (!s) { _pollen_tls_seterr("SSL_new"); _pollen_sock_close(fd); return 0; }
         SSL_set_fd(s, fd);
         _pollen_set_io_timeouts(fd, POLLEN_TLS_HANDSHAKE_MS);
-        int r = server ? SSL_accept(s) : SSL_connect(s);
+        /* v0.9.1 : a handshake interrupted by a signal (EINTR) goes on,
+         * within the handshake delay, instead of being refused. */
+        pollen_io_t hs; hs.fd = fd; hs.ssl = s;
+        struct timespec h0; clock_gettime(CLOCK_MONOTONIC, &h0);
+        int r;
+        for (;;) {
+            errno = 0;
+            r = server ? SSL_accept(s) : SSL_connect(s);
+            if (r == 1 || !_pollen_eintr(&hs, r)) break;
+            struct timespec h1; clock_gettime(CLOCK_MONOTONIC, &h1);
+            long el = (long) (h1.tv_sec - h0.tv_sec) * 1000 + (h1.tv_nsec - h0.tv_nsec) / 1000000;
+            if (el >= POLLEN_TLS_HANDSHAKE_MS) break;
+        }
         _pollen_set_io_timeouts(fd, 0);
         if (r != 1) {
             _pollen_tls_seterr(server ? "handshake refused (listener)" : "handshake refused");
@@ -353,16 +399,29 @@ import Amalgame.String
 
     /* Blocking reads and writes. recv returns <= 0 when closed. */
     static long _pollen_io_recv(pollen_io_t* io, char* buf, size_t n) {
-        if (!io->ssl) return (long) recv(io->fd, buf, n, 0);
-        int r = SSL_read(io->ssl, buf, (int) n);
-        return r > 0 ? r : -1;
+        for (;;) {
+            if (!io->ssl) {
+                long r = (long) recv(io->fd, buf, n, 0);
+                if (r < 0 && _pollen_eintr(io, -1)) continue;
+                return r;
+            }
+            errno = 0;
+            int r = SSL_read(io->ssl, buf, (int) n);
+            if (r > 0) return r;
+            if (_pollen_eintr(io, r)) continue;
+            return -1;
+        }
     }
     static int _pollen_io_send_all(pollen_io_t* io, const char* buf, size_t n) {
         size_t sent = 0;
         while (sent < n) {
+            errno = 0;
             long w = io->ssl ? SSL_write(io->ssl, buf + sent, (int) (n - sent))
                              : (long) send(io->fd, buf + sent, n - sent, MSG_NOSIGNAL);
-            if (w <= 0) return 0;
+            if (w <= 0) {
+                if (_pollen_eintr(io, (int) w)) continue;
+                return 0;
+            }
             sent += (size_t) w;
         }
         return 1;

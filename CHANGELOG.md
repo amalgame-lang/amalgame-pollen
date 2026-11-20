@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.9.1 — 2026-11-21
+
+### Fixed — waits interrupted by the garbage collector's signals
+
+The garbage collector stops the world with signals (Linux, macOS). A
+thread blocked in `poll()`, `recv()` / `SSL_read()`, `send()` /
+`SSL_write()` or in the TLS handshake then returns early with `EINTR`
+(OpenSSL : `WANT_READ`, `WANT_WRITE` or `SYSCALL`). Pollen took that for
+a timeout or a closed connection : `PublishSync` reported "not
+acknowledged" for a message the listener had handled and acknowledged,
+and a handshake could be refused, as soon as a collection happened
+during the wait. Found by Kairos : a command to a PLC written and read
+back, but reported unacknowledged.
+
+- `poll()` waits again for the time left (monotonic clock) ;
+- reads and writes are tried again ; a `SO_RCVTIMEO` timeout still ends
+  a read ;
+- the TLS handshake goes on within its delay.
+
+`tests/gc_signal_smoke.am` : 20 `PublishSync` with a 300 ms handler
+(acknowledged after the handler) while another thread collects without
+pause : 0/20 acknowledged before, 20/20 after, in clear and in TLS.
+Windows is unchanged (no such signals).
+
 ## v0.9.0 — 2026-11-18
 
 ### Added — acknowledge after the handler (`Pollen.SetAckAfterHandler`)

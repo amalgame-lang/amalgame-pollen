@@ -1,0 +1,88 @@
+// tests/gc_signal_smoke.am — waits that survive the GC's signals.
+//
+// The garbage collector stops the world with signals (Linux, macOS) :
+// a thread blocked in poll() or SSL_read() then returns early with
+// EINTR. Before v0.9.1, PublishSync took that for "no ACK" : a message
+// handled by the listener (ACK after the handler) was reported as not
+// delivered when a collection happened while the sender waited.
+// Found by Kairos : a command to a PLC written and read back, but
+// reported "not acknowledged".
+//
+// One process : a listener whose handler takes 300 ms (ACK after the
+// handler), a thread that forces collections without pause, and
+// PublishSync calls that must all get their ACK — in clear, then in TLS.
+
+namespace PollenTests
+
+import Amalgame.Pollen
+import Amalgame.Threading
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Churn {
+    public Run: bool
+    public Collections: int
+
+    public Churn() {
+        this.Run = true
+        this.Collections = 0
+    }
+}
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    // n PublishSync to the listener ; how many got their ACK.
+    public static int Send(port: int, topic: string, n: int) {
+        var acked: int = 0
+        for i in 0..n {
+            let mid: string = Pollen.PublishSync("127.0.0.1", port, topic, 1, "{\"i\":" + String_FromInt(i) + "}", 5000)
+            if (String_Length(mid) > 0) { acked = acked + 1 }
+        }
+        return acked
+    }
+
+    public static void Main(string[] args) {
+        let port: int = 18793
+        let n: int = 20
+        Pollen.SetAckAfterHandler(true)
+        Pollen.OnTopic("tls.gc", (env: string) => {
+            Threading.ThreadSleep(300)
+            return 0
+        })
+        let listen = (_a: int) => {
+            Pollen.SetListenAddress("127.0.0.1")
+            Pollen.StartListener(port)
+            return 0
+        }
+        Threading.ThreadSpawn(listen, 0)
+        Threading.ThreadSleep(300)
+
+        // Collections without pause, from another thread.
+        let ch: Churn = new Churn()
+        let churn = (_a: int) => {
+            while (ch.Run) {
+                let junk: List<string> = new List<string>()
+                for k in 0..200 { junk.Add("x" + String_FromInt(k)) }
+                @c { GC_gcollect(); }
+                ch.Collections = ch.Collections + 1
+                Threading.ThreadSleep(2)
+            }
+            return 0
+        }
+        Threading.ThreadSpawn(churn, 0)
+
+        let clear: int = Program.Send(port, "tls.gc", n)
+        Program.Check(clear == n, "in clear : " + String_FromInt(clear) + "/" + String_FromInt(n) + " PublishSync acknowledged while the GC collects without pause")
+
+        Pollen.SetTls("certs/ca.pem", "certs/node-a.pem", "certs/node-a.key")
+        let tls: int = Program.Send(port, "tls.gc", n)
+        Program.Check(tls == n, "in TLS : " + String_FromInt(tls) + "/" + String_FromInt(n) + " PublishSync acknowledged while the GC collects without pause")
+        ch.Run = false
+        Program.Check(ch.Collections > 20, String_FromInt(ch.Collections) + " collections during the test")
+    }
+}
