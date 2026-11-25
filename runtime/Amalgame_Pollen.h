@@ -78,6 +78,13 @@ void        Amalgame_Pollen_Pollen_StartCapabilityReader(void);
 void        Amalgame_Pollen_Pollen_SetLoadBalance(code_bool on);
 int64_t     Amalgame_Pollen_Pollen_RegistrySize(void);
 code_string Amalgame_Pollen_Pollen_ResolveProvider(code_string topic);
+/* v0.10.0 — discovery over the network (pollen.capabilities). */
+void        Amalgame_Pollen_Pollen_AddPeer(code_string host, int64_t port);
+int64_t     Amalgame_Pollen_Pollen_PeerCount(void);
+int64_t     Amalgame_Pollen_Pollen_AnnouncesIn(void);
+code_string Amalgame_Pollen_Pollen_NetRegistryJson(void);
+code_bool   Amalgame_Pollen_Pollen_AddOutboxMember(code_string topic, code_string label);
+int64_t     Amalgame_Pollen_Pollen_OutboxPendingFor(code_string topic, code_string label);
 
 /* v0.5.0 — Publish / call keep one TCP connection per peer (default
  * on) ; ConnectCount counts pooled connects, for tests. */

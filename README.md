@@ -9,6 +9,13 @@ This package extracts the workflow runtime that originally lived inside the `pol
 
 ## Status
 
+**v0.10.0** — nodes on several machines : discovery over the network
+(`AddPeer` : capabilities announced on the bus, by the receiver's clock,
+under TLS rights), and durable fan-out (`mode: "all"` with
+`on_error: "buffer"` : one FIFO per member, named by its label ; a
+member down gets everything back, in order). For redundant consumers,
+e.g. two or more servers each keeping the whole history.
+
 **v0.9.0** — acknowledge after the handler (`SetAckAfterHandler`) : a
 consumer that stores messages acknowledges them once stored, so a
 crash between receipt and storage loses nothing (the sender's durable
@@ -225,6 +232,41 @@ keeps the recent `Pollen.EnvelopeMessageId(env)` values. The ACK is
 sent when the provider's listener receives the message, before its
 handler runs. `Pollen.OutboxPending()` and `Pollen.OutboxDelivered()`
 give the state of the outbox.
+
+### Durable fan-out (v0.10.0)
+
+`mode: "all"` with `on_error: "buffer"` : every member of the topic's
+group gets every message, each from its own FIFO
+(`<outbox>/<topic>/@<label>/`). A member is named by its label, the
+stable name given to `StartCapabilityWriter`.
+
+```amalgame
+Pollen.AddOutboxMember("app.history", "historian-a")   // known from the start
+Pollen.AddOutboxMember("app.history", "historian-b")   // down now : its FIFO fills
+```
+
+```json
+{ "type": "call", "action": "history", "mode": "all", "on_error": "buffer" }
+```
+
+A member down only holds its own messages ; when it is back it gets
+them all, in order. `Pollen.OutboxPendingFor(topic, label)` says what
+waits for one member.
+
+### Discovery over the network (v0.10.0)
+
+```amalgame
+Pollen.AddPeer("10.0.0.11", 7101)       // a server's listener
+Pollen.StartCapabilityWriter("edge-nord", "10.0.0.21", 7001)
+Pollen.StartCapabilityReader()
+```
+
+Each node announces its capability on `pollen.capabilities` every 2 s to
+its peers (the `AddPeer` seeds, and every node it heard from). The
+registry keeps an announcement for 7 s by the receiver's own clock, and
+merges it with the capability files of `sharedDir`, if any. Under TLS,
+announcing needs the right `pollen:publish:pollen.capabilities`.
+`NetRegistryJson()` lists the providers known by announcement.
 
 ### Capability discovery + load balancer (Phase 6.1-6.3)
 

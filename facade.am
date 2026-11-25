@@ -629,6 +629,7 @@ import Amalgame.String
     typedef struct {
         char    host[POLLEN_HOST_MAX];
         int     port;
+        char    label[64];          /* v0.10.0 : the node's stable name (StartCapabilityWriter) */
         char    actions[POLLEN_REG_ACTIONS_MAX][POLLEN_TOPIC_MAX];
         int     n_actions;
         long    inflight;
@@ -640,6 +641,52 @@ import Amalgame.String
     static pthread_mutex_t   _pollen_reg_mutex = PTHREAD_MUTEX_INITIALIZER;
     static int               _pollen_reader_active = 0;
     static int               _pollen_lb_enabled = 0;
+
+    /* v0.10.0 — discovery over the network. Each node announces its
+     * capability (the same JSON as the capability file) on the reserved
+     * topic pollen.capabilities to its peers every 2 s : the seeds given
+     * by AddPeer, and every node it heard an announcement from (so edges
+     * need only the servers' addresses ; the servers learn the edges).
+     * An announcement is kept while it is fresh by the RECEIVER's clock
+     * (no clock skew between machines) and merged with the capability
+     * files of sharedDir, when there is one. Under TLS it is a message
+     * like any other : refused unless the sender's certificate has the
+     * right pollen:publish:pollen.capabilities. */
+    #define POLLEN_PEERS_MAX     32
+    #define POLLEN_NET_STALE_MS  7000
+    #define POLLEN_CAP_TOPIC     "pollen.capabilities"
+    typedef struct { char host[POLLEN_HOST_MAX]; int port; int seed; } pollen_netpeer_t;
+    static pollen_netpeer_t _pollen_peers[POLLEN_PEERS_MAX];
+    static int             _pollen_peer_n = 0;
+    typedef struct { char id[48]; char label[64]; pollen_provider_t p; int64_t seen; } pollen_netcap_t;
+    static pollen_netcap_t _pollen_net[POLLEN_REG_MAX];
+    static int             _pollen_net_n = 0;
+    static pthread_mutex_t _pollen_net_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static _Atomic long    _pollen_announces_in = 0;
+    static int  _pollen_publish_pooled(const char* host, int port, const char* topic_uuid,
+                                       int64_t topic_version, const char* data_json, char* out_mid);
+    static int  _pollen_reg_parse_one(const char* buf, size_t len, pollen_provider_t* p);
+    static void _pollen_net_ingest(const char* env);
+
+    /* A peer to announce to ; 1 when it was not known. */
+    static int _pollen_add_peer(const char* host, int port, int seed) {
+        if (!host || !host[0] || port <= 0 || strlen(host) >= POLLEN_HOST_MAX) return 0;
+        int added = 0;
+        pthread_mutex_lock(&_pollen_net_mutex);
+        int found = -1;
+        for (int i = 0; i < _pollen_peer_n; i++)
+            if (_pollen_peers[i].port == port && strcmp(_pollen_peers[i].host, host) == 0) { found = i; break; }
+        if (found >= 0) { if (seed) _pollen_peers[found].seed = 1; }
+        else if (_pollen_peer_n < POLLEN_PEERS_MAX) {
+            strcpy(_pollen_peers[_pollen_peer_n].host, host);
+            _pollen_peers[_pollen_peer_n].port = port;
+            _pollen_peers[_pollen_peer_n].seed = seed;
+            _pollen_peer_n++;
+            added = 1;
+        }
+        pthread_mutex_unlock(&_pollen_net_mutex);
+        return added;
+    }
 
     static const char _pollen_pkg_unimpl_warning[] =
         "amalgame-pollen v0.1.0-dev : %s is a stub. "
@@ -951,6 +998,7 @@ import Amalgame.String
                  *   without a loaded workflow. */
                 int do_ack = 1;
                 int v3_handled = 0;
+                int cap_msg = 0;
                 AmalgameClosure* app_handler = 0;
                 const char* v3_topic_gc = 0;
                 const char* v3_env_gc   = 0;
@@ -978,7 +1026,8 @@ import Amalgame.String
                                 int want_v3 = _pollen_v3_active && _pollen_v3_entry_count > 0
                                               && _pollen_v3_lookup_entry_by_topic(tnt) >= 0;
                                 AmalgameClosure* h = _pollen_handler_lookup(tnt);
-                                if (!denied && (want_v3 || h)) {
+                                int cap_in = strcmp(tnt, POLLEN_CAP_TOPIC) == 0;
+                                if (!denied && (want_v3 || h || cap_in)) {
                                     /* GC-dup so the AM call after the
                                      * unlock has stable storage. */
                                     char* td = (char*) GC_MALLOC_ATOMIC(tlen3 + 1);
@@ -990,6 +1039,7 @@ import Amalgame.String
                                         v3_env_gc   = ed;
                                         v3_handled  = want_v3;
                                         app_handler = h;
+                                        cap_msg     = cap_in;
                                         matched3    = 1;
                                     }
                                 }
@@ -1018,6 +1068,9 @@ import Amalgame.String
                     goto worker_done;
                 }
                 pthread_mutex_unlock(&_pollen_wf_mutex);
+
+                /* v0.10.0 — an announcement from a peer. */
+                if (cap_msg && v3_env_gc) _pollen_net_ingest(v3_env_gc);
 
                 /* v0.4.0 — application handler (Pollen.OnTopic). Runs
                  * outside the wf mutex, on this connection's worker
@@ -1162,11 +1215,15 @@ import Amalgame.String
      * tmp+rename so a reader never sees a half-written file. */
     static void* _pollen_capability_writer(void* arg) {
         (void) arg;
+        int64_t last_file = 0;
         for (;;) {
-            if (_pollen_shared_dir[0] && _pollen_cap_instance[0]) {
+            if (_pollen_cap_instance[0]) {
                 char dir[600];
-                snprintf(dir, sizeof(dir), "%s/capabilities", _pollen_shared_dir);
-                _pollen_mkdir(dir);
+                dir[0] = 0;
+                if (_pollen_shared_dir[0]) {
+                    snprintf(dir, sizeof(dir), "%s/capabilities", _pollen_shared_dir);
+                    _pollen_mkdir(dir);
+                }
 
                 /* actions[] from the v3 entries' `on:` topics — the
                  * topics this node will consume when a bus message
@@ -1190,7 +1247,24 @@ import Amalgame.String
                     _pollen_cap_instance, _pollen_self_host, _pollen_self_port,
                     _pollen_cap_label[0] ? _pollen_cap_label : _pollen_cap_instance,
                     actions, inflight, handled, (long long) now);
-                if (n > 0 && n < (int) sizeof(buf)) {
+                /* v0.10.0 — the same JSON to the peers, every 2 s. */
+                if (n > 1 && n < (int) sizeof(buf)) {
+                    pollen_netpeer_t peers[POLLEN_PEERS_MAX];
+                    int np = 0;
+                    pthread_mutex_lock(&_pollen_net_mutex);
+                    np = _pollen_peer_n;
+                    memcpy(peers, _pollen_peers, sizeof(pollen_netpeer_t) * (size_t) np);
+                    pthread_mutex_unlock(&_pollen_net_mutex);
+                    char data[4096];
+                    memcpy(data, buf, (size_t) n - 1); data[n - 1] = 0;      /* without the newline */
+                    for (int i = 0; i < np; i++) {
+                        if (peers[i].port == _pollen_self_port && strcmp(peers[i].host, _pollen_self_host) == 0) continue;
+                        char mid[37];
+                        _pollen_publish_pooled(peers[i].host, peers[i].port, POLLEN_CAP_TOPIC, 1, data, mid);
+                    }
+                }
+                if (dir[0] && n > 0 && n < (int) sizeof(buf) && now - last_file >= 5000) {
+                    last_file = now;
                     char path[800], tmp[920];
                     snprintf(path, sizeof(path), "%s/%s.json", dir, _pollen_cap_instance);
                     snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid());
@@ -1202,9 +1276,44 @@ import Amalgame.String
                     }
                 }
             }
-            _pollen_sleep_ms(5000);
+            _pollen_sleep_ms(2000);
         }
         return NULL;
+    }
+
+    /* v0.10.0 — an announcement received : the provider it describes,
+     * fresh as of now (the receiver's clock), and its sender learned as
+     * a peer to announce back to. */
+    static void _pollen_net_ingest(const char* env) {
+        const char* v; size_t vlen;
+        size_t len = strlen(env);
+        if (!_pollen_json_field(env, len, "data", 4, &v, &vlen) || vlen < 2 || *v != '{') return;
+        pollen_netcap_t nc;
+        memset(&nc, 0, sizeof(nc));
+        if (!_pollen_reg_parse_one(v, vlen, &nc.p)) return;
+        const char* iv; size_t ilen;
+        if (_pollen_json_field(v, vlen, "instanceId", 10, &iv, &ilen) && ilen >= 2 && ilen - 2 < sizeof(nc.id)) {
+            memcpy(nc.id, iv + 1, ilen - 2); nc.id[ilen - 2] = 0;
+        }
+        if (_pollen_json_field(v, vlen, "label", 5, &iv, &ilen) && ilen >= 2 && ilen - 2 < sizeof(nc.label)) {
+            memcpy(nc.label, iv + 1, ilen - 2); nc.label[ilen - 2] = 0;
+        }
+        if (!nc.id[0]) return;
+        if (nc.p.port == _pollen_self_port && strcmp(nc.p.host, _pollen_self_host) == 0) return;
+        nc.seen = _pollen_now_ms_c();
+        nc.p.heartbeat = nc.seen;
+        atomic_fetch_add(&_pollen_announces_in, 1);
+        pthread_mutex_lock(&_pollen_net_mutex);
+        int slot = -1;
+        /* The same node (instance), or the same address after a restart. */
+        for (int i = 0; i < _pollen_net_n; i++) {
+            if (strcmp(_pollen_net[i].id, nc.id) == 0
+                || (_pollen_net[i].p.port == nc.p.port && strcmp(_pollen_net[i].p.host, nc.p.host) == 0)) { slot = i; break; }
+        }
+        if (slot < 0 && _pollen_net_n < POLLEN_REG_MAX) slot = _pollen_net_n++;
+        if (slot >= 0) _pollen_net[slot] = nc;
+        pthread_mutex_unlock(&_pollen_net_mutex);
+        _pollen_add_peer(nc.p.host, nc.p.port, 0);
     }
 
     static void
@@ -1240,7 +1349,11 @@ import Amalgame.String
                                        pollen_provider_t* p) {
         const char* v; size_t vlen;
         p->n_actions = 0; p->inflight = 0; p->heartbeat = 0;
-        p->host[0] = 0; p->port = 0;
+        p->host[0] = 0; p->port = 0; p->label[0] = 0;
+        if (_pollen_json_field(buf, len, "label", 5, &v, &vlen)
+            && vlen >= 2 && *v == '"' && vlen - 2 < sizeof(p->label)) {
+            memcpy(p->label, v + 1, vlen - 2); p->label[vlen - 2] = 0;
+        }
 
         if (_pollen_json_field(buf, len, "host", 4, &v, &vlen)
             && vlen >= 2 && *v == '"') {
@@ -1292,14 +1405,15 @@ import Amalgame.String
     static void* _pollen_capability_reader(void* arg) {
         (void) arg;
         for (;;) {
-            if (_pollen_shared_dir[0]) {
+            {
+                pollen_provider_t tmp[POLLEN_REG_MAX];
+                int tn = 0;
+                int64_t now = _pollen_now_ms_c();
                 char dir[600];
-                snprintf(dir, sizeof(dir), "%s/capabilities", _pollen_shared_dir);
-                DIR* d = opendir(dir);
+                dir[0] = 0;
+                if (_pollen_shared_dir[0]) snprintf(dir, sizeof(dir), "%s/capabilities", _pollen_shared_dir);
+                DIR* d = dir[0] ? opendir(dir) : NULL;
                 if (d) {
-                    pollen_provider_t tmp[POLLEN_REG_MAX];
-                    int tn = 0;
-                    int64_t now = _pollen_now_ms_c();
                     struct dirent* de;
                     while ((de = readdir(d)) != NULL && tn < POLLEN_REG_MAX) {
                         const char* nm = de->d_name;
@@ -1321,14 +1435,24 @@ import Amalgame.String
                         tmp[tn++] = p;
                     }
                     closedir(d);
-                    pthread_mutex_lock(&_pollen_reg_mutex);
-                    if (tn > 0) memcpy(_pollen_reg, tmp,
-                                       sizeof(pollen_provider_t) * (size_t) tn);
-                    _pollen_reg_n = tn;
-                    pthread_mutex_unlock(&_pollen_reg_mutex);
                 }
+                /* v0.10.0 — the fresh announcements, once per address. */
+                pthread_mutex_lock(&_pollen_net_mutex);
+                for (int i = 0; i < _pollen_net_n && tn < POLLEN_REG_MAX; i++) {
+                    if (now - _pollen_net[i].seen > POLLEN_NET_STALE_MS) continue;
+                    int dup = 0;
+                    for (int k = 0; k < tn; k++)
+                        if (tmp[k].port == _pollen_net[i].p.port && strcmp(tmp[k].host, _pollen_net[i].p.host) == 0) { dup = 1; break; }
+                    if (!dup) tmp[tn++] = _pollen_net[i].p;
+                }
+                pthread_mutex_unlock(&_pollen_net_mutex);
+                pthread_mutex_lock(&_pollen_reg_mutex);
+                if (tn > 0) memcpy(_pollen_reg, tmp,
+                                   sizeof(pollen_provider_t) * (size_t) tn);
+                _pollen_reg_n = tn;
+                pthread_mutex_unlock(&_pollen_reg_mutex);
             }
-            _pollen_sleep_ms(2000);  /* 2s */
+            _pollen_sleep_ms(1000);  /* 1s : a provider gone shows within the stale delay + 1 s */
         }
         return NULL;
     }
@@ -1367,6 +1491,27 @@ import Amalgame.String
             out_host[host_cap - 1] = 0;
             *out_port = _pollen_reg[chosen].port;
             ok = 1;
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        return ok;
+    }
+
+    /* v0.10.0 — the live provider of `topic` whose label is `label`. */
+    static int _pollen_reg_find_label(const char* topic, const char* label, char* out_host,
+                                        size_t host_cap, int* out_port) {
+        int ok = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n && !ok; i++) {
+            if (strcmp(_pollen_reg[i].label, label) != 0) continue;
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++) {
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) {
+                    strncpy(out_host, _pollen_reg[i].host, host_cap - 1);
+                    out_host[host_cap - 1] = 0;
+                    *out_port = _pollen_reg[i].port;
+                    ok = 1;
+                    break;
+                }
+            }
         }
         pthread_mutex_unlock(&_pollen_reg_mutex);
         return ok;
@@ -2529,7 +2674,17 @@ import Amalgame.String
      * provider does not hold the other topics. The ACK is sent by the
      * provider's listener when the message is received, before the
      * provider's handler runs : a consumer that buffers in memory can
-     * still lose what it had not stored when it crashes. */
+     * still lose what it had not stored when it crashes.
+     *
+     * v0.10.0 — mode "all" with "buffer" : DURABLE FAN-OUT. Each member
+     * of the topic's group, named by its label (a node's stable name),
+     * has its own FIFO : <topic>/@<label>/. Members are declared with
+     * AddOutboxMember (so a member down from the start gets every
+     * message) and added when a live provider of the topic with a label
+     * is seen. A message is written to every member's FIFO ; each FIFO
+     * drains to the provider with that label, at its own pace : a member
+     * down only holds its own messages, and gets them all when it is
+     * back, in order. */
     #define POLLEN_OUTBOX_ACK_MS 3000
     static char            _pollen_outbox_dir[700] = "";
     static pthread_mutex_t _pollen_outbox_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2674,7 +2829,7 @@ import Amalgame.String
 
     /* Deliver the messages of one topic directory, in order. Returns
      * the number delivered ; stops at the first failure. */
-    static int _pollen_outbox_drain_topic(const char* tdir) {
+    static int _pollen_outbox_drain_dir(const char* tdir, const char* label) {
         int n = 0, done = 0;
         char** files = _pollen_outbox_list(tdir, 0, &n);
         for (int i = 0; i < n; i++) {
@@ -2694,9 +2849,11 @@ import Amalgame.String
             const char* mid = strchr(files[i], '-');
             mid = mid ? strchr(mid + 1, '-') : 0;
             char host[POLLEN_HOST_MAX]; int port = 0;
-            int ok = mid && strlen(mid + 1) >= 36
-                  && _pollen_lb_pick(topic, host, sizeof(host), &port)
+            int found = label ? _pollen_reg_find_label(topic, label, host, sizeof(host), &port)
+                              : _pollen_lb_pick(topic, host, sizeof(host), &port);
+            int ok = mid && strlen(mid + 1) >= 36 && found
                   && _pollen_outbox_send(host, port, env, mid + 1);
+            if (getenv("POLLEN_OUTBOX_TRACE")) fprintf(stderr, "[outbox] %s %s -> %s:%d (%s) %s\n", ok ? "delivered" : "failed", files[i], found ? host : "?", found ? port : 0, label ? label : "one", topic);
             free(content);
             if (!ok) break;
             remove(path);
@@ -2705,6 +2862,21 @@ import Amalgame.String
             done++;
         }
         _pollen_outbox_free(files, n);
+        return done;
+    }
+
+    /* A topic directory : its own FIFO (mode one), then each member's. */
+    static int _pollen_outbox_drain_topic(const char* tdir) {
+        int done = _pollen_outbox_drain_dir(tdir, 0);
+        int nm = 0;
+        char** members = _pollen_outbox_list(tdir, 1, &nm);
+        for (int m = 0; m < nm; m++) {
+            if (members[m][0] != '@') continue;
+            char mdir[1100];
+            snprintf(mdir, sizeof(mdir), "%s/%s", tdir, members[m]);
+            done += _pollen_outbox_drain_dir(mdir, members[m] + 1);
+        }
+        _pollen_outbox_free(members, nm);
         return done;
     }
 
@@ -2720,6 +2892,16 @@ import Amalgame.String
             char** files = _pollen_outbox_list(tdir, 0, &nf);
             left_over += nf;
             _pollen_outbox_free(files, nf);
+            int nm = 0;
+            char** members = _pollen_outbox_list(tdir, 1, &nm);
+            for (int m = 0; m < nm; m++) {
+                char mdir[1100]; int mf = 0;
+                snprintf(mdir, sizeof(mdir), "%s/%s", tdir, members[m]);
+                char** mfiles = _pollen_outbox_list(mdir, 0, &mf);
+                left_over += mf;
+                _pollen_outbox_free(mfiles, mf);
+            }
+            _pollen_outbox_free(members, nm);
         }
         _pollen_outbox_free(topics, nt);
         return left_over;
@@ -2753,6 +2935,104 @@ import Amalgame.String
     /* Write one buffered call to disk and wake the delivery thread.
      * Returns 1 on success, 0 when there is no sharedDir or the write
      * failed (the caller then sends directly). */
+    /* The outbox root, and the delivery thread started (once). */
+    static int _pollen_outbox_ready(void) {
+        pthread_mutex_lock(&_pollen_outbox_mu);
+        int ok = _pollen_outbox_root();
+        if (ok && !_pollen_outbox_started) {
+            atomic_fetch_add(&_pollen_outbox_pending, _pollen_outbox_count_left_over());
+            pthread_t th;
+            if (pthread_create(&th, NULL, _pollen_outbox_thread, NULL) == 0) {
+                pthread_detach(th);
+                _pollen_outbox_started = 1;
+            } else ok = 0;
+        }
+        pthread_mutex_unlock(&_pollen_outbox_mu);
+        return ok;
+    }
+
+    /* One message file into dir (".tmp" then rename) ; 1 on success. */
+    static int _pollen_outbox_write(const char* dir, const char* topic, const char* mid, int64_t now, const char* data_json) {
+        long seq = atomic_fetch_add(&_pollen_outbox_seq, 1) % 1000000;
+        char name[1200], tmp[1210];
+        snprintf(name, sizeof(name), "%s/%013lld-%06ld-%s.msg", dir, (long long) now, seq, mid);
+        snprintf(tmp, sizeof(tmp), "%s.tmp", name);
+        FILE* f = fopen(tmp, "wb");
+        if (!f) return 0;
+        int w = fprintf(f, "%s\n{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
+                           "\"type\":\"MESSAGE\",\"topic\":{\"uuid\":\"%s\",\"version\":1},"
+                           "\"data\":%s,\"timestamp\":%lld}\n",
+                        topic, mid, mid, topic, data_json, (long long) now);
+        int closed = fclose(f);
+        if (w <= 0 || closed != 0 || rename(tmp, name) != 0) { remove(tmp); return 0; }
+        atomic_fetch_add(&_pollen_outbox_pending, 1);
+        return 1;
+    }
+
+    /* v0.10.0 — a member of the topic's group : its FIFO exists from now on. */
+    static int _pollen_outbox_member(const char* topic, const char* label) {
+        if (!label || !label[0] || strlen(label) > 60) return 0;
+        if (!_pollen_outbox_ready()) return 0;
+        char tname[POLLEN_TOPIC_MAX], lname[64], mdir[1100];
+        _pollen_outbox_topic_dir(topic, tname, sizeof(tname));
+        _pollen_outbox_topic_dir(label, lname, sizeof(lname));
+        snprintf(mdir, sizeof(mdir), "%s/%s", _pollen_outbox_dir, tname);
+        _pollen_mkdir(mdir);
+        snprintf(mdir, sizeof(mdir), "%s/%s/@%s", _pollen_outbox_dir, tname, lname);
+        _pollen_mkdir(mdir);
+        return 1;
+    }
+
+    /* v0.10.0 — durable fan-out : the message into every member's FIFO
+     * (members declared, and live labelled providers of the topic).
+     * Returns the number of members, 0 when there is none (or no sharedDir). */
+    static int _pollen_outbox_put_all(const char* topic, const char* data_json) {
+        if (!_pollen_outbox_ready()) return 0;
+        char labels[POLLEN_REG_MAX][64]; int nl = 0;
+        pthread_mutex_lock(&_pollen_reg_mutex);
+        for (int i = 0; i < _pollen_reg_n && nl < POLLEN_REG_MAX; i++) {
+            if (!_pollen_reg[i].label[0]) continue;
+            for (int a = 0; a < _pollen_reg[i].n_actions; a++)
+                if (strcmp(_pollen_reg[i].actions[a], topic) == 0) { strcpy(labels[nl++], _pollen_reg[i].label); break; }
+        }
+        pthread_mutex_unlock(&_pollen_reg_mutex);
+        for (int i = 0; i < nl; i++) _pollen_outbox_member(topic, labels[i]);
+        char tname[POLLEN_TOPIC_MAX], tdir[1024];
+        _pollen_outbox_topic_dir(topic, tname, sizeof(tname));
+        snprintf(tdir, sizeof(tdir), "%s/%s", _pollen_outbox_dir, tname);
+        int nm = 0, written = 0;
+        char** members = _pollen_outbox_list(tdir, 1, &nm);
+        char mid[37];
+        _pollen_gen_uuid(mid);
+        int64_t now = _pollen_now_ms_c();
+        for (int m = 0; m < nm; m++) {
+            if (members[m][0] != '@') continue;
+            char mdir[1100];
+            snprintf(mdir, sizeof(mdir), "%s/%s", tdir, members[m]);
+            written += _pollen_outbox_write(mdir, topic, mid, now, data_json);
+        }
+        _pollen_outbox_free(members, nm);
+        if (written) {
+            pthread_mutex_lock(&_pollen_outbox_mu);
+            pthread_cond_signal(&_pollen_outbox_cv);
+            pthread_mutex_unlock(&_pollen_outbox_mu);
+        }
+        return written;
+    }
+
+    /* v0.10.0 — messages waiting in one member's FIFO. */
+    static int64_t _pollen_outbox_member_pending(const char* topic, const char* label) {
+        if (!_pollen_outbox_root()) return 0;
+        char tname[POLLEN_TOPIC_MAX], lname[64], mdir[1200];
+        _pollen_outbox_topic_dir(topic, tname, sizeof(tname));
+        _pollen_outbox_topic_dir(label, lname, sizeof(lname));
+        snprintf(mdir, sizeof(mdir), "%s/%s/@%s", _pollen_outbox_dir, tname, lname);
+        int n = 0;
+        char** files = _pollen_outbox_list(mdir, 0, &n);
+        _pollen_outbox_free(files, n);
+        return n;
+    }
+
     static int _pollen_outbox_put(const char* topic, const char* data_json) {
         pthread_mutex_lock(&_pollen_outbox_mu);
         int ok = _pollen_outbox_root();
@@ -2813,10 +3093,14 @@ import Amalgame.String
             return 0;
         }
 
-        /* v0.6.0 — on_error=buffer : to the durable outbox. The
-         * validator rejects buffer with mode=all. Without a sharedDir
-         * (or if the write fails) fall back to a direct send. */
+        /* v0.6.0 — on_error=buffer : to the durable outbox. Without a
+         * sharedDir (or if the write fails) fall back to a direct send.
+         * v0.10.0 — with mode=all : one FIFO per member (durable fan-out). */
         if (on_error == 3 && mode == 0 && _pollen_outbox_put(topic, data_json)) return 1;
+        if (on_error == 3 && mode == 1) {
+            int nm = _pollen_outbox_put_all(topic, data_json);
+            if (nm > 0) return nm;
+        }
 
         if (mode == 1) {
             /* mode=all */
@@ -4369,6 +4653,70 @@ public class Pollen {
         @c { Amalgame_Pollen_Pollen_StartCapabilityReader_c(); }
     }
 
+    // v0.10.0 — a peer to announce this node's capability to, over the
+    // bus (host, port of its listener). Nodes on other machines then find
+    // each other without a shared directory ; a node also announces back
+    // to every peer it hears from. Call before or after
+    // StartCapabilityWriter (which sends the announcements, every 2 s).
+    public static void AddPeer(host: string, port: int) {
+        @c { _pollen_add_peer((const char*) host, (int) port, 1); }
+    }
+
+    // v0.10.0 — a member of a topic's group for durable fan-out (`call`
+    // with mode "all" and on_error "buffer") : the node whose capability
+    // label is `label`. Its FIFO exists from now on, so it gets every
+    // message even if it is down from the start. Needs a sharedDir.
+    public static bool AddOutboxMember(topic: string, label: string) {
+        var ok: bool = false
+        @c { ok = _pollen_outbox_member((const char*) topic, (const char*) label) != 0; }
+        return ok
+    }
+
+    // v0.10.0 — messages waiting for one member of a topic's group.
+    public static int OutboxPendingFor(topic: string, label: string) {
+        var n: int = 0
+        @c { n = _pollen_outbox_member_pending((const char*) topic, (const char*) label); }
+        return n
+    }
+
+    // v0.10.0 — peers this node announces to (seeds and learned).
+    public static int PeerCount() {
+        var n: int = 0
+        @c { pthread_mutex_lock(&_pollen_net_mutex); n = _pollen_peer_n; pthread_mutex_unlock(&_pollen_net_mutex); }
+        return n
+    }
+
+    // v0.10.0 — announcements received from peers since start.
+    public static int AnnouncesIn() {
+        var n: int = 0
+        @c { n = (int64_t) atomic_load(&_pollen_announces_in); }
+        return n
+    }
+
+    // v0.10.0 — the live providers known by announcement, as JSON :
+    // [{"label","host","port","actions":[...],"age_ms"}] (age by this
+    // node's clock ; a provider older than 7 s is not listed).
+    public static string NetRegistryJson() {
+        var out: string = "[]"
+        @c {
+            char* b = (char*) GC_MALLOC_ATOMIC(65536); size_t o = 0; b[o++] = '[';
+            int64_t now = _pollen_now_ms_c(); int first = 1;
+            pthread_mutex_lock(&_pollen_net_mutex);
+            for (int i = 0; i < _pollen_net_n && o < 60000; i++) {
+                pollen_netcap_t* c = &_pollen_net[i];
+                if (now - c->seen > POLLEN_NET_STALE_MS) continue;
+                o += (size_t) snprintf(b + o, 65536 - o, "%s{\"label\":\"%s\",\"host\":\"%s\",\"port\":%d,\"actions\":[", first ? "" : ",", c->label, c->p.host, c->p.port);
+                for (int a = 0; a < c->p.n_actions && o < 60000; a++) o += (size_t) snprintf(b + o, 65536 - o, "%s\"%s\"", a ? "," : "", c->p.actions[a]);
+                o += (size_t) snprintf(b + o, 65536 - o, "],\"age_ms\":%lld}", (long long) (now - c->seen));
+                first = 0;
+            }
+            pthread_mutex_unlock(&_pollen_net_mutex);
+            b[o++] = ']'; b[o] = 0;
+            out = (code_string) b;
+        }
+        return out
+    }
+
     // Phase 6.3 — toggle load-balanced forwarding. When ON, a forward
     // resolves the emit topic against the registry and sends to ONE
     // provider chosen by power-of-two-choices (lower inFlight wins),
@@ -5048,13 +5396,8 @@ public class Pollen {
                 if (oe != "log" && oe != "fail" && oe != "drop" && oe != "buffer") {
                     diags.Add("[error shape] " + path + ".on_error: must be \"log\"/\"fail\"/\"drop\"/\"buffer\", got \"" + oe + "\"")
                 }
-                // v0.6.0 — the outbox waits for ONE provider's ACK.
-                if (oe == "buffer" && stepV.Has("mode")) {
-                    let bm: string = stepV.Get("mode").AsString()
-                    if (bm == "all") {
-                        diags.Add("[error shape] " + path + ".on_error: \"buffer\" needs mode \"one\" (one provider ACKs each message)")
-                    }
-                }
+                // v0.10.0 — buffer with mode "all" : one durable FIFO per
+                // member of the topic's group (AddOutboxMember).
             }
             return
         }

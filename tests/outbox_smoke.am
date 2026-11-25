@@ -7,7 +7,8 @@
 //   2. once a handler for outbox.sink is registered and advertised,
 //      the 5 messages are delivered, in order, and the outbox empties
 //   3. later messages go through the outbox straight away
-//   4. the validator rejects "buffer" with mode "all"
+//   4. the validator accepts "buffer" with mode "all" (v0.10.0 : durable
+//      fan-out, one FIFO per member ; see outbox_fanout_smoke)
 // Runs on Linux, macOS and Windows (Winsock).
 
 namespace PollenTests
@@ -104,12 +105,8 @@ public class Program {
         Program.Check(Pollen.HandlerCallCount() == 8, "each message handled once (got "
                       + String_FromInt(Pollen.HandlerCallCount()) + ")")
 
-        // 4 — buffer needs mode one
-        let errs: List<string> = Pollen.WorkflowValidateV3("examples/workflow-v3-buffer-all-invalid.json")
-        var rejected: bool = false
-        for e in errs {
-            if (String_Contains(e, "buffer")) { rejected = true }
-        }
-        Program.Check(rejected, "validator rejects buffer with mode all")
+        // 4 — buffer with mode all : durable fan-out since v0.10.0
+        let errs: List<string> = Pollen.WorkflowValidateV3("examples/workflow-v3-buffer-all.json")
+        Program.Check(errs.Count() == 0, "validator accepts buffer with mode all (durable fan-out)")
     }
 }

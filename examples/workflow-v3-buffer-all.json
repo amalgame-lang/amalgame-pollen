@@ -1,6 +1,6 @@
 {
   "schema": "pollen/v3",
-  "name": "v3-buffer-all-invalid",
+  "name": "v3-buffer-all",
   "version": 1,
   "actions": {
     "sink": { "topic": "outbox.sink" }

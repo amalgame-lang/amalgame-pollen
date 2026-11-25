@@ -63,7 +63,7 @@
 
 [package]
 name              = "amalgame-pollen"
-version           = "0.9.1"
+version           = "0.10.0"
 license           = "Apache-2.0"
 description       = "Workflow engine for Pollen — runs workflow.json v3 entries over a P2P TCP message bus."
 authors           = ["Bastien Mouget"]
@@ -163,6 +163,13 @@ OutboxPending       = { returns = "i64" }
 OutboxDelivered     = { returns = "i64" }
 RegistrySize        = { returns = "i64" }
 ResolveProvider     = { returns = "code_string" }
+# v0.10.0 — discovery over the network
+AddPeer             = { returns = "void" }
+PeerCount           = { returns = "i64" }
+AnnouncesIn         = { returns = "i64" }
+NetRegistryJson     = { returns = "code_string" }
+AddOutboxMember     = { returns = "code_bool" }
+OutboxPendingFor    = { returns = "i64" }
 
 # Engine introspection (used by tests + manager)
 WorkflowVersion     = { returns = "i64" }

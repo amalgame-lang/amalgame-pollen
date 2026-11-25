@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.10.0 — 2026-11-23
+
+Two pieces for nodes spread over several machines, and for redundant
+consumers : found by Kairos (two or more servers fed by every edge).
+
+### Added — discovery over the network (`AddPeer`)
+
+Until now the capability registry came from files in `sharedDir` : one
+machine (or a shared file system). A node now also announces its
+capability on the bus, on the reserved topic `pollen.capabilities`,
+every 2 s, to its peers : the seeds given by `Pollen.AddPeer(host, port)`
+and every node it heard an announcement from. Edges need only the
+servers' addresses ; the servers learn the edges and announce back.
+
+- An announcement is kept while it is fresh **by the receiver's clock**
+  (7 s) : clocks of different machines need not agree.
+- It merges with the capability files when there is a `sharedDir`.
+- Under TLS it is a message like any other : refused unless the sender's
+  certificate has the right `pollen:publish:pollen.capabilities`.
+- `PeerCount`, `AnnouncesIn`, `NetRegistryJson` (label, address, topics,
+  age of each live provider known by announcement).
+- The registry is rebuilt every second (was 2 s), so a provider gone
+  leaves it within the stale delay plus 1 s.
+- Capability files are still written every 5 s ; announcements go out
+  every 2 s.
+
+### Added — durable fan-out (`mode: "all"` with `on_error: "buffer"`)
+
+The validator refused this pair : the outbox waited for one provider's
+ACK. Now each member of the topic's group has its own FIFO,
+`<outbox>/<topic>/@<label>/`, named by the member's **label** (the
+stable name given to `StartCapabilityWriter`, unlike the instance id,
+which changes at each start) :
+
+- `Pollen.AddOutboxMember(topic, label)` declares a member, so a member
+  down from the very start still gets every message ; a live provider
+  of the topic with a label becomes a member when it is seen ;
+- a message is written to every member's FIFO ; each FIFO drains to the
+  provider with that label, at its own pace : a member down only holds
+  its own messages, and gets them all, in order, when it is back ;
+- `Pollen.OutboxPendingFor(topic, label)` : what waits for one member.
+- `POLLEN_OUTBOX_TRACE=1` (environment) : the outbox prints each delivery
+  and each failure to stderr, with the member and the address tried.
+
+### Tests
+
+- `tests/net_discovery_smoke.am` (2 processes, no shared directory) :
+  each finds the other's topic, a message goes through, a stopped peer
+  is forgotten. 6 checks.
+- `tests/outbox_fanout_smoke.am` (3 processes) : a member absent from
+  the start gets its 5 waiting messages 1 s after it starts ; a member
+  stopped gets the 3 it missed when it is back, in order ; nothing
+  twice, nothing lost. 9 checks.
+- `outbox_smoke` : the validator now accepts buffer with mode all
+  (`examples/workflow-v3-buffer-all.json`, formerly `-invalid`).
+
 ## v0.9.1 — 2026-11-21
 
 ### Fixed — waits interrupted by the garbage collector's signals
