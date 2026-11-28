@@ -32,6 +32,7 @@ import Amalgame.String
 
 @c {
     #include <stdio.h>
+    #include <stdarg.h>
     #include <stdint.h>
     #include <stdlib.h>
     #include <string.h>
@@ -485,6 +486,8 @@ import Amalgame.String
     extern int GC_pthread_detach(pthread_t);
 
     #define POLLEN_TOPIC_MAX    128
+    /* v0.10.1 : the largest message (one line) a listener accepts. */
+    #define POLLEN_LINE_MAX     (16 * 1024 * 1024)
     #define POLLEN_HOST_MAX     64
 
     static pthread_mutex_t _pollen_wf_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -729,6 +732,94 @@ import Amalgame.String
      * JSON buffer. Returns the value extent (string with quotes
      * included, object/array including braces, or a bare literal).
      * Used by the capability registry parser. */
+    /* v0.10.1 — the end of the JSON value starting at v (string, object,
+     * array or scalar), or 0 when it does not end before `end`. */
+    static const char* _pollen_json_skip(const char* v, const char* end) {
+        if (v >= end) return 0;
+        if (*v == '"') {
+            const char* e = v + 1;
+            while (e < end) {
+                if (*e == '\\') { e += 2; continue; }
+                if (*e == '"') return e + 1;
+                e++;
+            }
+            return 0;
+        }
+        if (*v == '{' || *v == '[') {
+            int depth = 0, in_str = 0;
+            const char* e = v;
+            while (e < end) {
+                char c = *e;
+                if (in_str) {
+                    if (c == '\\') { e += 2; continue; }
+                    if (c == '"') in_str = 0;
+                } else if (c == '"') in_str = 1;
+                else if (c == '{' || c == '[') depth++;
+                else if (c == '}' || c == ']') { if (--depth == 0) return e + 1; }
+                e++;
+            }
+            return 0;
+        }
+        const char* e = v;
+        while (e < end && *e != ',' && *e != '}' && *e != ']' && *e != ' ' && *e != '\n' && *e != '\r' && *e != '\t') e++;
+        return e > v ? e : 0;
+    }
+
+    /* v0.10.1 — the value of key `key` at the TOP level of the JSON object
+     * buf (a key of the same name inside a nested value is not taken).
+     * One pass : the AM-side Json.Parse + Encode it replaces in
+     * EnvelopeData grew with the square of the message. 1 if found. */
+    static int _pollen_json_top(const char* buf, size_t len, const char* key,
+                                const char** out_v, size_t* out_vlen) {
+        const char* p = buf;
+        const char* end = buf + len;
+        size_t klen = strlen(key);
+        #define _PJ_WS while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++
+        _PJ_WS;
+        if (p >= end || *p != '{') return 0;
+        p++;
+        for (;;) {
+            _PJ_WS;
+            if (p >= end || *p != '"') return 0;
+            const char* ks = p + 1;
+            const char* ke = _pollen_json_skip(p, end);
+            if (!ke) return 0;
+            int match = (size_t) (ke - 1 - ks) == klen && memcmp(ks, key, klen) == 0;
+            p = ke;
+            _PJ_WS;
+            if (p >= end || *p != ':') return 0;
+            p++;
+            _PJ_WS;
+            const char* ve = _pollen_json_skip(p, end);
+            if (!ve) return 0;
+            if (match) { *out_v = p; *out_vlen = (size_t) (ve - p); return 1; }
+            p = ve;
+            _PJ_WS;
+            if (p < end && *p == ',') { p++; continue; }
+            return 0;
+        }
+        #undef _PJ_WS
+    }
+
+    /* A GC copy of the top-level field `key` of `env` (raw JSON text) ;
+     * unquote : a string without escapes, returned without its quotes.
+     * 0 when absent, or when unquote is asked of a string with escapes
+     * (the caller then takes the general path). */
+    static code_string _pollen_env_field(const char* env, const char* key, int unquote) {
+        if (!env) return 0;
+        const char* v; size_t vl;
+        if (!_pollen_json_top(env, strlen(env), key, &v, &vl)) return 0;
+        if (unquote) {
+            if (vl < 2 || v[0] != '"' || memchr(v, '\\', vl)) return 0;
+            v++; vl -= 2;
+        }
+        char* out = (char*) GC_MALLOC_ATOMIC(vl + 1);
+        if (!out) return 0;
+        memcpy(out, v, vl);
+        out[vl] = 0;
+        return (code_string) out;
+    }
+
     static int _pollen_json_field(const char* buf, size_t len,
                                     const char* key, int klen,
                                     const char** out_v, size_t* out_vlen) {
@@ -972,7 +1063,12 @@ import Amalgame.String
         pollen_peer_t peer;
         _pollen_peer_load(&peer, io.ssl);
         _pollen_cur_peer = &peer;
-        char rbuf[16384];
+        /* v0.10.1 : the line buffer grows with the message (it was 16 KB :
+         * a bigger message was dropped without a word, and the sender's
+         * outbox sent it again forever). POLLEN_LINE_MAX at most. */
+        size_t rcap = 16384;
+        char* rbuf = (char*) malloc(rcap);
+        if (!rbuf) { _pollen_io_close(&io); return NULL; }
         size_t rlen = 0;
         const char* MID_KEY   = "\"messageId\":\"";
         const size_t MID_KEY_LEN = 13;
@@ -980,8 +1076,21 @@ import Amalgame.String
         const size_t TOPIC_KEY_LEN = 17;
 
         for (;;) {
-            if (rlen >= sizeof(rbuf)) break;  /* oversize line — drop */
-            long n = _pollen_io_recv(&io, rbuf + rlen, sizeof(rbuf) - rlen);
+            if (rlen == 0 && rcap > (size_t) 1048576) {   /* after a big message : back to small */
+                char* nb = (char*) realloc(rbuf, 16384);
+                if (nb) { rbuf = nb; rcap = 16384; }
+            }
+            if (rlen >= rcap) {
+                if (rcap >= (size_t) POLLEN_LINE_MAX) {
+                    fprintf(stderr, "[pollen] message over %d bytes from a peer : connection closed\n", POLLEN_LINE_MAX);
+                    break;
+                }
+                size_t nc = rcap * 2 > (size_t) POLLEN_LINE_MAX ? (size_t) POLLEN_LINE_MAX : rcap * 2;
+                char* nb = (char*) realloc(rbuf, nc);
+                if (!nb) break;
+                rbuf = nb; rcap = nc;
+            }
+            long n = _pollen_io_recv(&io, rbuf + rlen, rcap - rlen);
             if (n <= 0) break;
             rlen += (size_t) n;
             for (;;) {
@@ -1154,6 +1263,7 @@ import Amalgame.String
         }
     worker_done:
         _pollen_cur_peer = 0;
+        free(rbuf);
         _pollen_io_close(&io);
         return NULL;
     }
@@ -1612,6 +1722,24 @@ import Amalgame.String
         return _pollen_io_open(io, fd, 0);
     }
 
+    /* v0.10.1 — a formatted string allocated to its size (malloc ; the
+     * caller frees it). *len : its length. */
+    static char* _pollen_aprintf(int* len, const char* fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = vsnprintf(NULL, 0, fmt, ap);
+        va_end(ap);
+        *len = 0;
+        if (n < 0) return 0;
+        char* b = (char*) malloc((size_t) n + 1);
+        if (!b) return 0;
+        va_start(ap, fmt);
+        vsnprintf(b, (size_t) n + 1, fmt, ap);
+        va_end(ap);
+        *len = n;
+        return b;
+    }
+
     static int _pollen_publish_one(const char* host, int port,
                                      const char* topic_uuid,
                                      int64_t topic_version,
@@ -1622,19 +1750,20 @@ import Amalgame.String
         if (!_pollen_connect_io(host, port, &io)) return 0;
         _pollen_gen_uuid(out_mid);
 
-        char envelope[8192];
         int64_t now = _pollen_now_ms_c();
-        int env_len = snprintf(envelope, sizeof(envelope),
+        int env_len = 0;
+        char* envelope = _pollen_aprintf(&env_len,
             "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
              "\"type\":\"MESSAGE\","
              "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
              "\"data\":%s,\"timestamp\":%lld}\n",
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
-        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            _pollen_io_close(&io); return 0;
+        if (!envelope || env_len <= 0) {
+            free(envelope); _pollen_io_close(&io); return 0;
         }
         int ok = _pollen_io_send_all(&io, envelope, (size_t) env_len);
+        free(envelope);
         _pollen_io_close(&io);
         return ok;
     }
@@ -1820,16 +1949,16 @@ import Amalgame.String
         if (!c) return _pollen_publish_one(host, port, topic_uuid,
                                              topic_version, data_json, out_mid);
         _pollen_gen_uuid(out_mid);
-        char envelope[8192];
         int64_t now = _pollen_now_ms_c();
-        int env_len = snprintf(envelope, sizeof(envelope),
+        int env_len = 0;
+        char* envelope = _pollen_aprintf(&env_len,
             "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
              "\"type\":\"MESSAGE\","
              "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
              "\"data\":%s,\"timestamp\":%lld}\n",
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
-        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) return 0;
+        if (!envelope || env_len <= 0) { free(envelope); return 0; }
 
         int ok = 0;
         pthread_mutex_lock(&c->mu);
@@ -1841,6 +1970,7 @@ import Amalgame.String
             else _pollen_pool_drop(c);
         }
         pthread_mutex_unlock(&c->mu);
+        free(envelope);
         return ok;
     }
 
@@ -1912,19 +2042,21 @@ import Amalgame.String
         pollen_io_t io;
         if (!_pollen_connect_io(host, port, &io)) return 0;
         _pollen_gen_uuid(out_mid);
-        char envelope[8192];
         int64_t now = _pollen_now_ms_c();
-        int env_len = snprintf(envelope, sizeof(envelope),
+        int env_len = 0;
+        char* envelope = _pollen_aprintf(&env_len,
             "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
              "\"type\":\"MESSAGE\","
              "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
              "\"data\":%s,\"timestamp\":%lld}\n",
             out_mid, out_mid, topic_uuid,
             (long long) topic_version, data_json, (long long) now);
-        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            _pollen_io_close(&io); return 0;
+        if (!envelope || env_len <= 0) {
+            free(envelope); _pollen_io_close(&io); return 0;
         }
-        if (!_pollen_io_send_all(&io, envelope, (size_t) env_len)) { _pollen_io_close(&io); return 0; }
+        int sent = _pollen_io_send_all(&io, envelope, (size_t) env_len);
+        free(envelope);
+        if (!sent) { _pollen_io_close(&io); return 0; }
 
         /* Wait for one newline-terminated line and verify it ACKs
          * our mid. poll() bounds the wait by timeout_ms. */
@@ -2016,9 +2148,9 @@ import Amalgame.String
         const char* bps  = breakpointsJson ? (const char*) breakpointsJson : "[]";
         const char* mgr  = managerAddr ? (const char*) managerAddr : "127.0.0.1:3001";
 
-        char envelope[8192];
         int64_t now = _pollen_now_ms_c();
-        int env_len = snprintf(envelope, sizeof(envelope),
+        int env_len = 0;
+        char* envelope = _pollen_aprintf(&env_len,
             "{\"messageId\":\"%s\",\"rootMessageId\":\"%s\","
              "\"type\":\"MESSAGE\","
              "\"topic\":{\"uuid\":\"%s\",\"version\":%lld},"
@@ -2029,10 +2161,12 @@ import Amalgame.String
             mid, mid, (const char*) topicUuid, (long long) topicVersion,
             (const char*) dataJson, (long long) now,
             sess, md, mgr, bps);
-        if (env_len <= 0 || env_len >= (int) sizeof(envelope)) {
-            _pollen_io_close(&io); return (code_string) empty;
+        if (!envelope || env_len <= 0) {
+            free(envelope); _pollen_io_close(&io); return (code_string) empty;
         }
-        if (!_pollen_io_send_all(&io, envelope, (size_t) env_len)) { _pollen_io_close(&io); return (code_string) empty; }
+        int sent = _pollen_io_send_all(&io, envelope, (size_t) env_len);
+        free(envelope);
+        if (!sent) { _pollen_io_close(&io); return (code_string) empty; }
         /* drain one ACK line (best-effort, short wait) */
         char ackbuf[512];
         if (_pollen_io_wait_in(&io, 2000) > 0) (void) _pollen_io_recv(&io, ackbuf, sizeof(ackbuf));
@@ -4591,6 +4725,13 @@ public class Pollen {
     // v0.4.0 — the `data` payload of an envelope, re-encoded as JSON
     // ("null" if absent or unparsable).
     public static string EnvelopeData(envelope: string) {
+        // v0.10.1 : in one pass (Json.Parse + Encode grew with the square
+        // of the message : 1.7 s for 100 KB) ; the general path for an
+        // envelope that is not a plain object.
+        var raw: string = ""
+        var found: bool = false
+        @c { code_string f = _pollen_env_field((const char*) envelope, "data", 0); if (f) { raw = f; found = 1; } }
+        if (found) { return raw }
         let r: JsonResult = Json.Parse(envelope)
         if (!r.Ok) { return "null" }
         let env: JsonValue = r.Value
@@ -4600,6 +4741,14 @@ public class Pollen {
 
     // v0.4.0 — the topic of an envelope ("" if absent).
     public static string EnvelopeTopic(envelope: string) {
+        var raw: string = ""
+        var found: bool = false
+        @c {
+            code_string t = _pollen_env_field((const char*) envelope, "topic", 0);
+            code_string u = t ? _pollen_env_field((const char*) t, "uuid", 1) : 0;
+            if (u) { raw = u; found = 1; }
+        }
+        if (found) { return raw }
         let r: JsonResult = Json.Parse(envelope)
         if (!r.Ok) { return "" }
         let env: JsonValue = r.Value
@@ -4611,6 +4760,10 @@ public class Pollen {
     // v0.6.0 — the messageId of an envelope ("" if absent). A message
     // sent again by the outbox keeps its messageId : dedupe on it.
     public static string EnvelopeMessageId(envelope: string) {
+        var raw: string = ""
+        var found: bool = false
+        @c { code_string m = _pollen_env_field((const char*) envelope, "messageId", 1); if (m) { raw = m; found = 1; } }
+        if (found) { return raw }
         let r: JsonResult = Json.Parse(envelope)
         if (!r.Ok) { return "" }
         let env: JsonValue = r.Value
