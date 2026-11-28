@@ -1,0 +1,115 @@
+// tests/big_message_smoke.am — v0.10.1 : messages bigger than the old
+// fixed buffers (8 KB to send, 16 KB to receive).
+//
+// One process : a handler on a topic, the listener on a worker thread,
+// and messages of 20 KB, 1 MB and 15 MB sent to itself by
+//   1. PublishSync (one connection per message, waits for the ACK)
+//   2. Publish (the pooled connection, fire-and-forget)
+// Checks the handler got each one whole (length and last byte), then
+//   3. a message over POLLEN_LINE_MAX (16 MB) is refused : no ACK, and the
+//      listener keeps serving (a small message is ACKed right after).
+// Before v0.10.1 the 20 KB message already failed : the sender could not
+// build it (8 KB) and the listener dropped it without a word (16 KB).
+
+namespace PollenTests
+
+import Amalgame.Pollen
+import Amalgame.Threading
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Console
+
+public class Seen {
+    public Sizes: List<int>
+    public Mu: AmalgameMutex
+
+    public Seen() {
+        this.Sizes = new List<int>()
+        this.Mu = Threading.MutexNew()
+    }
+
+    public bool Has(n: int) {
+        Threading.MutexLock(this.Mu)
+        var found: bool = false
+        let c: int = this.Sizes.Count()
+        for i in 0..c { if (this.Sizes.Get(i) == n) { found = true } }
+        Threading.MutexUnlock(this.Mu)
+        return found
+    }
+}
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    // {"pad":"xxx…x","end":7} of about n bytes.
+    public static string Body(n: int) {
+        return "{\"pad\":\"" + String.Repeat("x", n) + "\",\"end\":7}"
+    }
+
+    public static bool Wait(seen: Seen, n: int) {
+        var waited: int = 0
+        while (!seen.Has(n) && waited < 10000) {
+            Threading.ThreadSleep(20)
+            waited = waited + 20
+        }
+        return seen.Has(n)
+    }
+
+    public static void Main(string[] args) {
+        let port: int = 18741
+        let seen: Seen = new Seen()
+        Pollen.OnTopic("big.test", (env: string) => {
+            let d: string = Pollen.EnvelopeData(env)
+            // Whole : it still ends with the last field.
+            if (String.EndsWith(d, ",\"end\":7}")) {
+                Threading.MutexLock(seen.Mu)
+                seen.Sizes.Add(String.Length(d))
+                Threading.MutexUnlock(seen.Mu)
+            }
+            return 0
+        })
+        let listen = (_a: int) => {
+            Pollen.SetListenAddress("127.0.0.1")
+            Pollen.StartListener(port)
+            return 0
+        }
+        Threading.ThreadSpawn(listen, 0)
+        Threading.ThreadSleep(300)
+        // The envelope accessors read the TOP-level fields : a field of the
+        // same name inside the data is not taken.
+        let trap: string = "{\"type\":\"MESSAGE\",\"data\":{\"messageId\":\"inner\",\"topic\":{\"uuid\":\"inner.t\"},\"s\":\"a\\\"b\"},"
+            + "\"topic\":{\"uuid\":\"outer.t\",\"version\":1},\"messageId\":\"0f8fad5b-d9cb-469f-a165-70867728950e\"}"
+        Program.Check(Pollen.EnvelopeMessageId(trap) == "0f8fad5b-d9cb-469f-a165-70867728950e" && Pollen.EnvelopeTopic(trap) == "outer.t"
+            && Pollen.EnvelopeData(trap) == "{\"messageId\":\"inner\",\"topic\":{\"uuid\":\"inner.t\"},\"s\":\"a\\\"b\"}",
+            "EnvelopeMessageId / EnvelopeTopic / EnvelopeData take the top-level fields, not those inside the data")
+
+        let sizes: List<int> = new List<int>()
+        sizes.Add(20000)
+        sizes.Add(1000000)
+        sizes.Add(15000000)
+        let ns: int = sizes.Count()
+        for i in 0..ns {
+            let n: int = sizes.Get(i)
+            let body: string = Program.Body(n)
+            let mid: string = Pollen.PublishSync("127.0.0.1", port, "big.test", 1, body, 20000)
+            Program.Check(String.Length(mid) > 0 && Program.Wait(seen, String.Length(body)),
+                "PublishSync of " + String.FromInt(String.Length(body)) + " bytes : ACKed and handled whole")
+        }
+        for i in 0..ns {
+            let n: int = sizes.Get(i) + 1     // a different length from the PublishSync ones
+            let body: string = Program.Body(n)
+            let mid: string = Pollen.Publish("127.0.0.1", port, "big.test", 1, body)
+            Program.Check(String.Length(mid) > 0 && Program.Wait(seen, String.Length(body)),
+                "Publish (pooled connection) of " + String.FromInt(String.Length(body)) + " bytes : handled whole")
+        }
+
+        let huge: string = Program.Body(17 * 1024 * 1024)
+        let hm: string = Pollen.PublishSync("127.0.0.1", port, "big.test", 1, huge, 20000)
+        let after: string = Pollen.PublishSync("127.0.0.1", port, "big.test", 1, Program.Body(10), 3000)
+        Program.Check(String.Length(hm) == 0 && !seen.Has(String.Length(huge)) && String.Length(after) > 0,
+            "a message over 16 MB is refused (no ACK), and the listener still serves the next one")
+    }
+}

@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.10.1 — 2026-11-28
+
+Found by Kairos measuring its historian under load : an edge reading more
+than about 300 values a cycle could not feed it.
+
+### Fixed — messages of any size (up to 16 MB)
+
+- **Sending** : the envelope of `Publish`, `PublishSync`, the pooled
+  connection and `PublishDebug` was built in a fixed 8 KB buffer ; a
+  bigger message failed to be sent. It is now allocated to its size.
+- **Receiving** : a listener read each message into a fixed 16 KB buffer
+  and dropped a bigger one **without a word** — the sender's durable
+  outbox then sent it again forever. The buffer now grows with the
+  message, up to `POLLEN_LINE_MAX` (16 MB) ; over that the connection is
+  closed and the listener says so on stderr.
+- `tests/big_message_smoke.am` : 20 KB, 1 MB and 15 MB by `PublishSync`
+  and by the pooled connection, whole ; 17 MB refused, the listener
+  still serving the next message.
+
+### Changed — envelope accessors in one pass
+
+`EnvelopeData`, `EnvelopeTopic` and `EnvelopeMessageId` parsed the whole
+envelope with the AM-side `Json` (and `EnvelopeData` encoded the data
+again) : time growing with the square of the message (1.7 s for 100 KB).
+They now read the top-level field in one pass in C — a field of the same
+name inside the data is not taken (tested) — and fall back to the old
+path for an envelope that is not a plain object. `EnvelopeData` returns
+the data as sent (it was re-encoded).
+
 ## v0.10.0 — 2026-11-23
 
 Two pieces for nodes spread over several machines, and for redundant
